@@ -25,6 +25,35 @@ const String _wordCharPattern =
     r'[\w\u0600-\u06FF\u08A0-\u08FF\u0590-\u05FF'
     r'\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]';
 
+typedef CodeForgeContextMenuBuilder =
+    Widget Function(BuildContext context, CodeForgeContextMenuDetails details);
+
+class CodeForgeContextMenuDetails {
+  const CodeForgeContextMenuDetails({
+    required this.localPosition,
+    required this.globalPosition,
+    required this.textOffset,
+    required this.hasSelection,
+    required this.readOnly,
+    required this.isMobile,
+    required this.controller,
+    required this.items,
+    required this.onItemPressed,
+    required this.close,
+  });
+
+  final Offset localPosition;
+  final Offset globalPosition;
+  final int textOffset;
+  final bool hasSelection;
+  final bool readOnly;
+  final bool isMobile;
+  final CodeForgeController controller;
+  final List<CustomContextMenu> items;
+  final ValueChanged<CustomContextMenu> onItemPressed;
+  final VoidCallback close;
+}
+
 /// A highly customizable code editor widget for Flutter.
 ///
 /// [CodeForge] provides a feature-rich code editing experience with support for:
@@ -165,6 +194,12 @@ class CodeForge extends StatefulWidget {
   /// Styling options for hover documentation popup.
   final HoverDetailsStyle? hoverDetailsStyle;
 
+  /// Border radius for fenced Markdown code blocks in LSP tooltips.
+  ///
+  /// Defaults to an 8 pixel radius. Use [BorderRadius.zero] for square
+  /// corners.
+  final BorderRadius markdownCodeBlockBorderRadius;
+
   /// Styling options for search match highlighting.
   final MatchHighlightStyle? matchHighlightStyle;
 
@@ -257,6 +292,14 @@ class CodeForge extends StatefulWidget {
   /// Include custom items in the context menu (The menu appearson right click).
   final List<CustomContextMenu>? customContextMenuItems;
 
+  /// Builds a custom context menu in the root overlay.
+  ///
+  /// When omitted, the default CodeForge context menu is used.
+  final CodeForgeContextMenuBuilder? contextMenuBuilder;
+
+  /// Called with the text offset on Ctrl/Meta + left click.
+  final ValueChanged<int>? onModifierTap;
+
   /// If set to true, deleting the first line of a folded block will delete the entire folded region,
   /// else only the first line gets deleted and the rest of the block stays safe.
   /// Defauts to false.
@@ -293,6 +336,8 @@ class CodeForge extends StatefulWidget {
     this.keyboardShotcuts = const CodeForgeKeyboardShortcuts(),
     this.customCodeSnippets,
     this.customContextMenuItems,
+    this.contextMenuBuilder,
+    this.onModifierTap,
     this.readOnly = false,
     this.autoFocus = false,
     this.lineWrap = false,
@@ -314,6 +359,9 @@ class CodeForge extends StatefulWidget {
     this.ghostTextStyle,
     this.suggestionStyle,
     this.hoverDetailsStyle,
+    this.markdownCodeBlockBorderRadius = const BorderRadius.all(
+      Radius.circular(8),
+    ),
     this.matchHighlightStyle,
     this.extraLanguages = const [],
     this.finderBuilder,
@@ -345,6 +393,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final ValueNotifier<String?> _aiNotifier;
   late final ValueNotifier<Offset?> _aiOffsetNotifier;
   late final ValueNotifier<Offset> _contextMenuOffsetNotifier;
+  late final ValueNotifier<int> _contextMenuTextOffsetNotifier;
   late final ValueNotifier<bool> _selectionActiveNotifier, _isHoveringPopup;
   late final ValueNotifier<List<dynamic>?> _lspActionNotifier;
   late final UndoRedoController _undoRedoController;
@@ -357,6 +406,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final VoidCallback _signatureListener, _hoverListener;
   late final VoidCallback _isHoveringPopupListener, _selectedSuggestionListener;
   late final VoidCallback _snippetSuggestionsListener, _snippetNotifierListener;
+  late final VoidCallback _contextMenuListener;
   late bool _readOnly;
   final ValueNotifier<Offset> _offsetNotifier = ValueNotifier(Offset(0, 0));
   final ValueNotifier<Offset?> _lspActionOffsetNotifier = ValueNotifier(null);
@@ -366,7 +416,9 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   final _actionScrollController = ScrollController();
   final Map<String, String> _suggestionDetailsCache = {};
   final _isMac = Platform.isMacOS;
-  final GlobalKey _codeFieldKey = GlobalKey();
+  final OverlayPortalController _contextMenuPortalController =
+      OverlayPortalController();
+  _CodeFieldRenderer? _codeFieldRenderer;
   TextInputConnection? _connection;
   StreamSubscription? _lspResponsesSubscription;
   bool _isHovering = false, _isSignatureInvoked = false;
@@ -385,20 +437,13 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     super.initState();
     _controller = widget.controller ?? CodeForgeController();
 
-    _controller.getFloatingCursorStartPosition = () {
-      final renderObject = _codeFieldKey.currentContext?.findRenderObject();
-      if (renderObject is _CodeFieldRenderer) {
-        return renderObject.getCaretOffset();
-      }
-      return null;
-    };
+    _controller.getFloatingCursorStartPosition = () =>
+        _codeFieldRenderer?.getCaretOffset();
 
     _controller.getTextOffsetForFloatingCursorPosition = (Offset position) {
-      final renderObject = _codeFieldKey.currentContext?.findRenderObject();
-      if (renderObject is _CodeFieldRenderer) {
-        return renderObject.getTextOffsetForPosition(position);
-      }
-      return _controller.selection.baseOffset;
+      final renderObject = _codeFieldRenderer;
+      return renderObject?.getTextOffsetForPosition(position) ??
+          _controller.selection.baseOffset;
     };
 
     _findController = widget.findController ?? FindController(_controller);
@@ -419,6 +464,17 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     _aiNotifier = ValueNotifier(null);
     _aiOffsetNotifier = ValueNotifier(null);
     _contextMenuOffsetNotifier = ValueNotifier(const Offset(-1, -1));
+    _contextMenuTextOffsetNotifier = ValueNotifier(-1);
+    _contextMenuListener = () {
+      if (widget.contextMenuBuilder == null) return;
+      final offset = _contextMenuOffsetNotifier.value;
+      if (offset.dx < 0 || offset.dy < 0) {
+        _contextMenuPortalController.hide();
+      } else {
+        _contextMenuPortalController.show();
+      }
+    };
+    _contextMenuOffsetNotifier.addListener(_contextMenuListener);
     _selectionActiveNotifier = ValueNotifier(false);
     _isHoveringPopup = ValueNotifier<bool>(false);
     _controller.userCodeAction = _fetchCodeActionsForCurrentPosition;
@@ -821,8 +877,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   }
 
   void _updateScrollbarLineNumberIndicator() {
-    final renderObject = _codeFieldKey.currentContext?.findRenderObject();
-    if (renderObject is! _CodeFieldRenderer) return;
+    final renderObject = _codeFieldRenderer;
+    if (renderObject == null) return;
 
     final lineNumber = renderObject.getScrollbarLineNumberAtScrollOffset(
       _vscrollController.hasClients ? _vscrollController.offset : 0.0,
@@ -1036,6 +1092,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   void didUpdateWidget(covariant CodeForge oldWidget) {
     super.didUpdateWidget(oldWidget);
 
+    if (oldWidget.contextMenuBuilder != widget.contextMenuBuilder) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (widget.contextMenuBuilder != null &&
+            _contextMenuOffsetNotifier.value.dx >= 0) {
+          _contextMenuPortalController.show();
+        } else {
+          _contextMenuPortalController.hide();
+        }
+      });
+    }
+
     final oldTabSize = oldWidget.tabSize ?? (oldWidget.useSpaceAsTab ? 2 : 1);
     final newTabSize = widget.tabSize ?? (widget.useSpaceAsTab ? 2 : 1);
     final newUseSpaceAsTab = widget.useSpaceAsTab;
@@ -1064,6 +1132,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     );
     _controller.removeListener(_snippetSuggestionsListener);
     _suggestionNotifier.removeListener(_snippetNotifierListener);
+    _contextMenuOffsetNotifier.removeListener(_contextMenuListener);
     _connection?.close();
     _lspResponsesSubscription?.cancel();
     _caretBlinkController.dispose();
@@ -1073,6 +1142,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     _aiNotifier.dispose();
     _aiOffsetNotifier.dispose();
     _contextMenuOffsetNotifier.dispose();
+    _contextMenuTextOffsetNotifier.dispose();
     _selectionActiveNotifier.dispose();
     _isHoveringPopup.dispose();
     _offsetNotifier.dispose();
@@ -1169,6 +1239,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   }
 
   Widget _buildContextMenu() {
+    if (widget.contextMenuBuilder != null) return const SizedBox.shrink();
     return ValueListenableBuilder<Offset>(
       valueListenable: _contextMenuOffsetNotifier,
       builder: (context, offset, _) {
@@ -1176,6 +1247,13 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
         final hasSelection =
             _controller.selection.start != _controller.selection.end;
+        final textOffset = _contextMenuTextOffsetNotifier.value;
+        bool isVisible(CustomContextMenu item) =>
+            item.visibleAt?.call(textOffset) ?? item.visible?.call() ?? true;
+        void press(CustomContextMenu item) {
+          item.onPressAt?.call(textOffset);
+          if (item.onPressAt == null) item.onPress();
+        }
 
         if (_isMobile) {
           return TextSelectionToolbar(
@@ -1197,7 +1275,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     onPressed: () {
                       _controller.cut();
-                      _contextMenuOffsetNotifier.value = const Offset(-1, -1);
+                      _hideContextMenu();
                     },
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -1222,7 +1300,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                   padding: const EdgeInsets.symmetric(horizontal: 8),
                   onPressed: () {
                     _controller.copy();
-                    _contextMenuOffsetNotifier.value = const Offset(-1, -1);
+                    _hideContextMenu();
                   },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -1249,7 +1327,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                   padding: const EdgeInsets.symmetric(horizontal: 8),
                   onPressed: () async {
                     await _controller.paste();
-                    _contextMenuOffsetNotifier.value = const Offset(-1, -1);
+                    _hideContextMenu();
                   },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -1294,6 +1372,37 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                   ],
                 ),
               ),
+              ...?widget.customContextMenuItems
+                  ?.where(isVisible)
+                  .map(
+                    (item) => TextSelectionToolbarTextButton(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      onPressed: () {
+                        press(item);
+                        _hideContextMenu();
+                      },
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (item.icon != null) ...[
+                            Icon(
+                              item.icon,
+                              size: 16,
+                              color: _editorTheme['root']?.color,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Text(
+                            item.label,
+                            style: TextStyle(
+                              color: _editorTheme['root']?.color,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
             ],
           );
         } else {
@@ -1333,13 +1442,16 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                       'Ctrl+A',
                       () => _controller.selectAll(),
                     ),
-                    ...widget.customContextMenuItems?.map(
-                          (item) => _buildDesktopContextMenuItem(
-                            item.label,
-                            item.description,
-                            item.onPress,
-                          ),
-                        ) ??
+                    ...widget.customContextMenuItems
+                            ?.where(isVisible)
+                            .map(
+                              (item) => _buildDesktopContextMenuItem(
+                                item.label,
+                                item.description,
+                                () => press(item),
+                                icon: item.icon,
+                              ),
+                            ) ??
                         [],
                   ],
                 ),
@@ -1351,15 +1463,70 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     );
   }
 
+  Widget _buildCustomContextMenu(BuildContext context) {
+    final builder = widget.contextMenuBuilder;
+    final offset = _contextMenuOffsetNotifier.value;
+    if (builder == null || offset.dx < 0 || offset.dy < 0) {
+      return const SizedBox.shrink();
+    }
+
+    final textOffset = _contextMenuTextOffsetNotifier.value;
+    final items =
+        widget.customContextMenuItems
+            ?.where(
+              (item) =>
+                  item.visibleAt?.call(textOffset) ??
+                  item.visible?.call() ??
+                  true,
+            )
+            .toList() ??
+        const <CustomContextMenu>[];
+    final renderObject = _codeFieldRenderer;
+    final globalPosition = renderObject?.localToGlobal(offset) ?? offset;
+    final overlay = Overlay.of(
+      context,
+      rootOverlay: true,
+    ).context.findRenderObject();
+    final overlayPosition = overlay is RenderBox
+        ? overlay.globalToLocal(globalPosition)
+        : globalPosition;
+
+    return Positioned(
+      left: overlayPosition.dx,
+      top: overlayPosition.dy,
+      child: builder(
+        context,
+        CodeForgeContextMenuDetails(
+          localPosition: offset,
+          globalPosition: globalPosition,
+          textOffset: textOffset,
+          hasSelection:
+              _controller.selection.start != _controller.selection.end,
+          readOnly: _controller.readOnly,
+          isMobile: _isMobile,
+          controller: _controller,
+          items: items,
+          onItemPressed: (item) {
+            item.onPressAt?.call(textOffset);
+            if (item.onPressAt == null) item.onPress();
+            _hideContextMenu();
+          },
+          close: _hideContextMenu,
+        ),
+      ),
+    );
+  }
+
   Widget _buildDesktopContextMenuItem(
     String label,
     String shortcut,
-    VoidCallback onTap,
-  ) {
+    VoidCallback onTap, {
+    IconData? icon,
+  }) {
     return InkWell(
       onTap: () {
         onTap();
-        _contextMenuOffsetNotifier.value = const Offset(-1, -1);
+        _hideContextMenu();
       },
       hoverColor: _suggestionStyle.hoverColor,
       child: Padding(
@@ -1367,7 +1534,15 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(label, style: _suggestionStyle.textStyle),
+            Row(
+              children: [
+                if (icon != null) ...[
+                  Icon(icon, size: 16, color: _suggestionStyle.textStyle.color),
+                  const SizedBox(width: 8),
+                ],
+                Text(label, style: _suggestionStyle.textStyle),
+              ],
+            ),
             const SizedBox(width: 24),
             Text(
               shortcut,
@@ -1380,6 +1555,21 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  void _showContextMenu(Offset offset, int textOffset) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _contextMenuTextOffsetNotifier.value = textOffset;
+      _contextMenuOffsetNotifier.value = offset;
+    });
+  }
+
+  void _hideContextMenu() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _contextMenuOffsetNotifier.value = const Offset(-1, -1);
+    });
   }
 
   void _clearSnippetSuggestions() {
@@ -1559,10 +1749,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   Widget build(BuildContext context) {
     final mediaQuery = MediaQuery.of(context);
     final screenWidth = mediaQuery.size.width;
-    final screenHeight = mediaQuery.size.height;
-    return LayoutBuilder(
+    final editor = LayoutBuilder(
       builder: (_, constraints) {
-        final editorHeight = constraints.maxHeight;
         return Column(
           children: [
             if (widget.finderBuilder != null)
@@ -1576,1400 +1764,1612 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                 },
               ),
             Expanded(
-              child: Stack(
-                children: [
-                  Directionality(
-                    textDirection: widget.textDirection,
-                    child: CustomScrollbar(
-                      controller: _vscrollController,
-                      lineNumberNotifier: _scrollbarLineNumberIndicator,
-                      textDirection: widget.textDirection,
-                      borderRadius: _scrollbarDecoration.borderRadius,
-                      showLineNumberIndicator:
-                          _scrollbarDecoration.showLineNumberIndicator,
-                      thickness: _scrollbarDecoration.thickness,
-                      thumbColor: _scrollbarDecoration.thumbColor,
-                      interactive: _scrollbarDecoration.interactive,
-                      crossAxisMargin: _scrollbarDecoration.crossAxisMargin,
-                      mainAxisMargin: _scrollbarDecoration.mainAxisMargin,
-                      scrollbarOrientation:
-                          _scrollbarDecoration.scrollbarOrientation,
-                      trackBorderColor: _scrollbarDecoration.trackBorderColor,
-                      fadeDuration: _scrollbarDecoration.fadeDuration,
-                      timeToFade: _scrollbarDecoration.timeToFade,
-                      trackRadius: _scrollbarDecoration.trackRadius,
-                      trackVisibility: _scrollbarDecoration.trackVisibility,
-                      minOverscrollLength:
-                          _scrollbarDecoration.minOverscrollLength,
-                      minThumbLength: _scrollbarDecoration.minThumbLength,
-                      padding: _scrollbarDecoration.padding,
-                      pressDuration: _scrollbarDecoration.pressDuration,
-                      trackColor: _scrollbarDecoration.trackColor,
-                      notificationPredicate:
-                          _scrollbarDecoration.notificationPredicate,
-                      thumbVisibility: _isHovering,
-                      lineNumberStyle:
-                          _scrollbarDecoration.lineNumberStyle ??
-                          TextStyle(
-                            color:
-                                _editorTheme['root']?.backgroundColor ??
-                                Colors.black,
-                            fontSize: widget.textStyle?.fontSize ?? 14,
-                            fontFamily: widget.textStyle?.fontFamily,
-                          ),
-                      child: Transform(
-                        alignment: Alignment.center,
-                        transform: widget.textDirection == TextDirection.rtl
-                            ? (Matrix4.identity()
-                                ..scaleByVector3(Vector3(-1.0, 1.0, 1.0)))
-                            : Matrix4.identity(),
-                        child: RawScrollbar(
+              child: LayoutBuilder(
+                builder: (_, popupConstraints) {
+                  final popupHeight = popupConstraints.maxHeight;
+                  const popupBottomGap = 10.0;
+                  return Stack(
+                    children: [
+                      Directionality(
+                        textDirection: widget.textDirection,
+                        child: CustomScrollbar(
+                          controller: _vscrollController,
+                          lineNumberNotifier: _scrollbarLineNumberIndicator,
+                          textDirection: widget.textDirection,
+                          borderRadius: _scrollbarDecoration.borderRadius,
+                          showLineNumberIndicator:
+                              _scrollbarDecoration.showLineNumberIndicator,
+                          thickness: _scrollbarDecoration.thickness,
+                          thumbColor: _scrollbarDecoration.thumbColor,
+                          interactive: _scrollbarDecoration.interactive,
+                          crossAxisMargin: _scrollbarDecoration.crossAxisMargin,
+                          mainAxisMargin: _scrollbarDecoration.mainAxisMargin,
+                          scrollbarOrientation:
+                              _scrollbarDecoration.scrollbarOrientation,
+                          trackBorderColor:
+                              _scrollbarDecoration.trackBorderColor,
+                          fadeDuration: _scrollbarDecoration.fadeDuration,
+                          timeToFade: _scrollbarDecoration.timeToFade,
+                          trackRadius: _scrollbarDecoration.trackRadius,
+                          trackVisibility: _scrollbarDecoration.trackVisibility,
+                          minOverscrollLength:
+                              _scrollbarDecoration.minOverscrollLength,
+                          minThumbLength: _scrollbarDecoration.minThumbLength,
+                          padding: _scrollbarDecoration.padding,
+                          pressDuration: _scrollbarDecoration.pressDuration,
+                          trackColor: _scrollbarDecoration.trackColor,
+                          notificationPredicate:
+                              _scrollbarDecoration.notificationPredicate,
                           thumbVisibility: _isHovering,
-                          controller: _hscrollController,
+                          lineNumberStyle:
+                              _scrollbarDecoration.lineNumberStyle ??
+                              TextStyle(
+                                color:
+                                    _editorTheme['root']?.backgroundColor ??
+                                    Colors.black,
+                                fontSize: widget.textStyle?.fontSize ?? 14,
+                                fontFamily: widget.textStyle?.fontFamily,
+                              ),
                           child: Transform(
                             alignment: Alignment.center,
                             transform: widget.textDirection == TextDirection.rtl
                                 ? (Matrix4.identity()
                                     ..scaleByVector3(Vector3(-1.0, 1.0, 1.0)))
                                 : Matrix4.identity(),
-                            child: GestureDetector(
-                              onTap: () {
-                                if (_isMobile) return;
-                                _focusNode.requestFocus();
-                              },
-                              onDoubleTapDown: (details) {
-                                if (_controller.text.isNotEmpty) return;
-                                _contextMenuOffsetNotifier.value =
-                                    details.localPosition;
-                              },
-                              child: MouseRegion(
-                                onEnter: (event) {
-                                  if (mounted) {
-                                    setState(() => _isHovering = true);
-                                  }
-                                },
-                                onExit: (event) {
-                                  if (mounted) {
-                                    setState(() => _isHovering = false);
-                                  }
-                                },
-                                child: ValueListenableBuilder(
-                                  valueListenable: _selectionActiveNotifier,
-                                  builder: (context, selVal, child) {
-                                    return TwoDimensionalScrollable(
-                                      horizontalDetails:
-                                          ScrollableDetails.horizontal(
-                                            controller: _hscrollController,
-                                            physics: selVal
-                                                ? const NeverScrollableScrollPhysics()
-                                                : RTLAwareScrollPhysics(
-                                                    isRTL:
-                                                        widget.textDirection ==
-                                                        TextDirection.rtl,
-                                                    isMobile: _isMobile,
-                                                  ),
-                                          ),
-                                      verticalDetails: ScrollableDetails.vertical(
-                                        controller: _vscrollController,
-                                        physics: selVal
-                                            ? const NeverScrollableScrollPhysics()
-                                            : widget.verticalScrollPhysics,
-                                      ),
-                                      viewportBuilder: (_, voffset, hoffset) => CustomViewport(
-                                        verticalOffset: voffset,
-                                        verticalAxisDirection:
-                                            AxisDirection.down,
-                                        horizontalOffset: hoffset,
-                                        horizontalAxisDirection:
-                                            widget.textDirection ==
-                                                TextDirection.rtl
-                                            ? AxisDirection.left
-                                            : AxisDirection.right,
-                                        mainAxis: Axis.vertical,
-                                        lineWrap: widget.lineWrap,
-                                        delegate: TwoDimensionalChildBuilderDelegate(
-                                          maxXIndex: 0,
-                                          maxYIndex: 0,
-                                          builder: (_, vic) {
-                                            return Focus(
-                                              focusNode: _focusNode,
-                                              onKeyEvent: (node, event) {
-                                                if (_controller
-                                                    .isComposingActive) {
-                                                  return KeyEventResult.ignored;
-                                                }
-
-                                                final shrtCt =
-                                                    widget.keyboardShotcuts;
-                                                if (shrtCt.duplicate.accepts(
-                                                  event,
-                                                  HardwareKeyboard.instance,
-                                                )) {
-                                                  if (!_readOnly) {
-                                                    _controller.duplicateLine();
-                                                    _commonKeyFunctions();
-                                                  }
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.deletWordBackward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (!_readOnly) {
-                                                    _deleteWordBackward();
-                                                    _commonKeyFunctions();
-                                                  }
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.deletWordForward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (!_readOnly) {
-                                                    _deleteWordForward();
-                                                    _commonKeyFunctions();
-                                                  }
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .moveCursorToPreviousWord
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (widget.textDirection ==
-                                                      TextDirection.rtl) {
-                                                    _moveWordRight(false);
-                                                  } else {
-                                                    _moveWordLeft(false);
-                                                  }
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.moveCursorToNextWord
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (widget.textDirection ==
-                                                      TextDirection.rtl) {
-                                                    _moveWordLeft(false);
-                                                  } else {
-                                                    _moveWordRight(false);
-                                                  }
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.lspCodeActions
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  (() async {
-                                                    _suggestionNotifier.value =
-                                                        null;
-                                                    await _fetchCodeActionsForCurrentPosition();
-                                                  })();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.jumpToDocumentStart
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller
-                                                      .pressDocumentHomeKey(
-                                                        isShiftPressed: false,
-                                                      );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .jumpToDocumentStartAndSelectText
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller
-                                                      .pressDocumentHomeKey(
-                                                        isShiftPressed: true,
-                                                      );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.jumpToDocumentEnd
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller
-                                                      .pressDocumentEndKey(
-                                                        isShiftPressed: false,
-                                                      );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .jumpToDocumentEndAndSelectText
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller
-                                                      .pressDocumentEndKey(
-                                                        isShiftPressed: true,
-                                                      );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.showFindBar.accepts(
-                                                  event,
-                                                  HardwareKeyboard.instance,
-                                                )) {
-                                                  final isAlt = HardwareKeyboard
-                                                      .instance
-                                                      .isAltPressed;
-                                                  _findController.isActive =
-                                                      true;
-                                                  _findController
-                                                          .isReplaceMode =
-                                                      isAlt;
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.showFindAndReplaceBar
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (!HardwareKeyboard
-                                                      .instance
-                                                      .isMetaPressed) {
-                                                    _findController.isActive =
-                                                        true;
-                                                    _findController
-                                                            .isReplaceMode =
-                                                        true;
-
-                                                    return KeyEventResult
-                                                        .handled;
-                                                  }
-                                                }
-
-                                                if (shrtCt.lspSignatureHelp
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  setState(() {
-                                                    _isSignatureInvoked = true;
-                                                  });
-                                                  (() async => await _controller
-                                                      .callSignatureHelp())();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.shiftLineUp.accepts(
-                                                  event,
-                                                  HardwareKeyboard.instance,
-                                                )) {
-                                                  _controller.moveLineUp();
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.shiftLineDown
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller.moveLineDown();
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .moveSelectionToPreviousWord
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (widget.textDirection ==
-                                                      TextDirection.rtl) {
-                                                    _moveWordRight(true);
-                                                  } else {
-                                                    _moveWordLeft(true);
-                                                  }
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .moveSelectionToNextWord
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  if (widget.textDirection ==
-                                                      TextDirection.rtl) {
-                                                    _moveWordLeft(true);
-                                                  } else {
-                                                    _moveWordRight(true);
-                                                  }
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.moveSelectionForward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _handleArrowRight(true);
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.moveSelectionBackward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _handleArrowLeft(true);
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.moveSelectionUpward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller.pressUpArrowKey(
-                                                    isShiftPressed: true,
-                                                  );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.moveSelectionDownward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller.pressDownArrowKey(
-                                                    isShiftPressed: true,
-                                                  );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.selectToLineStart
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller.pressHomeKey(
-                                                    isShiftPressed: true,
-                                                  );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt.selectToLineEnd
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  _controller.pressEndKey(
-                                                    isShiftPressed: true,
-                                                  );
-                                                  _commonKeyFunctions();
-                                                  return KeyEventResult.handled;
-                                                }
-
-                                                if (shrtCt
-                                                    .extendMutliCursorDownward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  final selection =
-                                                      _controller.selection;
-                                                  final primaryLine =
-                                                      _controller
-                                                          .getLineAtOffset(
-                                                            selection
-                                                                .extentOffset,
-                                                          );
-
-                                                  final anchorLine =
-                                                      _controller
-                                                          .hasMultiCursors
-                                                      ? _controller.multiCursors
-                                                            .map((c) => c.line)
-                                                            .reduce(
-                                                              (a, b) =>
-                                                                  a > b ? a : b,
-                                                            )
-                                                      : primaryLine;
-
-                                                  final foldAtAnchor = _controller
-                                                      .getFoldRangeAtCurrentLine(
-                                                        anchorLine,
-                                                      );
-                                                  int targetLine =
-                                                      (foldAtAnchor != null &&
-                                                          foldAtAnchor.isFolded)
-                                                      ? foldAtAnchor.endIndex +
-                                                            1
-                                                      : anchorLine + 1;
-
-                                                  while (targetLine <
-                                                          _controller
-                                                              .lineCount &&
-                                                      _controller
-                                                          .isLineInFoldedRegion(
-                                                            targetLine,
-                                                          )) {
-                                                    final foldStart = _controller
-                                                        .getFoldStartForLine(
-                                                          targetLine,
-                                                        );
-                                                    if (foldStart != null) {
-                                                      final fold =
-                                                          _controller
-                                                              .foldings[foldStart] ??
-                                                          FoldRange(
-                                                            targetLine,
-                                                            targetLine,
-                                                          );
-                                                      targetLine =
-                                                          fold.endIndex + 1;
-                                                    } else {
-                                                      targetLine++;
+                            child: RawScrollbar(
+                              thumbVisibility: _isHovering,
+                              controller: _hscrollController,
+                              child: Transform(
+                                alignment: Alignment.center,
+                                transform:
+                                    widget.textDirection == TextDirection.rtl
+                                    ? (Matrix4.identity()..scaleByVector3(
+                                        Vector3(-1.0, 1.0, 1.0),
+                                      ))
+                                    : Matrix4.identity(),
+                                child: GestureDetector(
+                                  onTap: () {
+                                    if (_isMobile) return;
+                                    _focusNode.requestFocus();
+                                  },
+                                  onDoubleTapDown: (details) {
+                                    if (_controller.text.isNotEmpty) return;
+                                    _showContextMenu(details.localPosition, -1);
+                                  },
+                                  child: MouseRegion(
+                                    onEnter: (event) {
+                                      if (mounted) {
+                                        setState(() => _isHovering = true);
+                                      }
+                                    },
+                                    onExit: (event) {
+                                      if (mounted) {
+                                        setState(() => _isHovering = false);
+                                      }
+                                    },
+                                    child: ValueListenableBuilder(
+                                      valueListenable: _selectionActiveNotifier,
+                                      builder: (context, selVal, child) {
+                                        return TwoDimensionalScrollable(
+                                          horizontalDetails:
+                                              ScrollableDetails.horizontal(
+                                                controller: _hscrollController,
+                                                physics: selVal
+                                                    ? const NeverScrollableScrollPhysics()
+                                                    : RTLAwareScrollPhysics(
+                                                        isRTL:
+                                                            widget
+                                                                .textDirection ==
+                                                            TextDirection.rtl,
+                                                        isMobile: _isMobile,
+                                                      ),
+                                              ),
+                                          verticalDetails:
+                                              ScrollableDetails.vertical(
+                                                controller: _vscrollController,
+                                                physics: selVal
+                                                    ? const NeverScrollableScrollPhysics()
+                                                    : widget
+                                                          .verticalScrollPhysics,
+                                              ),
+                                          viewportBuilder: (_, voffset, hoffset) => CustomViewport(
+                                            verticalOffset: voffset,
+                                            verticalAxisDirection:
+                                                AxisDirection.down,
+                                            horizontalOffset: hoffset,
+                                            horizontalAxisDirection:
+                                                widget.textDirection ==
+                                                    TextDirection.rtl
+                                                ? AxisDirection.left
+                                                : AxisDirection.right,
+                                            mainAxis: Axis.vertical,
+                                            lineWrap: widget.lineWrap,
+                                            delegate: TwoDimensionalChildBuilderDelegate(
+                                              maxXIndex: 0,
+                                              maxYIndex: 0,
+                                              builder: (_, vic) {
+                                                return Focus(
+                                                  focusNode: _focusNode,
+                                                  onKeyEvent: (node, event) {
+                                                    if (_controller
+                                                        .isComposingActive) {
+                                                      return KeyEventResult
+                                                          .ignored;
                                                     }
-                                                  }
 
-                                                  if (targetLine <
-                                                      _controller.lineCount) {
-                                                    final lineStart =
+                                                    final shrtCt =
+                                                        widget.keyboardShotcuts;
+                                                    if (shrtCt.duplicate
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
                                                         _controller
-                                                            .getLineStartOffset(
-                                                              primaryLine,
-                                                            );
-                                                    final column =
-                                                        selection.extentOffset -
-                                                        lineStart;
-                                                    final nextLineText =
-                                                        _controller.getLineText(
-                                                          targetLine,
-                                                        );
-                                                    final newColumn = column
-                                                        .clamp(
-                                                          0,
-                                                          nextLineText.length,
-                                                        );
-                                                    _controller.addMultiCursor(
-                                                      targetLine,
-                                                      newColumn,
-                                                    );
-                                                  }
+                                                            .duplicateLine();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                  return KeyEventResult.handled;
-                                                }
+                                                    if (shrtCt.deletWordBackward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _deleteWordBackward();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                if (shrtCt
-                                                    .extendMutliCursorUpward
-                                                    .accepts(
-                                                      event,
-                                                      HardwareKeyboard.instance,
-                                                    )) {
-                                                  final selection =
-                                                      _controller.selection;
-                                                  final primaryLine =
+                                                    if (shrtCt.deletWordForward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _deleteWordForward();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveCursorToPreviousWord
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (widget
+                                                              .textDirection ==
+                                                          TextDirection.rtl) {
+                                                        _moveWordRight(false);
+                                                      } else {
+                                                        _moveWordLeft(false);
+                                                      }
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveCursorToNextWord
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (widget
+                                                              .textDirection ==
+                                                          TextDirection.rtl) {
+                                                        _moveWordLeft(false);
+                                                      } else {
+                                                        _moveWordRight(false);
+                                                      }
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.lspCodeActions
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      (() async {
+                                                        _suggestionNotifier
+                                                                .value =
+                                                            null;
+                                                        await _fetchCodeActionsForCurrentPosition();
+                                                      })();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .jumpToDocumentStart
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
                                                       _controller
-                                                          .getLineAtOffset(
-                                                            selection
-                                                                .extentOffset,
+                                                          .pressDocumentHomeKey(
+                                                            isShiftPressed:
+                                                                false,
                                                           );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                  final anchorLine =
+                                                    if (shrtCt
+                                                        .jumpToDocumentStartAndSelectText
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
                                                       _controller
-                                                          .hasMultiCursors
-                                                      ? _controller.multiCursors
-                                                            .map((c) => c.line)
-                                                            .reduce(
-                                                              (a, b) =>
-                                                                  a < b ? a : b,
-                                                            )
-                                                      : primaryLine;
+                                                          .pressDocumentHomeKey(
+                                                            isShiftPressed:
+                                                                true,
+                                                          );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                  int targetLine =
-                                                      anchorLine - 1;
-                                                  while (targetLine > 0 &&
+                                                    if (shrtCt.jumpToDocumentEnd
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
                                                       _controller
+                                                          .pressDocumentEndKey(
+                                                            isShiftPressed:
+                                                                false,
+                                                          );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .jumpToDocumentEndAndSelectText
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller
+                                                          .pressDocumentEndKey(
+                                                            isShiftPressed:
+                                                                true,
+                                                          );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.showFindBar
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      final isAlt =
+                                                          HardwareKeyboard
+                                                              .instance
+                                                              .isAltPressed;
+                                                      _findController.isActive =
+                                                          true;
+                                                      _findController
+                                                              .isReplaceMode =
+                                                          isAlt;
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .showFindAndReplaceBar
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!HardwareKeyboard
+                                                          .instance
+                                                          .isMetaPressed) {
+                                                        _findController
+                                                                .isActive =
+                                                            true;
+                                                        _findController
+                                                                .isReplaceMode =
+                                                            true;
+
+                                                        return KeyEventResult
+                                                            .handled;
+                                                      }
+                                                    }
+
+                                                    if (shrtCt.lspSignatureHelp
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      setState(() {
+                                                        _isSignatureInvoked =
+                                                            true;
+                                                      });
+                                                      (() async => await _controller
+                                                          .callSignatureHelp())();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.shiftLineUp
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller.moveLineUp();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.shiftLineDown
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller
+                                                          .moveLineDown();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionToPreviousWord
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (widget
+                                                              .textDirection ==
+                                                          TextDirection.rtl) {
+                                                        _moveWordRight(true);
+                                                      } else {
+                                                        _moveWordLeft(true);
+                                                      }
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionToNextWord
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (widget
+                                                              .textDirection ==
+                                                          TextDirection.rtl) {
+                                                        _moveWordLeft(true);
+                                                      } else {
+                                                        _moveWordRight(true);
+                                                      }
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionForward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _handleArrowRight(true);
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionBackward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _handleArrowLeft(true);
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionUpward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller
+                                                          .pressUpArrowKey(
+                                                            isShiftPressed:
+                                                                true,
+                                                          );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .moveSelectionDownward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller
+                                                          .pressDownArrowKey(
+                                                            isShiftPressed:
+                                                                true,
+                                                          );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.selectToLineStart
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller.pressHomeKey(
+                                                        isShiftPressed: true,
+                                                      );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.selectToLineEnd
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller.pressEndKey(
+                                                        isShiftPressed: true,
+                                                      );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .extendMutliCursorDownward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      final selection =
+                                                          _controller.selection;
+                                                      final primaryLine =
+                                                          _controller
+                                                              .getLineAtOffset(
+                                                                selection
+                                                                    .extentOffset,
+                                                              );
+
+                                                      final anchorLine =
+                                                          _controller
+                                                              .hasMultiCursors
+                                                          ? _controller
+                                                                .multiCursors
+                                                                .map(
+                                                                  (c) => c.line,
+                                                                )
+                                                                .reduce(
+                                                                  (a, b) =>
+                                                                      a > b
+                                                                      ? a
+                                                                      : b,
+                                                                )
+                                                          : primaryLine;
+
+                                                      final foldAtAnchor =
+                                                          _controller
+                                                              .getFoldRangeAtCurrentLine(
+                                                                anchorLine,
+                                                              );
+                                                      int targetLine =
+                                                          (foldAtAnchor !=
+                                                                  null &&
+                                                              foldAtAnchor
+                                                                  .isFolded)
+                                                          ? foldAtAnchor
+                                                                    .endIndex +
+                                                                1
+                                                          : anchorLine + 1;
+
+                                                      while (targetLine <
+                                                              _controller
+                                                                  .lineCount &&
+                                                          _controller
+                                                              .isLineInFoldedRegion(
+                                                                targetLine,
+                                                              )) {
+                                                        final foldStart =
+                                                            _controller
+                                                                .getFoldStartForLine(
+                                                                  targetLine,
+                                                                );
+                                                        if (foldStart != null) {
+                                                          final fold =
+                                                              _controller
+                                                                  .foldings[foldStart] ??
+                                                              FoldRange(
+                                                                targetLine,
+                                                                targetLine,
+                                                              );
+                                                          targetLine =
+                                                              fold.endIndex + 1;
+                                                        } else {
+                                                          targetLine++;
+                                                        }
+                                                      }
+
+                                                      if (targetLine <
+                                                          _controller
+                                                              .lineCount) {
+                                                        final lineStart =
+                                                            _controller
+                                                                .getLineStartOffset(
+                                                                  primaryLine,
+                                                                );
+                                                        final column =
+                                                            selection
+                                                                .extentOffset -
+                                                            lineStart;
+                                                        final nextLineText =
+                                                            _controller
+                                                                .getLineText(
+                                                                  targetLine,
+                                                                );
+                                                        final newColumn = column
+                                                            .clamp(
+                                                              0,
+                                                              nextLineText
+                                                                  .length,
+                                                            );
+                                                        _controller
+                                                            .addMultiCursor(
+                                                              targetLine,
+                                                              newColumn,
+                                                            );
+                                                      }
+
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .extendMutliCursorUpward
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      final selection =
+                                                          _controller.selection;
+                                                      final primaryLine =
+                                                          _controller
+                                                              .getLineAtOffset(
+                                                                selection
+                                                                    .extentOffset,
+                                                              );
+
+                                                      final anchorLine =
+                                                          _controller
+                                                              .hasMultiCursors
+                                                          ? _controller
+                                                                .multiCursors
+                                                                .map(
+                                                                  (c) => c.line,
+                                                                )
+                                                                .reduce(
+                                                                  (a, b) =>
+                                                                      a < b
+                                                                      ? a
+                                                                      : b,
+                                                                )
+                                                          : primaryLine;
+
+                                                      int targetLine =
+                                                          anchorLine - 1;
+                                                      while (targetLine > 0 &&
+                                                          _controller
+                                                              .isLineInFoldedRegion(
+                                                                targetLine,
+                                                              )) {
+                                                        targetLine--;
+                                                      }
+                                                      if (_controller
                                                           .isLineInFoldedRegion(
                                                             targetLine,
                                                           )) {
-                                                    targetLine--;
-                                                  }
-                                                  if (_controller
-                                                      .isLineInFoldedRegion(
-                                                        targetLine,
-                                                      )) {
-                                                    targetLine =
-                                                        _controller
-                                                            .getFoldStartForLine(
-                                                              targetLine,
-                                                            ) ??
-                                                        0;
-                                                  }
+                                                        targetLine =
+                                                            _controller
+                                                                .getFoldStartForLine(
+                                                                  targetLine,
+                                                                ) ??
+                                                            0;
+                                                      }
 
-                                                  final lineStart = _controller
-                                                      .getLineStartOffset(
-                                                        primaryLine,
-                                                      );
-                                                  final column =
-                                                      selection.extentOffset -
-                                                      lineStart;
-                                                  final prevLineText =
-                                                      _controller.getLineText(
-                                                        targetLine,
-                                                      );
-                                                  final newColumn = column
-                                                      .clamp(
-                                                        0,
-                                                        prevLineText.length,
-                                                      );
-                                                  _controller.addMultiCursor(
-                                                    targetLine,
-                                                    newColumn,
-                                                  );
+                                                      final lineStart =
+                                                          _controller
+                                                              .getLineStartOffset(
+                                                                primaryLine,
+                                                              );
+                                                      final column =
+                                                          selection
+                                                              .extentOffset -
+                                                          lineStart;
+                                                      final prevLineText =
+                                                          _controller
+                                                              .getLineText(
+                                                                targetLine,
+                                                              );
+                                                      final newColumn = column
+                                                          .clamp(
+                                                            0,
+                                                            prevLineText.length,
+                                                          );
+                                                      _controller
+                                                          .addMultiCursor(
+                                                            targetLine,
+                                                            newColumn,
+                                                          );
 
-                                                  return KeyEventResult.handled;
-                                                }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                final isCtrlAltPressed =
-                                                    (HardwareKeyboard
-                                                            .instance
-                                                            .isControlPressed ||
+                                                    final isCtrlAltPressed =
+                                                        (HardwareKeyboard
+                                                                .instance
+                                                                .isControlPressed ||
+                                                            HardwareKeyboard
+                                                                .instance
+                                                                .isMetaPressed) &&
                                                         HardwareKeyboard
                                                             .instance
-                                                            .isMetaPressed) &&
-                                                    HardwareKeyboard
-                                                        .instance
-                                                        .isAltPressed;
+                                                            .isAltPressed;
 
-                                                if (event is KeyDownEvent &&
-                                                    isCtrlAltPressed &&
-                                                    !_controller
-                                                        .inlayHintsVisible) {
-                                                  _controller.showInlayHints();
-                                                  return KeyEventResult.handled;
-                                                }
+                                                    if (event is KeyDownEvent &&
+                                                        isCtrlAltPressed &&
+                                                        !_controller
+                                                            .inlayHintsVisible) {
+                                                      _controller
+                                                          .showInlayHints();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
 
-                                                if (event is KeyUpEvent &&
-                                                    _controller
-                                                        .inlayHintsVisible) {
-                                                  final isStillCtrlAlt =
-                                                      (HardwareKeyboard
+                                                    if (event is KeyUpEvent &&
+                                                        _controller
+                                                            .inlayHintsVisible) {
+                                                      final isStillCtrlAlt =
+                                                          (HardwareKeyboard
+                                                                  .instance
+                                                                  .isControlPressed ||
+                                                              HardwareKeyboard
+                                                                  .instance
+                                                                  .isMetaPressed) &&
+                                                          HardwareKeyboard
+                                                              .instance
+                                                              .isAltPressed;
+                                                      if (!isStillCtrlAlt) {
+                                                        _controller
+                                                            .hideInlayHints();
+                                                        return KeyEventResult
+                                                            .handled;
+                                                      }
+                                                    }
+
+                                                    if (event is KeyDownEvent ||
+                                                        event
+                                                            is KeyRepeatEvent) {
+                                                      final isAltPressed =
+                                                          HardwareKeyboard
+                                                              .instance
+                                                              .isAltPressed;
+                                                      final isShiftPressed =
+                                                          HardwareKeyboard
+                                                              .instance
+                                                              .isShiftPressed;
+                                                      final isCtrlPressed =
+                                                          HardwareKeyboard
                                                               .instance
                                                               .isControlPressed ||
                                                           HardwareKeyboard
                                                               .instance
-                                                              .isMetaPressed) &&
-                                                      HardwareKeyboard
-                                                          .instance
-                                                          .isAltPressed;
-                                                  if (!isStillCtrlAlt) {
-                                                    _controller
-                                                        .hideInlayHints();
-                                                    return KeyEventResult
-                                                        .handled;
-                                                  }
-                                                }
-
-                                                if (event is KeyDownEvent ||
-                                                    event is KeyRepeatEvent) {
-                                                  final isAltPressed =
-                                                      HardwareKeyboard
-                                                          .instance
-                                                          .isAltPressed;
-                                                  final isShiftPressed =
-                                                      HardwareKeyboard
-                                                          .instance
-                                                          .isShiftPressed;
-                                                  final isCtrlPressed =
-                                                      HardwareKeyboard
-                                                          .instance
-                                                          .isControlPressed ||
-                                                      HardwareKeyboard
-                                                          .instance
-                                                          .isMetaPressed;
-                                                  if (_suggestionNotifier
-                                                              .value !=
-                                                          null &&
-                                                      _suggestionNotifier
-                                                          .value!
-                                                          .isNotEmpty) {
-                                                    final suggestions =
-                                                        _suggestionNotifier
-                                                            .value!;
-                                                    switch (event.logicalKey) {
-                                                      case LogicalKeyboardKey
-                                                          .arrowDown:
-                                                        if (mounted) {
-                                                          setState(() {
-                                                            _sugSelIndex =
-                                                                (_sugSelIndex +
-                                                                    1) %
-                                                                suggestions
-                                                                    .length;
-                                                            _scrollToSelectedSuggestion();
-                                                          });
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .arrowUp:
-                                                        if (mounted) {
-                                                          setState(() {
-                                                            _sugSelIndex =
-                                                                (_sugSelIndex -
-                                                                    1 +
+                                                              .isMetaPressed;
+                                                      if (_suggestionNotifier
+                                                                  .value !=
+                                                              null &&
+                                                          _suggestionNotifier
+                                                              .value!
+                                                              .isNotEmpty) {
+                                                        final suggestions =
+                                                            _suggestionNotifier
+                                                                .value!;
+                                                        switch (event
+                                                            .logicalKey) {
+                                                          case LogicalKeyboardKey
+                                                              .arrowDown:
+                                                            if (mounted) {
+                                                              setState(() {
+                                                                _sugSelIndex =
+                                                                    (_sugSelIndex +
+                                                                        1) %
                                                                     suggestions
-                                                                        .length) %
-                                                                suggestions
-                                                                    .length;
-                                                            _scrollToSelectedSuggestion();
-                                                          });
+                                                                        .length;
+                                                                _scrollToSelectedSuggestion();
+                                                              });
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .arrowUp:
+                                                            if (mounted) {
+                                                              setState(() {
+                                                                _sugSelIndex =
+                                                                    (_sugSelIndex -
+                                                                        1 +
+                                                                        suggestions
+                                                                            .length) %
+                                                                    suggestions
+                                                                        .length;
+                                                                _scrollToSelectedSuggestion();
+                                                              });
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .enter:
+                                                          case LogicalKeyboardKey
+                                                              .tab:
+                                                            _acceptSuggestion();
+                                                            if (_extraText
+                                                                .isNotEmpty) {
+                                                              _controller
+                                                                  .applyWorkspaceEdit(
+                                                                    _extraText,
+                                                                  );
+                                                            }
+                                                            setState(() {
+                                                              _isSignatureInvoked =
+                                                                  true;
+                                                            });
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .escape:
+                                                            _suggestionNotifier
+                                                                    .value =
+                                                                null;
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          default:
+                                                            break;
                                                         }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .enter:
-                                                      case LogicalKeyboardKey
-                                                          .tab:
-                                                        _acceptSuggestion();
-                                                        if (_extraText
-                                                            .isNotEmpty) {
-                                                          _controller
-                                                              .applyWorkspaceEdit(
-                                                                _extraText,
-                                                              );
-                                                        }
-                                                        setState(() {
-                                                          _isSignatureInvoked =
-                                                              true;
-                                                        });
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .escape:
-                                                        _suggestionNotifier
-                                                                .value =
-                                                            null;
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      default:
-                                                        break;
-                                                    }
-                                                  }
+                                                      }
 
-                                                  if (_lspActionNotifier
-                                                              .value !=
-                                                          null &&
-                                                      _lspActionOffsetNotifier
-                                                              .value !=
-                                                          null &&
-                                                      _lspActionNotifier
-                                                          .value!
-                                                          .isNotEmpty) {
-                                                    final actions =
-                                                        _lspActionNotifier
-                                                            .value!;
-                                                    switch (event.logicalKey) {
-                                                      case LogicalKeyboardKey
-                                                          .arrowDown:
-                                                        if (mounted) {
-                                                          setState(() {
-                                                            _actionSelIndex =
-                                                                (_actionSelIndex +
-                                                                    1) %
-                                                                actions.length;
-                                                            _scrollToSelectedAction();
-                                                          });
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .arrowUp:
-                                                        if (mounted) {
-                                                          setState(() {
-                                                            _actionSelIndex =
-                                                                (_actionSelIndex -
-                                                                    1 +
+                                                      if (_lspActionNotifier
+                                                                  .value !=
+                                                              null &&
+                                                          _lspActionOffsetNotifier
+                                                                  .value !=
+                                                              null &&
+                                                          _lspActionNotifier
+                                                              .value!
+                                                              .isNotEmpty) {
+                                                        final actions =
+                                                            _lspActionNotifier
+                                                                .value!;
+                                                        switch (event
+                                                            .logicalKey) {
+                                                          case LogicalKeyboardKey
+                                                              .arrowDown:
+                                                            if (mounted) {
+                                                              setState(() {
+                                                                _actionSelIndex =
+                                                                    (_actionSelIndex +
+                                                                        1) %
                                                                     actions
-                                                                        .length) %
-                                                                actions.length;
-                                                            _scrollToSelectedAction();
-                                                          });
+                                                                        .length;
+                                                                _scrollToSelectedAction();
+                                                              });
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .arrowUp:
+                                                            if (mounted) {
+                                                              setState(() {
+                                                                _actionSelIndex =
+                                                                    (_actionSelIndex -
+                                                                        1 +
+                                                                        actions
+                                                                            .length) %
+                                                                    actions
+                                                                        .length;
+                                                                _scrollToSelectedAction();
+                                                              });
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .enter:
+                                                          case LogicalKeyboardKey
+                                                              .tab:
+                                                            (() async {
+                                                              await _controller
+                                                                  .applyWorkspaceEdit(
+                                                                    _lspActionNotifier
+                                                                        .value![_actionSelIndex],
+                                                                  );
+                                                            })();
+                                                            _lspActionNotifier
+                                                                    .value =
+                                                                null;
+                                                            _lspActionOffsetNotifier
+                                                                    .value =
+                                                                null;
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .escape:
+                                                            _lspActionNotifier
+                                                                    .value =
+                                                                null;
+                                                            _lspActionOffsetNotifier
+                                                                    .value =
+                                                                null;
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          default:
+                                                            break;
                                                         }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .enter:
-                                                      case LogicalKeyboardKey
-                                                          .tab:
-                                                        (() async {
-                                                          await _controller
-                                                              .applyWorkspaceEdit(
-                                                                _lspActionNotifier
-                                                                    .value![_actionSelIndex],
-                                                              );
-                                                        })();
-                                                        _lspActionNotifier
-                                                                .value =
-                                                            null;
-                                                        _lspActionOffsetNotifier
-                                                                .value =
-                                                            null;
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .escape:
-                                                        _lspActionNotifier
-                                                                .value =
-                                                            null;
-                                                        _lspActionOffsetNotifier
-                                                                .value =
-                                                            null;
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      default:
-                                                        break;
-                                                    }
-                                                  }
+                                                      }
 
-                                                  if (isCtrlPressed) {
-                                                    switch (event.logicalKey) {
-                                                      case LogicalKeyboardKey
-                                                          .keyC:
-                                                        _controller.copy();
+                                                      if (isCtrlPressed) {
+                                                        switch (event
+                                                            .logicalKey) {
+                                                          case LogicalKeyboardKey
+                                                              .keyC:
+                                                            _controller.copy();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .keyX:
+                                                            if (_readOnly) {
+                                                              return KeyEventResult
+                                                                  .handled;
+                                                            }
+                                                            _controller.cut();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .keyV:
+                                                            if (_readOnly) {
+                                                              return KeyEventResult
+                                                                  .handled;
+                                                            }
+                                                            _controller.paste();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .keyA:
+                                                            _controller
+                                                                .selectAll();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .keyZ:
+                                                            if (_readOnly) {
+                                                              return KeyEventResult
+                                                                  .handled;
+                                                            }
+                                                            if (isShiftPressed) {
+                                                              if (_undoRedoController
+                                                                  .canRedo) {
+                                                                _undoRedoController
+                                                                    .redo();
+                                                                _commonKeyFunctions();
+                                                              }
+                                                            } else if (_undoRedoController
+                                                                .canUndo) {
+                                                              _undoRedoController
+                                                                  .undo();
+                                                              _commonKeyFunctions();
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .keyY:
+                                                            if (_readOnly) {
+                                                              return KeyEventResult
+                                                                  .handled;
+                                                            }
+                                                            if (_undoRedoController
+                                                                .canRedo) {
+                                                              _undoRedoController
+                                                                  .redo();
+                                                              _commonKeyFunctions();
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          default:
+                                                            break;
+                                                        }
+                                                      }
+
+                                                      if (isAltPressed &&
+                                                          !isCtrlPressed &&
+                                                          _isMac) {
+                                                        switch (event
+                                                            .logicalKey) {
+                                                          case LogicalKeyboardKey
+                                                              .arrowLeft:
+                                                            if (widget
+                                                                    .textDirection ==
+                                                                TextDirection
+                                                                    .rtl) {
+                                                              _moveWordRight(
+                                                                isShiftPressed,
+                                                              );
+                                                            } else {
+                                                              _moveWordLeft(
+                                                                isShiftPressed,
+                                                              );
+                                                            }
+                                                            _commonKeyFunctions();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .arrowRight:
+                                                            if (widget
+                                                                    .textDirection ==
+                                                                TextDirection
+                                                                    .rtl) {
+                                                              _moveWordLeft(
+                                                                isShiftPressed,
+                                                              );
+                                                            } else {
+                                                              _moveWordRight(
+                                                                isShiftPressed,
+                                                              );
+                                                            }
+                                                            _commonKeyFunctions();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .backspace:
+                                                            if (!_readOnly) {
+                                                              _deleteWordBackward();
+                                                              _commonKeyFunctions();
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          case LogicalKeyboardKey
+                                                              .delete:
+                                                            if (!_readOnly) {
+                                                              _deleteWordForward();
+                                                              _commonKeyFunctions();
+                                                            }
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          default:
+                                                            break;
+                                                        }
+                                                      }
+
+                                                      if (isShiftPressed &&
+                                                          !isCtrlPressed &&
+                                                          event.logicalKey ==
+                                                              LogicalKeyboardKey
+                                                                  .tab) {
+                                                        if (!_readOnly) {
+                                                          _controller
+                                                              .unindent();
+                                                          _commonKeyFunctions();
+                                                        }
                                                         return KeyEventResult
                                                             .handled;
-                                                      case LogicalKeyboardKey
-                                                          .keyX:
-                                                        if (_readOnly) {
+                                                      }
+
+                                                      switch (event
+                                                          .logicalKey) {
+                                                        case LogicalKeyboardKey
+                                                            .backspace:
+                                                          if (_readOnly) {
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          }
+
+                                                          if (_controller
+                                                              .hasMultiCursors) {
+                                                            _controller
+                                                                .backspaceAtAllCursors();
+                                                          } else {
+                                                            _controller
+                                                                .backspace();
+                                                          }
+
+                                                          if (_suggestionNotifier
+                                                                  .value !=
+                                                              null) {
+                                                            _suggestionNotifier
+                                                                    .value =
+                                                                null;
+                                                          }
+                                                          _commonKeyFunctions();
                                                           return KeyEventResult
                                                               .handled;
-                                                        }
-                                                        _controller.cut();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .keyV:
-                                                        if (_readOnly) {
+
+                                                        case LogicalKeyboardKey
+                                                            .delete:
+                                                          if (_readOnly) {
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          }
+                                                          if (_controller
+                                                              .hasMultiCursors) {
+                                                            _controller
+                                                                .deleteAtAllCursors();
+                                                          } else {
+                                                            _controller
+                                                                .delete();
+                                                          }
+                                                          if (_suggestionNotifier
+                                                                  .value !=
+                                                              null) {
+                                                            _suggestionNotifier
+                                                                    .value =
+                                                                null;
+                                                          }
+                                                          _commonKeyFunctions();
                                                           return KeyEventResult
                                                               .handled;
-                                                        }
-                                                        _controller.paste();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .keyA:
-                                                        _controller.selectAll();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .keyZ:
-                                                        if (_readOnly) {
+
+                                                        case LogicalKeyboardKey
+                                                            .arrowDown:
+                                                          _controller
+                                                              .pressDownArrowKey(
+                                                                isShiftPressed:
+                                                                    isShiftPressed,
+                                                              );
+
+                                                          if (_controller
+                                                              .hasMultiCursors) {
+                                                            _controller
+                                                                .moveMultiCursorsDown(
+                                                                  isShiftPressed:
+                                                                      isShiftPressed,
+                                                                );
+                                                          }
+
+                                                          _commonKeyFunctions();
                                                           return KeyEventResult
                                                               .handled;
-                                                        }
-                                                        if (isShiftPressed) {
-                                                          if (_undoRedoController
-                                                              .canRedo) {
-                                                            _undoRedoController
-                                                                .redo();
+
+                                                        case LogicalKeyboardKey
+                                                            .arrowUp:
+                                                          _controller
+                                                              .pressUpArrowKey(
+                                                                isShiftPressed:
+                                                                    isShiftPressed,
+                                                              );
+
+                                                          if (_controller
+                                                              .hasMultiCursors) {
+                                                            _controller
+                                                                .moveMultiCursorsUp(
+                                                                  isShiftPressed:
+                                                                      isShiftPressed,
+                                                                );
+                                                          }
+
+                                                          _commonKeyFunctions();
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .arrowRight:
+                                                          _handleArrowRight(
+                                                            isShiftPressed,
+                                                          );
+                                                          _commonKeyFunctions();
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .arrowLeft:
+                                                          _handleArrowLeft(
+                                                            isShiftPressed,
+                                                          );
+                                                          _commonKeyFunctions();
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .home:
+                                                          _handleHomeKey(
+                                                            isShiftPressed,
+                                                          );
+                                                          _commonKeyFunctions();
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .end:
+                                                          _handleEndKey(
+                                                            isShiftPressed,
+                                                          );
+                                                          _commonKeyFunctions();
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .escape:
+                                                          _hoverTimer?.cancel();
+                                                          _lspSignatureNotifier
+                                                                  .value =
+                                                              null;
+                                                          _contextMenuOffsetNotifier
+                                                                  .value =
+                                                              const Offset(
+                                                                -1,
+                                                                -1,
+                                                              );
+                                                          _findController
+                                                                  .isActive =
+                                                              false;
+                                                          _findController
+                                                                  .isReplaceMode =
+                                                              false;
+                                                          _aiNotifier.value =
+                                                              null;
+                                                          _suggestionNotifier
+                                                                  .value =
+                                                              null;
+                                                          _hoverNotifier.value =
+                                                              null;
+                                                          _controller
+                                                              .clearMultiCursors();
+                                                          setState(() {
+                                                            _isSignatureInvoked =
+                                                                false;
+                                                          });
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .tab:
+                                                          if (_readOnly) {
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          }
+                                                          final ghost =
+                                                              _controller
+                                                                  .ghostText;
+                                                          if (ghost != null &&
+                                                              !ghost
+                                                                  .shouldPersist) {
+                                                            _acceptControllerGhostText();
+                                                            return KeyEventResult
+                                                                .handled;
+                                                          }
+                                                          if (_aiNotifier
+                                                                  .value !=
+                                                              null) {
+                                                            _acceptGhostText();
+                                                          } else if (_suggestionNotifier
+                                                                  .value ==
+                                                              null) {
+                                                            _controller
+                                                                .indent();
                                                             _commonKeyFunctions();
                                                           }
-                                                        } else if (_undoRedoController
-                                                            .canUndo) {
-                                                          _undoRedoController
-                                                              .undo();
-                                                          _commonKeyFunctions();
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .keyY:
-                                                        if (_readOnly) {
                                                           return KeyEventResult
                                                               .handled;
-                                                        }
-                                                        if (_undoRedoController
-                                                            .canRedo) {
-                                                          _undoRedoController
-                                                              .redo();
-                                                          _commonKeyFunctions();
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      default:
-                                                        break;
-                                                    }
-                                                  }
 
-                                                  if (isAltPressed &&
-                                                      !isCtrlPressed &&
-                                                      _isMac) {
-                                                    switch (event.logicalKey) {
-                                                      case LogicalKeyboardKey
-                                                          .arrowLeft:
-                                                        if (widget
-                                                                .textDirection ==
-                                                            TextDirection.rtl) {
-                                                          _moveWordRight(
-                                                            isShiftPressed,
-                                                          );
-                                                        } else {
-                                                          _moveWordLeft(
-                                                            isShiftPressed,
-                                                          );
-                                                        }
-                                                        _commonKeyFunctions();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .arrowRight:
-                                                        if (widget
-                                                                .textDirection ==
-                                                            TextDirection.rtl) {
-                                                          _moveWordLeft(
-                                                            isShiftPressed,
-                                                          );
-                                                        } else {
-                                                          _moveWordRight(
-                                                            isShiftPressed,
-                                                          );
-                                                        }
-                                                        _commonKeyFunctions();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .backspace:
-                                                        if (!_readOnly) {
-                                                          _deleteWordBackward();
-                                                          _commonKeyFunctions();
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      case LogicalKeyboardKey
-                                                          .delete:
-                                                        if (!_readOnly) {
-                                                          _deleteWordForward();
-                                                          _commonKeyFunctions();
-                                                        }
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      default:
-                                                        break;
-                                                    }
-                                                  }
+                                                        case LogicalKeyboardKey
+                                                            .pageUp:
+                                                          _vscrollController
+                                                              .animateTo(
+                                                                _vscrollController
+                                                                        .offset -
+                                                                    650,
+                                                                duration: Duration(
+                                                                  milliseconds:
+                                                                      300,
+                                                                ),
+                                                                curve:
+                                                                    Curves.ease,
+                                                              );
+                                                          return KeyEventResult
+                                                              .handled;
 
-                                                  if (isShiftPressed &&
-                                                      !isCtrlPressed &&
-                                                      event.logicalKey ==
-                                                          LogicalKeyboardKey
-                                                              .tab) {
-                                                    if (!_readOnly) {
-                                                      _controller.unindent();
-                                                      _commonKeyFunctions();
+                                                        case LogicalKeyboardKey
+                                                            .pageDown:
+                                                          _vscrollController
+                                                              .animateTo(
+                                                                _vscrollController
+                                                                        .offset +
+                                                                    650,
+                                                                duration: Duration(
+                                                                  milliseconds:
+                                                                      300,
+                                                                ),
+                                                                curve:
+                                                                    Curves.ease,
+                                                              );
+                                                          return KeyEventResult
+                                                              .handled;
+
+                                                        case LogicalKeyboardKey
+                                                            .enter:
+                                                          if (_aiNotifier
+                                                                  .value !=
+                                                              null) {
+                                                            _aiNotifier.value =
+                                                                null;
+                                                          }
+                                                          break;
+                                                        default:
+                                                      }
                                                     }
                                                     return KeyEventResult
-                                                        .handled;
-                                                  }
-
-                                                  switch (event.logicalKey) {
-                                                    case LogicalKeyboardKey
-                                                        .backspace:
-                                                      if (_readOnly) {
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      }
-
-                                                      if (_controller
-                                                          .hasMultiCursors) {
-                                                        _controller
-                                                            .backspaceAtAllCursors();
-                                                      } else {
-                                                        _controller.backspace();
-                                                      }
-
-                                                      if (_suggestionNotifier
-                                                              .value !=
-                                                          null) {
-                                                        _suggestionNotifier
-                                                                .value =
-                                                            null;
-                                                      }
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .delete:
-                                                      if (_readOnly) {
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      }
-                                                      if (_controller
-                                                          .hasMultiCursors) {
-                                                        _controller
-                                                            .deleteAtAllCursors();
-                                                      } else {
-                                                        _controller.delete();
-                                                      }
-                                                      if (_suggestionNotifier
-                                                              .value !=
-                                                          null) {
-                                                        _suggestionNotifier
-                                                                .value =
-                                                            null;
-                                                      }
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .arrowDown:
-                                                      _controller
-                                                          .pressDownArrowKey(
-                                                            isShiftPressed:
-                                                                isShiftPressed,
-                                                          );
-
-                                                      if (_controller
-                                                          .hasMultiCursors) {
-                                                        _controller
-                                                            .moveMultiCursorsDown(
-                                                              isShiftPressed:
-                                                                  isShiftPressed,
-                                                            );
-                                                      }
-
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .arrowUp:
-                                                      _controller
-                                                          .pressUpArrowKey(
-                                                            isShiftPressed:
-                                                                isShiftPressed,
-                                                          );
-
-                                                      if (_controller
-                                                          .hasMultiCursors) {
-                                                        _controller
-                                                            .moveMultiCursorsUp(
-                                                              isShiftPressed:
-                                                                  isShiftPressed,
-                                                            );
-                                                      }
-
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .arrowRight:
-                                                      _handleArrowRight(
-                                                        isShiftPressed,
-                                                      );
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .arrowLeft:
-                                                      _handleArrowLeft(
-                                                        isShiftPressed,
-                                                      );
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .home:
-                                                      _handleHomeKey(
-                                                        isShiftPressed,
-                                                      );
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey.end:
-                                                      _handleEndKey(
-                                                        isShiftPressed,
-                                                      );
-                                                      _commonKeyFunctions();
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .escape:
-                                                      _hoverTimer?.cancel();
-                                                      _lspSignatureNotifier
-                                                              .value =
-                                                          null;
-                                                      _contextMenuOffsetNotifier
-                                                          .value = const Offset(
-                                                        -1,
-                                                        -1,
-                                                      );
-                                                      _findController.isActive =
-                                                          false;
-                                                      _findController
-                                                              .isReplaceMode =
-                                                          false;
-                                                      _aiNotifier.value = null;
-                                                      _suggestionNotifier
-                                                              .value =
-                                                          null;
-                                                      _hoverNotifier.value =
-                                                          null;
-                                                      _controller
-                                                          .clearMultiCursors();
-                                                      setState(() {
-                                                        _isSignatureInvoked =
-                                                            false;
-                                                      });
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey.tab:
-                                                      if (_readOnly) {
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      }
-                                                      final ghost =
-                                                          _controller.ghostText;
-                                                      if (ghost != null &&
-                                                          !ghost
-                                                              .shouldPersist) {
-                                                        _acceptControllerGhostText();
-                                                        return KeyEventResult
-                                                            .handled;
-                                                      }
-                                                      if (_aiNotifier.value !=
-                                                          null) {
-                                                        _acceptGhostText();
-                                                      } else if (_suggestionNotifier
-                                                              .value ==
-                                                          null) {
-                                                        _controller.indent();
-                                                        _commonKeyFunctions();
-                                                      }
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .pageUp:
-                                                      _vscrollController
-                                                          .animateTo(
-                                                            _vscrollController
-                                                                    .offset -
-                                                                650,
-                                                            duration: Duration(
-                                                              milliseconds: 300,
-                                                            ),
-                                                            curve: Curves.ease,
-                                                          );
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .pageDown:
-                                                      _vscrollController
-                                                          .animateTo(
-                                                            _vscrollController
-                                                                    .offset +
-                                                                650,
-                                                            duration: Duration(
-                                                              milliseconds: 300,
-                                                            ),
-                                                            curve: Curves.ease,
-                                                          );
-                                                      return KeyEventResult
-                                                          .handled;
-
-                                                    case LogicalKeyboardKey
-                                                        .enter:
-                                                      if (_aiNotifier.value !=
-                                                          null) {
-                                                        _aiNotifier.value =
-                                                            null;
-                                                      }
-                                                      break;
-                                                    default:
-                                                  }
-                                                }
-                                                return KeyEventResult.ignored;
+                                                        .ignored;
+                                                  },
+                                                  child: _CodeField(
+                                                    onRendererCreated:
+                                                        (renderer) =>
+                                                            _codeFieldRenderer =
+                                                                renderer,
+                                                    context: context,
+                                                    controller: _controller,
+                                                    editorTheme: _editorTheme,
+                                                    language: _language,
+                                                    extraLanguages:
+                                                        widget.extraLanguages,
+                                                    languageId: _controller
+                                                        .lspConfig
+                                                        ?.languageId,
+                                                    lspConfig:
+                                                        _controller.lspConfig,
+                                                    semanticTokens:
+                                                        _semanticTokens,
+                                                    semanticTokensVersion:
+                                                        _semanticTokensVersion,
+                                                    innerPadding:
+                                                        widget.innerPadding,
+                                                    vscrollController:
+                                                        _vscrollController,
+                                                    hscrollController:
+                                                        _hscrollController,
+                                                    focusNode: _focusNode,
+                                                    readOnly: _readOnly,
+                                                    caretBlinkController:
+                                                        _caretBlinkController,
+                                                    lineHighlightController:
+                                                        _lineHighlightController,
+                                                    textStyle: widget.textStyle,
+                                                    enableFolding:
+                                                        widget.enableFolding,
+                                                    enableGuideLines:
+                                                        widget.enableGuideLines,
+                                                    enableGutter:
+                                                        widget.enableGutter,
+                                                    enableGutterDivider: widget
+                                                        .enableGutterDivider,
+                                                    gutterStyle: _gutterStyle,
+                                                    selectionStyle:
+                                                        _selectionStyle,
+                                                    diagnostics:
+                                                        _diagnosticsNotifier
+                                                            .value,
+                                                    isMobile: _isMobile,
+                                                    selectionActiveNotifier:
+                                                        _selectionActiveNotifier,
+                                                    contextMenuOffsetNotifier:
+                                                        _contextMenuOffsetNotifier,
+                                                    contextMenuTextOffsetNotifier:
+                                                        _contextMenuTextOffsetNotifier,
+                                                    onModifierTap:
+                                                        widget.onModifierTap,
+                                                    hoverNotifier:
+                                                        _hoverNotifier,
+                                                    hoverContentNotifier:
+                                                        _hoverContentNotifier,
+                                                    lineWrap: widget.lineWrap,
+                                                    offsetNotifier:
+                                                        _offsetNotifier,
+                                                    aiNotifier: _aiNotifier,
+                                                    aiOffsetNotifier:
+                                                        _aiOffsetNotifier,
+                                                    isHoveringPopup:
+                                                        _isHoveringPopup,
+                                                    suggestionNotifier:
+                                                        _suggestionNotifier,
+                                                    ghostTextStyle:
+                                                        widget.ghostTextStyle,
+                                                    matchHighlightStyle: widget
+                                                        .matchHighlightStyle,
+                                                    lspActionNotifier:
+                                                        _lspActionNotifier,
+                                                    lspActionOffsetNotifier:
+                                                        _lspActionOffsetNotifier,
+                                                    signatureNotifier:
+                                                        _lspSignatureNotifier,
+                                                    filePath: _filePath,
+                                                    textDirection:
+                                                        widget.textDirection,
+                                                    onHoverSetByTap: () {
+                                                      _hoverSetByTap = true;
+                                                    },
+                                                    gutterBuilder:
+                                                        widget.gutterBuilder,
+                                                  ),
+                                                );
                                               },
-                                              child: _CodeField(
-                                                key: _codeFieldKey,
-                                                context: context,
-                                                controller: _controller,
-                                                editorTheme: _editorTheme,
-                                                language: _language,
-                                                extraLanguages:
-                                                    widget.extraLanguages,
-                                                languageId: _controller
-                                                    .lspConfig
-                                                    ?.languageId,
-                                                lspConfig:
-                                                    _controller.lspConfig,
-                                                semanticTokens: _semanticTokens,
-                                                semanticTokensVersion:
-                                                    _semanticTokensVersion,
-                                                innerPadding:
-                                                    widget.innerPadding,
-                                                vscrollController:
-                                                    _vscrollController,
-                                                hscrollController:
-                                                    _hscrollController,
-                                                focusNode: _focusNode,
-                                                readOnly: _readOnly,
-                                                caretBlinkController:
-                                                    _caretBlinkController,
-                                                lineHighlightController:
-                                                    _lineHighlightController,
-                                                textStyle: widget.textStyle,
-                                                enableFolding:
-                                                    widget.enableFolding,
-                                                enableGuideLines:
-                                                    widget.enableGuideLines,
-                                                enableGutter:
-                                                    widget.enableGutter,
-                                                enableGutterDivider:
-                                                    widget.enableGutterDivider,
-                                                gutterStyle: _gutterStyle,
-                                                selectionStyle: _selectionStyle,
-                                                diagnostics:
-                                                    _diagnosticsNotifier.value,
-                                                isMobile: _isMobile,
-                                                selectionActiveNotifier:
-                                                    _selectionActiveNotifier,
-                                                contextMenuOffsetNotifier:
-                                                    _contextMenuOffsetNotifier,
-                                                hoverNotifier: _hoverNotifier,
-                                                hoverContentNotifier:
-                                                    _hoverContentNotifier,
-                                                lineWrap: widget.lineWrap,
-                                                offsetNotifier: _offsetNotifier,
-                                                aiNotifier: _aiNotifier,
-                                                aiOffsetNotifier:
-                                                    _aiOffsetNotifier,
-                                                isHoveringPopup:
-                                                    _isHoveringPopup,
-                                                suggestionNotifier:
-                                                    _suggestionNotifier,
-                                                ghostTextStyle:
-                                                    widget.ghostTextStyle,
-                                                matchHighlightStyle:
-                                                    widget.matchHighlightStyle,
-                                                lspActionNotifier:
-                                                    _lspActionNotifier,
-                                                lspActionOffsetNotifier:
-                                                    _lspActionOffsetNotifier,
-                                                signatureNotifier:
-                                                    _lspSignatureNotifier,
-                                                filePath: _filePath,
-                                                textDirection:
-                                                    widget.textDirection,
-                                                onHoverSetByTap: () {
-                                                  _hoverSetByTap = true;
-                                                },
-                                                gutterBuilder:
-                                                    widget.gutterBuilder,
-                                              ),
-                                            );
-                                          },
-                                        ),
-                                      ),
-                                    );
-                                  },
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
                                 ),
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ),
-                  _buildContextMenu(),
-                  ValueListenableBuilder(
-                    valueListenable: _offsetNotifier,
-                    builder: (_, offset, _) {
-                      return ValueListenableBuilder(
-                        valueListenable: _lspSignatureNotifier,
-                        builder: (_, signature, _) {
-                          if (signature == null ||
-                              signature.activeParameter < 0 ||
-                              signature.parameters.isEmpty) {
-                            return SizedBox.shrink();
-                          }
-                          final sigScrollCtrl = ScrollController();
+                      _buildContextMenu(),
+                      ValueListenableBuilder(
+                        valueListenable: _offsetNotifier,
+                        builder: (_, offset, _) {
+                          return ValueListenableBuilder(
+                            valueListenable: _lspSignatureNotifier,
+                            builder: (_, signature, _) {
+                              if (signature == null ||
+                                  signature.activeParameter < 0 ||
+                                  signature.parameters.isEmpty) {
+                                return SizedBox.shrink();
+                              }
+                              final sigScrollCtrl = ScrollController();
 
-                          final desiredWidth = screenWidth < 700
-                              ? screenWidth * 0.63
-                              : 420.0;
-                          final maxBoxHeight = 400.0;
-                          final fontSize = widget.textStyle?.fontSize ?? 14;
+                              final desiredWidth = screenWidth < 700
+                                  ? screenWidth * 0.63
+                                  : 420.0;
+                              final maxBoxHeight = 400.0;
+                              final fontSize = widget.textStyle?.fontSize ?? 14;
 
-                          double adjustedLeft = offset.dx;
-                          if (adjustedLeft + desiredWidth > screenWidth) {
-                            adjustedLeft = screenWidth - desiredWidth;
-                          }
-                          if (adjustedLeft < 0) {
-                            adjustedLeft = 0;
-                          }
+                              double adjustedLeft = offset.dx;
+                              if (adjustedLeft + desiredWidth > screenWidth) {
+                                adjustedLeft = screenWidth - desiredWidth;
+                              }
+                              if (adjustedLeft < 0) {
+                                adjustedLeft = 0;
+                              }
 
-                          final spaceBelow =
-                              editorHeight - offset.dy - fontSize - 10;
-                          final spaceAbove = offset.dy - 10;
-                          final shouldPositionAbove =
-                              maxBoxHeight > spaceBelow &&
-                              spaceAbove > maxBoxHeight;
+                              final spaceBelow =
+                                  popupHeight -
+                                  offset.dy -
+                                  fontSize -
+                                  popupBottomGap -
+                                  10;
+                              final spaceAbove = offset.dy - 10;
+                              final shouldPositionAbove =
+                                  maxBoxHeight > spaceBelow &&
+                                  spaceAbove >= spaceBelow;
+                              final availableHeight = max(
+                                0.0,
+                                min(
+                                  maxBoxHeight,
+                                  shouldPositionAbove ? spaceAbove : spaceBelow,
+                                ),
+                              );
 
-                          double? adjustedTop;
-                          double? adjustedBottom;
+                              double? adjustedTop;
+                              double? adjustedBottom;
 
-                          if (shouldPositionAbove) {
-                            adjustedBottom = editorHeight - offset.dy + 10;
-                          } else {
-                            adjustedTop = offset.dy + fontSize + 10;
-                          }
+                              if (shouldPositionAbove) {
+                                adjustedBottom = popupHeight - offset.dy + 10;
+                              } else {
+                                adjustedTop = offset.dy + fontSize + 10;
+                              }
 
-                          return Positioned(
-                            width: desiredWidth,
-                            top: adjustedTop,
-                            bottom: adjustedBottom,
-                            left: adjustedLeft,
-                            child: ConstrainedBox(
-                              constraints: BoxConstraints(
-                                maxWidth: desiredWidth,
-                                maxHeight: maxBoxHeight,
-                                minWidth: 70,
-                              ),
-                              child: Card(
-                                color: _hoverDetailsStyle.backgroundColor,
-                                shape: _hoverDetailsStyle.shape,
-                                child: RawScrollbar(
-                                  interactive: true,
-                                  controller: sigScrollCtrl,
-                                  thumbVisibility: true,
-                                  thumbColor: _editorTheme['root']!.color!
-                                      .withAlpha(100),
-                                  child: SingleChildScrollView(
-                                    controller: sigScrollCtrl,
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Padding(
-                                          padding: const EdgeInsets.only(
-                                            top: 7,
-                                            left: 6.5,
-                                          ),
-                                          child: RichText(
-                                            text: (() {
-                                              final label = signature.label;
-                                              final activeParamIndex =
-                                                  signature.activeParameter;
+                              return Positioned(
+                                width: desiredWidth,
+                                top: adjustedTop,
+                                bottom: adjustedBottom,
+                                left: adjustedLeft,
+                                child: ConstrainedBox(
+                                  constraints: BoxConstraints(
+                                    maxWidth: desiredWidth,
+                                    maxHeight: availableHeight,
+                                    minWidth: 70,
+                                  ),
+                                  child: Card(
+                                    color: _hoverDetailsStyle.backgroundColor,
+                                    shape: _hoverDetailsStyle.shape,
+                                    child: RawScrollbar(
+                                      interactive: true,
+                                      controller: sigScrollCtrl,
+                                      thumbVisibility: true,
+                                      thumbColor: _editorTheme['root']!.color!
+                                          .withAlpha(100),
+                                      child: SingleChildScrollView(
+                                        controller: sigScrollCtrl,
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 7,
+                                                left: 6.5,
+                                              ),
+                                              child: RichText(
+                                                text: (() {
+                                                  final label = signature.label;
+                                                  final activeParamIndex =
+                                                      signature.activeParameter;
 
-                                              if (activeParamIndex < 0 ||
-                                                  activeParamIndex >=
-                                                      signature
-                                                          .parameters
-                                                          .length) {
-                                                return TextSpan(text: label);
-                                              }
-
-                                              final paramLabel = signature
-                                                  .parameters[activeParamIndex]['label'];
-
-                                              if (paramLabel is List &&
-                                                  paramLabel.length >= 2) {
-                                                final range = paramLabel
-                                                    .cast<int>();
-                                                final firstPart = label
-                                                    .substring(0, range[0]);
-                                                final highlightPart = label
-                                                    .substring(
-                                                      range[0],
-                                                      range[1],
+                                                  if (activeParamIndex < 0 ||
+                                                      activeParamIndex >=
+                                                          signature
+                                                              .parameters
+                                                              .length) {
+                                                    return TextSpan(
+                                                      text: label,
                                                     );
-                                                final finalPart = label
-                                                    .substring(range[1]);
+                                                  }
 
-                                                return TextSpan(
-                                                  style: TextStyle(
-                                                    fontSize:
-                                                        (widget
-                                                                .textStyle
-                                                                ?.fontSize ??
-                                                            15) +
-                                                        1.75,
-                                                    color: _editorTheme['root']
-                                                        ?.color,
-                                                  ),
-                                                  children: [
-                                                    TextSpan(text: firstPart),
-                                                    TextSpan(
-                                                      text: highlightPart,
+                                                  final paramLabel = signature
+                                                      .parameters[activeParamIndex]['label'];
+
+                                                  if (paramLabel is List &&
+                                                      paramLabel.length >= 2) {
+                                                    final range = paramLabel
+                                                        .cast<int>();
+                                                    final firstPart = label
+                                                        .substring(0, range[0]);
+                                                    final highlightPart = label
+                                                        .substring(
+                                                          range[0],
+                                                          range[1],
+                                                        );
+                                                    final finalPart = label
+                                                        .substring(range[1]);
+
+                                                    return TextSpan(
                                                       style: TextStyle(
-                                                        fontWeight:
-                                                            FontWeight.bold,
-                                                        color: Colors.blue,
+                                                        fontSize:
+                                                            (widget
+                                                                    .textStyle
+                                                                    ?.fontSize ??
+                                                                15) +
+                                                            1.75,
+                                                        color:
+                                                            _editorTheme['root']
+                                                                ?.color,
                                                       ),
-                                                    ),
-                                                    TextSpan(text: finalPart),
-                                                  ],
-                                                );
-                                              } else if (paramLabel is String) {
-                                                final paramText = paramLabel;
-                                                final paramIndex = label
-                                                    .indexOf(paramText);
+                                                      children: [
+                                                        TextSpan(
+                                                          text: firstPart,
+                                                        ),
+                                                        TextSpan(
+                                                          text: highlightPart,
+                                                          style: TextStyle(
+                                                            fontWeight:
+                                                                FontWeight.bold,
+                                                            color: Colors.blue,
+                                                          ),
+                                                        ),
+                                                        TextSpan(
+                                                          text: finalPart,
+                                                        ),
+                                                      ],
+                                                    );
+                                                  } else if (paramLabel
+                                                      is String) {
+                                                    final paramText =
+                                                        paramLabel;
+                                                    final paramIndex = label
+                                                        .indexOf(paramText);
 
-                                                if (paramIndex >= 0) {
-                                                  final firstPart = label
-                                                      .substring(0, paramIndex);
-                                                  final highlightPart =
-                                                      paramText;
-                                                  final finalPart = label
-                                                      .substring(
-                                                        paramIndex +
-                                                            paramText.length,
+                                                    if (paramIndex >= 0) {
+                                                      final firstPart = label
+                                                          .substring(
+                                                            0,
+                                                            paramIndex,
+                                                          );
+                                                      final highlightPart =
+                                                          paramText;
+                                                      final finalPart = label
+                                                          .substring(
+                                                            paramIndex +
+                                                                paramText
+                                                                    .length,
+                                                          );
+
+                                                      return TextSpan(
+                                                        style: TextStyle(
+                                                          fontSize:
+                                                              (widget
+                                                                      .textStyle
+                                                                      ?.fontSize ??
+                                                                  15) +
+                                                              1.75,
+                                                          color:
+                                                              _editorTheme['root']
+                                                                  ?.color,
+                                                        ),
+                                                        children: [
+                                                          TextSpan(
+                                                            text: firstPart,
+                                                          ),
+                                                          TextSpan(
+                                                            text: highlightPart,
+                                                            style: TextStyle(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .bold,
+                                                              color:
+                                                                  Colors.blue,
+                                                            ),
+                                                          ),
+                                                          TextSpan(
+                                                            text: finalPart,
+                                                          ),
+                                                        ],
                                                       );
+                                                    }
+                                                  }
 
                                                   return TextSpan(
+                                                    text: label,
                                                     style: TextStyle(
                                                       fontSize:
                                                           (widget
@@ -2981,497 +3381,415 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           _editorTheme['root']
                                                               ?.color,
                                                     ),
-                                                    children: [
-                                                      TextSpan(text: firstPart),
-                                                      TextSpan(
-                                                        text: highlightPart,
-                                                        style: TextStyle(
-                                                          fontWeight:
-                                                              FontWeight.bold,
-                                                          color: Colors.blue,
+                                                  );
+                                                })(),
+                                              ),
+                                            ),
+                                            Divider(
+                                              color:
+                                                  signature
+                                                      .documentation
+                                                      .isNotEmpty
+                                                  ? _editorTheme['root']?.color
+                                                  : Colors.transparent,
+                                              thickness: 0.5,
+                                            ),
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                left: 6.5,
+                                              ),
+                                              child: MarkdownBlock(
+                                                data: signature.documentation,
+                                                config: MarkdownConfig.darkConfig.copy(
+                                                  configs: [
+                                                    PConfig(
+                                                      textStyle:
+                                                          _hoverDetailsStyle
+                                                              .textStyle,
+                                                    ),
+                                                    PreConfig(
+                                                      language:
+                                                          _controller
+                                                              .lspConfig
+                                                              ?.languageId
+                                                              .toLowerCase() ??
+                                                          'dart',
+                                                      theme: _editorTheme,
+                                                      textStyle: TextStyle(
+                                                        fontSize:
+                                                            _hoverDetailsStyle
+                                                                .textStyle
+                                                                .fontSize,
+                                                      ),
+                                                      styleNotMatched: TextStyle(
+                                                        color:
+                                                            _editorTheme['root']!
+                                                                .color,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color:
+                                                            _editorTheme['root']!
+                                                                .backgroundColor!,
+                                                        borderRadius: widget
+                                                            .markdownCodeBlockBorderRadius,
+                                                        border: Border.all(
+                                                          width: 0.2,
+                                                          color:
+                                                              _editorTheme['root']!
+                                                                  .color ??
+                                                              Colors.grey,
                                                         ),
                                                       ),
-                                                      TextSpan(text: finalPart),
-                                                    ],
-                                                  );
-                                                }
-                                              }
-
-                                              return TextSpan(
-                                                text: label,
-                                                style: TextStyle(
-                                                  fontSize:
-                                                      (widget
-                                                              .textStyle
-                                                              ?.fontSize ??
-                                                          15) +
-                                                      1.75,
-                                                  color: _editorTheme['root']
-                                                      ?.color,
-                                                ),
-                                              );
-                                            })(),
-                                          ),
-                                        ),
-                                        Divider(
-                                          color:
-                                              signature.documentation.isNotEmpty
-                                              ? _editorTheme['root']?.color
-                                              : Colors.transparent,
-                                          thickness: 0.5,
-                                        ),
-                                        Padding(
-                                          padding: const EdgeInsets.only(
-                                            left: 6.5,
-                                          ),
-                                          child: MarkdownBlock(
-                                            data: signature.documentation,
-                                            config: MarkdownConfig.darkConfig.copy(
-                                              configs: [
-                                                PConfig(
-                                                  textStyle: _hoverDetailsStyle
-                                                      .textStyle,
-                                                ),
-                                                PreConfig(
-                                                  language:
-                                                      _controller
-                                                          .lspConfig
-                                                          ?.languageId
-                                                          .toLowerCase() ??
-                                                      'dart',
-                                                  theme: _editorTheme,
-                                                  textStyle: TextStyle(
-                                                    fontSize: _hoverDetailsStyle
-                                                        .textStyle
-                                                        .fontSize,
-                                                  ),
-                                                  styleNotMatched: TextStyle(
-                                                    color: _editorTheme['root']!
-                                                        .color,
-                                                  ),
-                                                  decoration: BoxDecoration(
-                                                    color: _editorTheme['root']!
-                                                        .backgroundColor!,
-                                                    borderRadius:
-                                                        BorderRadius.zero,
-                                                    border: Border.all(
-                                                      width: 0.2,
-                                                      color:
-                                                          _editorTheme['root']!
-                                                              .color ??
-                                                          Colors.grey,
                                                     ),
-                                                  ),
+                                                  ],
                                                 ),
-                                              ],
+                                              ),
                                             ),
-                                          ),
+                                          ],
                                         ),
-                                      ],
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ),
-                            ),
+                              );
+                            },
                           );
                         },
-                      );
-                    },
-                  ),
-                  ValueListenableBuilder(
-                    valueListenable: _offsetNotifier,
-                    builder: (context, offset, child) {
-                      if (offset.dy < 0 || offset.dx < 0) {
-                        return SizedBox.shrink();
-                      }
-                      return ValueListenableBuilder(
-                        valueListenable: _suggestionNotifier,
-                        builder: (_, sugg, child) {
-                          if (_aiNotifier.value != null) {
+                      ),
+                      ValueListenableBuilder(
+                        valueListenable: _offsetNotifier,
+                        builder: (context, offset, child) {
+                          if (offset.dy < 0 || offset.dx < 0) {
                             return SizedBox.shrink();
                           }
-                          if (sugg == null || sugg.isEmpty) {
-                            _sugSelIndex = 0;
-                            _controller.currentlySelectedSuggestion = null;
-                            return SizedBox.shrink();
-                          }
-                          final completionScrlCtrl = ScrollController();
-                          final desiredWidth = screenWidth < 700
-                              ? screenWidth * 0.63
-                              : screenWidth * 0.3;
-                          final suggestionWidth = min(desiredWidth, 400.0);
-                          final itemExtent =
-                              _suggestionStyle.itemHeight ?? 24.0;
-                          final estimatedHeight = min(
-                            sugg.length * itemExtent,
-                            400.0,
-                          );
-                          double adjustedLeft = offset.dx;
-                          if (adjustedLeft + suggestionWidth > screenWidth) {
-                            adjustedLeft = screenWidth - suggestionWidth;
-                          }
-                          if (adjustedLeft < 0) {
-                            adjustedLeft = 0;
-                          }
-                          final fontSize = widget.textStyle?.fontSize ?? 14;
-                          final spaceBelow =
-                              editorHeight - offset.dy - fontSize - 10;
-                          final spaceAbove = offset.dy - 10;
-                          final shouldPositionAbove =
-                              estimatedHeight > spaceBelow &&
-                              spaceAbove > estimatedHeight;
-
-                          double? adjustedTop;
-                          double? adjustedBottom;
-
-                          if (shouldPositionAbove) {
-                            adjustedBottom = editorHeight - offset.dy + 10;
-                          } else {
-                            adjustedTop = offset.dy + fontSize + 10;
-                          }
-
                           return ValueListenableBuilder(
-                            valueListenable:
-                                _controller.selectedSuggestionNotifier,
-                            builder: (context, selected, child) {
-                              return Stack(
-                                children: [
-                                  Positioned(
-                                    width: suggestionWidth,
-                                    top: adjustedTop,
-                                    bottom: adjustedBottom,
-                                    left: adjustedLeft,
-                                    child: ConstrainedBox(
-                                      constraints: BoxConstraints(
-                                        maxHeight: 400,
-                                        maxWidth: 400,
-                                        minWidth: 70,
-                                      ),
-                                      child: Card(
-                                        shape: _suggestionStyle.shape,
-                                        elevation: _suggestionStyle.elevation,
-                                        color: _suggestionStyle.backgroundColor,
-                                        margin: EdgeInsets.zero,
-                                        child: RawScrollbar(
-                                          thumbVisibility: true,
-                                          thumbColor: _editorTheme['root']!
-                                              .color!
-                                              .withAlpha(80),
-                                          interactive: true,
-                                          controller: _suggScrollController,
-                                          child: ListView.builder(
-                                            itemExtent:
-                                                _suggestionStyle.itemHeight ??
-                                                24.0,
-                                            controller: _suggScrollController,
-                                            padding: EdgeInsets.zero,
-                                            shrinkWrap: true,
-                                            itemCount: sugg.length,
-                                            itemBuilder: (_, indx) {
-                                              final item = sugg[indx];
-                                              if ((item is LspCompletion) &&
-                                                  (indx == _sugSelIndex ||
-                                                      (_isMobile &&
-                                                          _isMobileSuggActive))) {
-                                                final key =
-                                                    _getSuggestionCacheKey(
-                                                      item,
-                                                    );
-                                                if (!_suggestionDetailsCache
-                                                        .containsKey(key) &&
-                                                    _controller.lspConfig !=
-                                                        null) {
-                                                  (() async {
-                                                    try {
-                                                      final data = await _controller
-                                                          .lspConfig!
-                                                          .resolveCompletionItem(
-                                                            item.completionItem,
-                                                          );
-                                                      final mdText =
-                                                          "${data['detail'] ?? ''}\n${(() {
-                                                            final doc = data['documentation'];
-                                                            if (doc == null) {
-                                                              return '';
-                                                            }
+                            valueListenable: _suggestionNotifier,
+                            builder: (_, sugg, child) {
+                              if (_aiNotifier.value != null) {
+                                return SizedBox.shrink();
+                              }
+                              if (sugg == null || sugg.isEmpty) {
+                                _sugSelIndex = 0;
+                                _controller.currentlySelectedSuggestion = null;
+                                return SizedBox.shrink();
+                              }
+                              final completionScrlCtrl = ScrollController();
+                              final desiredWidth = screenWidth < 700
+                                  ? screenWidth * 0.63
+                                  : screenWidth * 0.3;
+                              final suggestionWidth = min(desiredWidth, 400.0);
+                              final itemExtent =
+                                  _suggestionStyle.itemHeight ?? 24.0;
+                              final estimatedHeight = min(
+                                sugg.length * itemExtent,
+                                400.0,
+                              );
+                              double adjustedLeft = offset.dx;
+                              if (adjustedLeft + suggestionWidth >
+                                  screenWidth) {
+                                adjustedLeft = screenWidth - suggestionWidth;
+                              }
+                              if (adjustedLeft < 0) {
+                                adjustedLeft = 0;
+                              }
+                              final fontSize = widget.textStyle?.fontSize ?? 14;
+                              final spaceBelow =
+                                  popupHeight -
+                                  offset.dy -
+                                  fontSize -
+                                  popupBottomGap -
+                                  10;
+                              final spaceAbove = offset.dy - 10;
+                              final shouldPositionAbove =
+                                  estimatedHeight > spaceBelow &&
+                                  spaceAbove >= spaceBelow;
+                              final availableHeight = max(
+                                0.0,
+                                min(
+                                  400.0,
+                                  shouldPositionAbove ? spaceAbove : spaceBelow,
+                                ),
+                              );
 
-                                                            if (doc is Map<String, dynamic> && doc.containsKey('value')) {
-                                                              return doc['value'];
-                                                            }
+                              double? adjustedTop;
+                              double? adjustedBottom;
 
-                                                            return doc;
-                                                          })()}";
-                                                      if (!mounted) return;
-                                                      setState(() {
-                                                        final edits =
-                                                            data['additionalTextEdits'];
-                                                        if (edits is List) {
-                                                          try {
-                                                            _extraText = edits
-                                                                .map(
-                                                                  (e) =>
+                              if (shouldPositionAbove) {
+                                adjustedBottom = popupHeight - offset.dy + 10;
+                              } else {
+                                adjustedTop = offset.dy + fontSize + 10;
+                              }
+
+                              return ValueListenableBuilder(
+                                valueListenable:
+                                    _controller.selectedSuggestionNotifier,
+                                builder: (context, selected, child) {
+                                  return Stack(
+                                    children: [
+                                      Positioned(
+                                        width: suggestionWidth,
+                                        top: adjustedTop,
+                                        bottom: adjustedBottom,
+                                        left: adjustedLeft,
+                                        child: ConstrainedBox(
+                                          constraints: BoxConstraints(
+                                            maxHeight: availableHeight,
+                                            maxWidth: 400,
+                                            minWidth: 70,
+                                          ),
+                                          child: Card(
+                                            shape: _suggestionStyle.shape,
+                                            elevation:
+                                                _suggestionStyle.elevation,
+                                            color: _suggestionStyle
+                                                .backgroundColor,
+                                            margin: EdgeInsets.zero,
+                                            child: RawScrollbar(
+                                              thumbVisibility: true,
+                                              thumbColor: _editorTheme['root']!
+                                                  .color!
+                                                  .withAlpha(80),
+                                              interactive: true,
+                                              controller: _suggScrollController,
+                                              child: ListView.builder(
+                                                itemExtent:
+                                                    _suggestionStyle
+                                                        .itemHeight ??
+                                                    24.0,
+                                                controller:
+                                                    _suggScrollController,
+                                                padding: EdgeInsets.zero,
+                                                shrinkWrap: true,
+                                                itemCount: sugg.length,
+                                                itemBuilder: (_, indx) {
+                                                  final item = sugg[indx];
+                                                  if ((item is LspCompletion) &&
+                                                      (indx == _sugSelIndex ||
+                                                          (_isMobile &&
+                                                              _isMobileSuggActive))) {
+                                                    final key =
+                                                        _getSuggestionCacheKey(
+                                                          item,
+                                                        );
+                                                    if (!_suggestionDetailsCache
+                                                            .containsKey(key) &&
+                                                        _controller.lspConfig !=
+                                                            null) {
+                                                      (() async {
+                                                        try {
+                                                          final data = await _controller
+                                                              .lspConfig!
+                                                              .resolveCompletionItem(
+                                                                item.completionItem,
+                                                              );
+                                                          final mdText =
+                                                              "${data['detail'] ?? ''}\n${(() {
+                                                                final doc = data['documentation'];
+                                                                if (doc == null) {
+                                                                  return '';
+                                                                }
+
+                                                                if (doc is Map<String, dynamic> && doc.containsKey('value')) {
+                                                                  return doc['value'];
+                                                                }
+
+                                                                return doc;
+                                                              })()}";
+                                                          if (!mounted) return;
+                                                          setState(() {
+                                                            final edits =
+                                                                data['additionalTextEdits'];
+                                                            if (edits is List) {
+                                                              try {
+                                                                _extraText = edits
+                                                                    .map(
+                                                                      (e) =>
+                                                                          Map<
+                                                                            String,
+                                                                            dynamic
+                                                                          >.from(
+                                                                            e
+                                                                                as Map,
+                                                                          ),
+                                                                    )
+                                                                    .toList();
+                                                              } catch (_) {
+                                                                _extraText = edits
+                                                                    .cast<
                                                                       Map<
                                                                         String,
                                                                         dynamic
-                                                                      >.from(
-                                                                        e as Map,
-                                                                      ),
-                                                                )
-                                                                .toList();
-                                                          } catch (_) {
-                                                            _extraText = edits
-                                                                .cast<
-                                                                  Map<
-                                                                    String,
-                                                                    dynamic
-                                                                  >
-                                                                >();
-                                                          }
-                                                        } else {
-                                                          _extraText = [];
-                                                        }
-                                                        _suggestionDetailsCache[key] =
-                                                            mdText;
-                                                        _selectedSuggestionMd =
-                                                            mdText;
-                                                      });
-                                                    } catch (e) {
-                                                      debugPrint(
-                                                        "Completion Resolve failed: ${e.toString()}",
-                                                      );
-                                                    }
-                                                  })();
-                                                } else if (_suggestionDetailsCache
-                                                    .containsKey(key)) {
-                                                  final cached =
-                                                      _suggestionDetailsCache[key];
-                                                  if (_selectedSuggestionMd !=
-                                                      cached) {
-                                                    WidgetsBinding.instance
-                                                        .addPostFrameCallback((
-                                                          _,
-                                                        ) {
-                                                          if (!mounted) return;
-                                                          setState(() {
+                                                                      >
+                                                                    >();
+                                                              }
+                                                            } else {
+                                                              _extraText = [];
+                                                            }
+                                                            _suggestionDetailsCache[key] =
+                                                                mdText;
                                                             _selectedSuggestionMd =
-                                                                cached;
+                                                                mdText;
                                                           });
-                                                        });
-                                                  }
-                                                }
-                                              } else if ((item
-                                                          is! LspCompletion &&
-                                                      widget
-                                                          .enableLocalSuggestions) &&
-                                                  (indx == _sugSelIndex ||
-                                                      (_isMobile &&
-                                                          _isMobileSuggActive))) {
-                                                if (_selectedSuggestionMd !=
-                                                    null) {
-                                                  WidgetsBinding.instance
-                                                      .addPostFrameCallback((
-                                                        _,
-                                                      ) {
-                                                        if (!mounted) return;
-                                                        setState(() {
-                                                          _selectedSuggestionMd =
-                                                              null;
-                                                        });
-                                                      });
-                                                }
-                                              }
-
-                                              return Container(
-                                                height:
-                                                    _suggestionStyle.itemHeight,
-                                                padding: EdgeInsets.symmetric(
-                                                  horizontal: 8,
-                                                  vertical: 2,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color:
-                                                      ((!_isMobile &&
-                                                              (indx ==
-                                                                  _sugSelIndex)) ||
-                                                          _controller
-                                                                  .currentlySelectedSuggestion ==
-                                                              indx)
-                                                      ? (_suggestionStyle
-                                                                .selectedBackgroundColor ??
-                                                            _suggestionStyle
-                                                                .focusColor)
-                                                      : Colors.transparent,
-                                                  borderRadius:
-                                                      BorderRadius.circular(3),
-                                                ),
-                                                child: InkWell(
-                                                  canRequestFocus: false,
-                                                  hoverColor: _suggestionStyle
-                                                      .hoverColor,
-                                                  focusColor: _suggestionStyle
-                                                      .focusColor,
-                                                  splashColor: _suggestionStyle
-                                                      .splashColor,
-                                                  borderRadius:
-                                                      BorderRadius.circular(3),
-                                                  onTap: () {
-                                                    if (mounted) {
-                                                      setState(() {
-                                                        if (_isMobileSuggActive) {
-                                                          _controller
-                                                                  .currentlySelectedSuggestion =
-                                                              indx;
-                                                        } else {
-                                                          _sugSelIndex = indx;
-                                                        }
-                                                        if (item
-                                                            is _SnippetSuggestion) {
-                                                          _insertSnippetWithCursors(
-                                                            item,
+                                                        } catch (e) {
+                                                          debugPrint(
+                                                            "Completion Resolve failed: ${e.toString()}",
                                                           );
-                                                          _isInjectingSnippets =
-                                                              true;
-                                                          _suggestionNotifier
-                                                                  .value =
-                                                              null;
-                                                          _isInjectingSnippets =
-                                                              false;
-                                                        } else {
-                                                          final text =
-                                                              item
-                                                                  is LspCompletion
-                                                              ? item.label
-                                                              : item as String;
-                                                          _controller
-                                                              .insertAtCurrentCursor(
-                                                                text,
-                                                                replaceTypedChar:
-                                                                    true,
-                                                              );
-                                                          if (_extraText
-                                                              .isNotEmpty) {
-                                                            _controller
-                                                                .applyWorkspaceEdit(
-                                                                  _extraText,
-                                                                );
-                                                          }
-                                                          _suggestionNotifier
-                                                                  .value =
-                                                              null;
                                                         }
-                                                        _isSignatureInvoked =
-                                                            true;
-                                                        _controller
-                                                            .callSignatureHelp();
-                                                      });
+                                                      })();
+                                                    } else if (_suggestionDetailsCache
+                                                        .containsKey(key)) {
+                                                      final cached =
+                                                          _suggestionDetailsCache[key];
+                                                      if (_selectedSuggestionMd !=
+                                                          cached) {
+                                                        WidgetsBinding.instance
+                                                            .addPostFrameCallback((
+                                                              _,
+                                                            ) {
+                                                              if (!mounted)
+                                                                return;
+                                                              setState(() {
+                                                                _selectedSuggestionMd =
+                                                                    cached;
+                                                              });
+                                                            });
+                                                      }
                                                     }
-                                                  },
-                                                  child: Row(
-                                                    crossAxisAlignment:
-                                                        CrossAxisAlignment
-                                                            .center,
-                                                    children: [
-                                                      if (item
-                                                          is LspCompletion) ...[
-                                                        item.icon,
-                                                        const SizedBox(
-                                                          width: 8,
+                                                  } else if ((item
+                                                              is! LspCompletion &&
+                                                          widget
+                                                              .enableLocalSuggestions) &&
+                                                      (indx == _sugSelIndex ||
+                                                          (_isMobile &&
+                                                              _isMobileSuggActive))) {
+                                                    if (_selectedSuggestionMd !=
+                                                        null) {
+                                                      WidgetsBinding.instance
+                                                          .addPostFrameCallback((
+                                                            _,
+                                                          ) {
+                                                            if (!mounted)
+                                                              return;
+                                                            setState(() {
+                                                              _selectedSuggestionMd =
+                                                                  null;
+                                                            });
+                                                          });
+                                                    }
+                                                  }
+
+                                                  return Container(
+                                                    height: _suggestionStyle
+                                                        .itemHeight,
+                                                    padding:
+                                                        EdgeInsets.symmetric(
+                                                          horizontal: 8,
+                                                          vertical: 2,
                                                         ),
-                                                        Expanded(
-                                                          flex: 3,
-                                                          child: Text(
-                                                            item.label,
-                                                            style:
-                                                                _suggestionStyle.labelTextStyle?.copyWith(
-                                                                  color:
-                                                                      ((!_isMobile &&
-                                                                              (indx ==
-                                                                                  _sugSelIndex)) ||
-                                                                          _controller.currentlySelectedSuggestion ==
-                                                                              indx)
-                                                                      ? Colors
-                                                                            .white
-                                                                      : _suggestionStyle
-                                                                            .labelTextStyle
-                                                                            ?.color,
-                                                                ) ??
-                                                                _suggestionStyle.textStyle.copyWith(
-                                                                  color:
-                                                                      ((!_isMobile &&
-                                                                              (indx ==
-                                                                                  _sugSelIndex)) ||
-                                                                          _controller.currentlySelectedSuggestion ==
-                                                                              indx)
-                                                                      ? Colors
-                                                                            .white
-                                                                      : _suggestionStyle
-                                                                            .textStyle
-                                                                            .color,
-                                                                ),
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis,
+                                                    decoration: BoxDecoration(
+                                                      color:
+                                                          ((!_isMobile &&
+                                                                  (indx ==
+                                                                      _sugSelIndex)) ||
+                                                              _controller
+                                                                      .currentlySelectedSuggestion ==
+                                                                  indx)
+                                                          ? (_suggestionStyle
+                                                                    .selectedBackgroundColor ??
+                                                                _suggestionStyle
+                                                                    .focusColor)
+                                                          : Colors.transparent,
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            3,
                                                           ),
-                                                        ),
-                                                        if (item.importUri?[0] !=
-                                                            null) ...[
-                                                          const SizedBox(
-                                                            width: 8,
+                                                    ),
+                                                    child: InkWell(
+                                                      canRequestFocus: false,
+                                                      hoverColor:
+                                                          _suggestionStyle
+                                                              .hoverColor,
+                                                      focusColor:
+                                                          _suggestionStyle
+                                                              .focusColor,
+                                                      splashColor:
+                                                          _suggestionStyle
+                                                              .splashColor,
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            3,
                                                           ),
-                                                          Expanded(
-                                                            flex: 2,
-                                                            child: Text(
-                                                              item.importUri![0],
-                                                              style:
-                                                                  _suggestionStyle
-                                                                      .detailTextStyle ??
-                                                                  _suggestionStyle
-                                                                      .textStyle
-                                                                      .copyWith(
-                                                                        color: _suggestionStyle
-                                                                            .textStyle
-                                                                            .color
-                                                                            ?.withAlpha(
-                                                                              150,
-                                                                            ),
-                                                                      ),
-                                                              overflow:
-                                                                  TextOverflow
-                                                                      .ellipsis,
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
+                                                      onTap: () {
+                                                        if (mounted) {
+                                                          setState(() {
+                                                            if (_isMobileSuggActive) {
+                                                              _controller
+                                                                      .currentlySelectedSuggestion =
+                                                                  indx;
+                                                            } else {
+                                                              _sugSelIndex =
+                                                                  indx;
+                                                            }
+                                                            if (item
+                                                                is _SnippetSuggestion) {
+                                                              _insertSnippetWithCursors(
+                                                                item,
+                                                              );
+                                                              _isInjectingSnippets =
+                                                                  true;
+                                                              _suggestionNotifier
+                                                                      .value =
+                                                                  null;
+                                                              _isInjectingSnippets =
+                                                                  false;
+                                                            } else {
+                                                              final text =
+                                                                  item
+                                                                      is LspCompletion
+                                                                  ? item.label
+                                                                  : item
+                                                                        as String;
+                                                              _controller
+                                                                  .insertAtCurrentCursor(
+                                                                    text,
+                                                                    replaceTypedChar:
+                                                                        true,
+                                                                  );
+                                                              if (_extraText
+                                                                  .isNotEmpty) {
+                                                                _controller
+                                                                    .applyWorkspaceEdit(
+                                                                      _extraText,
+                                                                    );
+                                                              }
+                                                              _suggestionNotifier
+                                                                      .value =
+                                                                  null;
+                                                            }
+                                                            _isSignatureInvoked =
+                                                                true;
+                                                            _controller
+                                                                .callSignatureHelp();
+                                                          });
+                                                        }
+                                                      },
+                                                      child: Row(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .center,
+                                                        children: [
+                                                          if (item
+                                                              is LspCompletion) ...[
+                                                            item.icon,
+                                                            const SizedBox(
+                                                              width: 8,
                                                             ),
-                                                          ),
-                                                        ],
-                                                      ],
-                                                      if (item
-                                                          is _SnippetSuggestion) ...[
-                                                        Icon(
-                                                          completionItemIcons[CompletionItemType
-                                                                  .snippet]!
-                                                              .icon,
-                                                          color:
-                                                              completionItemIcons[CompletionItemType
-                                                                      .snippet]!
-                                                                  .color,
-                                                          size:
-                                                              _suggestionStyle
-                                                                  .iconSize ??
-                                                              16.0,
-                                                        ),
-                                                        const SizedBox(
-                                                          width: 8,
-                                                        ),
-                                                        Expanded(
-                                                          child: Text(
-                                                            item.label,
-                                                            style:
-                                                                (_suggestionStyle
-                                                                            .labelTextStyle ??
-                                                                        _suggestionStyle
-                                                                            .textStyle)
-                                                                    .copyWith(
+                                                            Expanded(
+                                                              flex: 3,
+                                                              child: Text(
+                                                                item.label,
+                                                                style:
+                                                                    _suggestionStyle.labelTextStyle?.copyWith(
                                                                       color:
                                                                           ((!_isMobile &&
                                                                                   (indx ==
@@ -3479,620 +3797,818 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                               _controller.currentlySelectedSuggestion ==
                                                                                   indx)
                                                                           ? Colors.white
-                                                                          : (_suggestionStyle.labelTextStyle ??
-                                                                                    _suggestionStyle.textStyle)
-                                                                                .color,
+                                                                          : _suggestionStyle.labelTextStyle?.color,
+                                                                    ) ??
+                                                                    _suggestionStyle.textStyle.copyWith(
+                                                                      color:
+                                                                          ((!_isMobile &&
+                                                                                  (indx ==
+                                                                                      _sugSelIndex)) ||
+                                                                              _controller.currentlySelectedSuggestion ==
+                                                                                  indx)
+                                                                          ? Colors.white
+                                                                          : _suggestionStyle.textStyle.color,
                                                                     ),
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis,
-                                                          ),
-                                                        ),
-                                                      ],
-                                                      if (item is String)
-                                                        Expanded(
-                                                          child: Text(
-                                                            item,
-                                                            style:
-                                                                _suggestionStyle
-                                                                    .labelTextStyle ??
-                                                                _suggestionStyle
-                                                                    .textStyle,
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis,
-                                                          ),
-                                                        ),
-                                                    ],
-                                                  ),
-                                                ),
-                                              );
-                                            },
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  if (_selectedSuggestionMd != null &&
-                                      _lspSignatureNotifier.value == null)
-                                    Positioned(
-                                      width: screenWidth < 700
-                                          ? screenWidth * 0.63
-                                          : null,
-                                      top:
-                                          offset.dy +
-                                          (widget.textStyle?.fontSize ?? 14) +
-                                          10 +
-                                          (screenWidth < 700
-                                              ? (offset.dy <
-                                                            (screenWidth / 2) &&
-                                                        400 < screenHeight)
-                                                    ? (((widget.textStyle?.fontSize ??
-                                                                      14) +
-                                                                  6.5) *
-                                                              (_suggestionNotifier
-                                                                      .value
-                                                                      ?.length ??
-                                                                  0))
-                                                          .clamp(0, 400)
-                                                    : -100
-                                              : 0),
-                                      left: screenWidth < 700
-                                          ? offset.dx
-                                          : ((adjustedLeft +
-                                                        suggestionWidth +
-                                                        420) >
-                                                    screenWidth
-                                                ? adjustedLeft - 420 - 10
-                                                : adjustedLeft +
-                                                      suggestionWidth),
-                                      child: ConstrainedBox(
-                                        constraints: BoxConstraints(
-                                          maxWidth: 420,
-                                          maxHeight: 400,
-                                          minWidth: 70,
-                                        ),
-                                        child: Card(
-                                          color: _hoverDetailsStyle
-                                              .backgroundColor,
-                                          shape: _hoverDetailsStyle.shape,
-                                          child: Padding(
-                                            padding: EdgeInsets.all(
-                                              _selectedSuggestionMd!
-                                                      .trim()
-                                                      .isEmpty
-                                                  ? 0
-                                                  : 8.0,
-                                            ),
-                                            child: RawScrollbar(
-                                              interactive: true,
-                                              controller: completionScrlCtrl,
-                                              thumbVisibility: true,
-                                              thumbColor: _editorTheme['root']!
-                                                  .color!
-                                                  .withAlpha(100),
-                                              child: SingleChildScrollView(
-                                                controller: completionScrlCtrl,
-                                                child: MarkdownBlock(
-                                                  data: _selectedSuggestionMd!,
-                                                  config: MarkdownConfig.darkConfig.copy(
-                                                    configs: [
-                                                      PConfig(
-                                                        textStyle:
-                                                            _hoverDetailsStyle
-                                                                .textStyle,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                              ),
+                                                            ),
+                                                            if (item.importUri?[0] !=
+                                                                null) ...[
+                                                              const SizedBox(
+                                                                width: 8,
+                                                              ),
+                                                              Expanded(
+                                                                flex: 2,
+                                                                child: Text(
+                                                                  item.importUri![0],
+                                                                  style:
+                                                                      _suggestionStyle
+                                                                          .detailTextStyle ??
+                                                                      _suggestionStyle.textStyle.copyWith(
+                                                                        color: _suggestionStyle
+                                                                            .textStyle
+                                                                            .color
+                                                                            ?.withAlpha(
+                                                                              150,
+                                                                            ),
+                                                                      ),
+                                                                  overflow:
+                                                                      TextOverflow
+                                                                          .ellipsis,
+                                                                  textAlign:
+                                                                      TextAlign
+                                                                          .right,
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ],
+                                                          if (item
+                                                              is _SnippetSuggestion) ...[
+                                                            Icon(
+                                                              completionItemIcons[CompletionItemType
+                                                                      .snippet]!
+                                                                  .icon,
+                                                              color:
+                                                                  completionItemIcons[CompletionItemType
+                                                                          .snippet]!
+                                                                      .color,
+                                                              size:
+                                                                  _suggestionStyle
+                                                                      .iconSize ??
+                                                                  16.0,
+                                                            ),
+                                                            const SizedBox(
+                                                              width: 8,
+                                                            ),
+                                                            Expanded(
+                                                              child: Text(
+                                                                item.label,
+                                                                style:
+                                                                    (_suggestionStyle.labelTextStyle ??
+                                                                            _suggestionStyle.textStyle)
+                                                                        .copyWith(
+                                                                          color:
+                                                                              ((!_isMobile &&
+                                                                                      (indx ==
+                                                                                          _sugSelIndex)) ||
+                                                                                  _controller.currentlySelectedSuggestion ==
+                                                                                      indx)
+                                                                              ? Colors.white
+                                                                              : (_suggestionStyle.labelTextStyle ??
+                                                                                        _suggestionStyle.textStyle)
+                                                                                    .color,
+                                                                        ),
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                          if (item is String)
+                                                            Expanded(
+                                                              child: Text(
+                                                                item,
+                                                                style:
+                                                                    _suggestionStyle
+                                                                        .labelTextStyle ??
+                                                                    _suggestionStyle
+                                                                        .textStyle,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                              ),
+                                                            ),
+                                                        ],
                                                       ),
-                                                      PreConfig(
-                                                        language:
-                                                            _controller
-                                                                .lspConfig
-                                                                ?.languageId
-                                                                .toLowerCase() ??
-                                                            'dart',
-                                                        theme: _editorTheme,
-                                                        textStyle: TextStyle(
-                                                          fontSize:
-                                                              _hoverDetailsStyle
-                                                                  .textStyle
-                                                                  .fontSize,
-                                                        ),
-                                                        styleNotMatched: TextStyle(
-                                                          color:
-                                                              _editorTheme['root']!
-                                                                  .color,
-                                                        ),
-                                                        decoration: BoxDecoration(
-                                                          color: _editorTheme['root']!
-                                                              .backgroundColor!,
-                                                          borderRadius:
-                                                              BorderRadius.zero,
-                                                          border: Border.all(
-                                                            width: 0.2,
-                                                            color:
-                                                                _editorTheme['root']!
-                                                                    .color ??
-                                                                Colors.grey,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
+                                                    ),
+                                                  );
+                                                },
                                               ),
                                             ),
                                           ),
                                         ),
                                       ),
-                                    ),
-                                ],
+                                      if (_selectedSuggestionMd != null &&
+                                          _lspSignatureNotifier.value == null)
+                                        Builder(
+                                          builder: (_) {
+                                            final documentationTop =
+                                                offset.dy +
+                                                (widget.textStyle?.fontSize ??
+                                                    14) +
+                                                10 +
+                                                (screenWidth < 700
+                                                    ? (offset.dy <
+                                                                  (screenWidth /
+                                                                      2) &&
+                                                              400 < popupHeight)
+                                                          ? (((widget.textStyle?.fontSize ??
+                                                                            14) +
+                                                                        6.5) *
+                                                                    (_suggestionNotifier
+                                                                            .value
+                                                                            ?.length ??
+                                                                        0))
+                                                                .clamp(0, 400)
+                                                          : -100
+                                                    : 0);
+                                            return Positioned(
+                                              width: screenWidth < 700
+                                                  ? screenWidth * 0.63
+                                                  : null,
+                                              top: documentationTop,
+                                              left: screenWidth < 700
+                                                  ? offset.dx
+                                                  : ((adjustedLeft +
+                                                                suggestionWidth +
+                                                                420) >
+                                                            screenWidth
+                                                        ? adjustedLeft -
+                                                              420 -
+                                                              10
+                                                        : adjustedLeft +
+                                                              suggestionWidth),
+                                              child: ConstrainedBox(
+                                                constraints: BoxConstraints(
+                                                  maxWidth: 420,
+                                                  maxHeight: min(
+                                                    400.0,
+                                                    max(
+                                                      0.0,
+                                                      popupHeight -
+                                                          documentationTop -
+                                                          popupBottomGap,
+                                                    ),
+                                                  ),
+                                                  minWidth: 70,
+                                                ),
+                                                child: Card(
+                                                  color: _hoverDetailsStyle
+                                                      .backgroundColor,
+                                                  shape:
+                                                      _hoverDetailsStyle.shape,
+                                                  child: Padding(
+                                                    padding: EdgeInsets.all(
+                                                      _selectedSuggestionMd!
+                                                              .trim()
+                                                              .isEmpty
+                                                          ? 0
+                                                          : 8.0,
+                                                    ),
+                                                    child: RawScrollbar(
+                                                      interactive: true,
+                                                      controller:
+                                                          completionScrlCtrl,
+                                                      thumbVisibility: true,
+                                                      thumbColor:
+                                                          _editorTheme['root']!
+                                                              .color!
+                                                              .withAlpha(100),
+                                                      child: SingleChildScrollView(
+                                                        controller:
+                                                            completionScrlCtrl,
+                                                        child: MarkdownBlock(
+                                                          data:
+                                                              _selectedSuggestionMd!,
+                                                          config: MarkdownConfig.darkConfig.copy(
+                                                            configs: [
+                                                              PConfig(
+                                                                textStyle:
+                                                                    _hoverDetailsStyle
+                                                                        .textStyle,
+                                                              ),
+                                                              PreConfig(
+                                                                language:
+                                                                    _controller
+                                                                        .lspConfig
+                                                                        ?.languageId
+                                                                        .toLowerCase() ??
+                                                                    'dart',
+                                                                theme:
+                                                                    _editorTheme,
+                                                                textStyle: TextStyle(
+                                                                  fontSize: _hoverDetailsStyle
+                                                                      .textStyle
+                                                                      .fontSize,
+                                                                ),
+                                                                styleNotMatched:
+                                                                    TextStyle(
+                                                                      color: _editorTheme['root']!
+                                                                          .color,
+                                                                    ),
+                                                                decoration: BoxDecoration(
+                                                                  color: _editorTheme['root']!
+                                                                      .backgroundColor!,
+                                                                  borderRadius:
+                                                                      widget
+                                                                          .markdownCodeBlockBorderRadius,
+                                                                  border: Border.all(
+                                                                    width: 0.2,
+                                                                    color:
+                                                                        _editorTheme['root']!
+                                                                            .color ??
+                                                                        Colors
+                                                                            .grey,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                    ],
+                                  );
+                                },
                               );
                             },
                           );
                         },
-                      );
-                    },
-                  ),
-                  ValueListenableBuilder(
-                    valueListenable: _hoverNotifier,
-                    builder: (_, hov, c) {
-                      if (hov == null || _controller.lspConfig == null) {
-                        return SizedBox.shrink();
-                      }
-                      final Offset position = hov.$1;
-                      final width = _isMobile
-                          ? screenWidth * 0.63
-                          : screenWidth * 0.3;
-                      final maxHeight = _isMobile ? screenHeight * 0.4 : 550.0;
+                      ),
+                      ValueListenableBuilder(
+                        valueListenable: _hoverNotifier,
+                        builder: (_, hov, c) {
+                          if (hov == null || _controller.lspConfig == null) {
+                            return SizedBox.shrink();
+                          }
+                          final Offset position = hov.$1;
+                          final width = _isMobile
+                              ? screenWidth * 0.63
+                              : screenWidth * 0.3;
+                          final maxHeight = min(
+                            _isMobile ? popupHeight * 0.4 : 550.0,
+                            popupHeight - popupBottomGap,
+                          );
 
-                      double adjustedLeft = position.dx;
-                      if (adjustedLeft + width > screenWidth) {
-                        adjustedLeft = screenWidth - width;
-                      }
-                      if (adjustedLeft < 0) {
-                        adjustedLeft = 0;
-                      }
+                          double adjustedLeft = position.dx;
+                          if (adjustedLeft + width > screenWidth) {
+                            adjustedLeft = screenWidth - width;
+                          }
+                          if (adjustedLeft < 0) {
+                            adjustedLeft = 0;
+                          }
 
-                      final spaceBelow = editorHeight - position.dy;
-                      final spaceAbove = position.dy - 10;
-                      final shouldPositionAbove =
-                          maxHeight > spaceBelow && spaceAbove > maxHeight;
+                          final spaceBelow =
+                              popupHeight - position.dy - popupBottomGap;
+                          final spaceAbove = position.dy - 10;
+                          final shouldPositionAbove =
+                              maxHeight > spaceBelow &&
+                              spaceAbove >= spaceBelow;
+                          final availableHeight = max(
+                            0.0,
+                            min(
+                              maxHeight,
+                              shouldPositionAbove ? spaceAbove : spaceBelow,
+                            ),
+                          );
 
-                      double? adjustedTop;
-                      double? adjustedBottom;
+                          double? adjustedTop;
+                          double? adjustedBottom;
 
-                      if (shouldPositionAbove) {
-                        adjustedBottom = editorHeight - position.dy + 10;
-                      } else {
-                        adjustedTop = position.dy;
-                      }
+                          if (shouldPositionAbove) {
+                            adjustedBottom = popupHeight - position.dy + 10;
+                          } else {
+                            adjustedTop = position.dy;
+                          }
 
-                      return Positioned(
-                        top: adjustedTop,
-                        bottom: adjustedBottom,
-                        left: adjustedLeft,
-                        width: width,
-                        child: MouseRegion(
-                          onEnter: (_) => _isHoveringPopup.value = true,
-                          onExit: (_) => _isHoveringPopup.value = false,
-                          child: ValueListenableBuilder<Map<String, dynamic>?>(
-                            valueListenable: _hoverContentNotifier,
-                            builder: (_, data, _) {
-                              if (data == null) {
-                                return ConstrainedBox(
-                                  constraints: BoxConstraints(
-                                    maxWidth: width,
-                                    maxHeight: maxHeight,
-                                  ),
-                                  child: Card(
-                                    color: _hoverDetailsStyle.backgroundColor,
-                                    shape: _hoverDetailsStyle.shape,
-                                    child: Padding(
-                                      padding: const EdgeInsets.all(8.0),
-                                      child: Text(
-                                        "Loading...",
-                                        style: _hoverDetailsStyle.textStyle,
+                          return Positioned(
+                            top: adjustedTop,
+                            bottom: adjustedBottom,
+                            left: adjustedLeft,
+                            width: width,
+                            child: MouseRegion(
+                              onEnter: (_) => _isHoveringPopup.value = true,
+                              onExit: (_) => _isHoveringPopup.value = false,
+                              child: ValueListenableBuilder<Map<String, dynamic>?>(
+                                valueListenable: _hoverContentNotifier,
+                                builder: (_, data, _) {
+                                  if (data == null) {
+                                    return ConstrainedBox(
+                                      constraints: BoxConstraints(
+                                        maxWidth: width,
+                                        maxHeight: availableHeight,
                                       ),
-                                    ),
-                                  ),
-                                );
-                              }
-
-                              final diagnosticMessage =
-                                  data['diagnostic'] ?? '';
-                              final severity = data['severity'] ?? 0;
-                              final hoverMessage = data['hover'] ?? '';
-
-                              if (diagnosticMessage.isEmpty &&
-                                  hoverMessage.isEmpty) {
-                                return SizedBox.shrink();
-                              }
-
-                              IconData diagnosticIcon;
-                              Color diagnosticColor;
-
-                              switch (severity) {
-                                case 1:
-                                  diagnosticIcon = Icons.error_outline;
-                                  diagnosticColor = Colors.red;
-                                  break;
-                                case 2:
-                                  diagnosticIcon = Icons.warning_amber_outlined;
-                                  diagnosticColor = Colors.orange;
-                                  break;
-                                case 3:
-                                  diagnosticIcon = Icons.info_outline;
-                                  diagnosticColor = Colors.blue;
-                                  break;
-                                case 4:
-                                  diagnosticIcon = Icons.lightbulb_outline;
-                                  diagnosticColor = Colors.grey;
-                                  break;
-                                default:
-                                  diagnosticIcon = Icons.info_outline;
-                                  diagnosticColor = Colors.grey;
-                              }
-
-                              final hoverScrollController = ScrollController();
-                              final errorSCrollController = ScrollController();
-
-                              return ConstrainedBox(
-                                constraints: BoxConstraints(
-                                  maxWidth: width,
-                                  maxHeight: maxHeight,
-                                ),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    if (diagnosticMessage.isNotEmpty)
-                                      Card(
-                                        surfaceTintColor: diagnosticColor,
+                                      child: Card(
                                         color:
                                             _hoverDetailsStyle.backgroundColor,
-                                        shape: BeveledRectangleBorder(
-                                          side: BorderSide(
-                                            color: diagnosticColor,
-                                            width: 0.2,
-                                          ),
-                                        ),
-                                        margin: EdgeInsets.only(
-                                          bottom: hoverMessage.isNotEmpty
-                                              ? 4
-                                              : 0,
-                                        ),
+                                        shape: _hoverDetailsStyle.shape,
                                         child: Padding(
                                           padding: const EdgeInsets.all(8.0),
-                                          child: RawScrollbar(
-                                            controller: errorSCrollController,
-                                            thumbVisibility: true,
-                                            thumbColor: _editorTheme['root']!
-                                                .color!
-                                                .withAlpha(100),
-                                            child: SingleChildScrollView(
-                                              scrollDirection: Axis.horizontal,
-                                              controller: errorSCrollController,
+                                          child: Text(
+                                            "Loading...",
+                                            style: _hoverDetailsStyle.textStyle,
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  }
+
+                                  final diagnosticMessage =
+                                      data['diagnostic'] ?? '';
+                                  final severity = data['severity'] ?? 0;
+                                  final hoverMessage = data['hover'] ?? '';
+
+                                  if (diagnosticMessage.isEmpty &&
+                                      hoverMessage.isEmpty) {
+                                    return SizedBox.shrink();
+                                  }
+
+                                  IconData diagnosticIcon;
+                                  Color diagnosticColor;
+
+                                  switch (severity) {
+                                    case 1:
+                                      diagnosticIcon = Icons.error_outline;
+                                      diagnosticColor = Colors.red;
+                                      break;
+                                    case 2:
+                                      diagnosticIcon =
+                                          Icons.warning_amber_outlined;
+                                      diagnosticColor = Colors.orange;
+                                      break;
+                                    case 3:
+                                      diagnosticIcon = Icons.info_outline;
+                                      diagnosticColor = Colors.blue;
+                                      break;
+                                    case 4:
+                                      diagnosticIcon = Icons.lightbulb_outline;
+                                      diagnosticColor = Colors.grey;
+                                      break;
+                                    default:
+                                      diagnosticIcon = Icons.info_outline;
+                                      diagnosticColor = Colors.grey;
+                                  }
+
+                                  final hoverScrollController =
+                                      ScrollController();
+
+                                  return ConstrainedBox(
+                                    constraints: BoxConstraints(
+                                      maxWidth: width,
+                                      maxHeight: availableHeight,
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        if (diagnosticMessage.isNotEmpty)
+                                          Card(
+                                            surfaceTintColor: diagnosticColor,
+                                            color: _hoverDetailsStyle
+                                                .backgroundColor,
+                                            shape: _hoverDetailsStyle.shape,
+                                            margin: EdgeInsets.only(
+                                              bottom: hoverMessage.isNotEmpty
+                                                  ? 4
+                                                  : 0,
+                                            ),
+                                            child: Padding(
+                                              padding: const EdgeInsets.all(
+                                                8.0,
+                                              ),
                                               child: Row(
-                                                mainAxisSize: MainAxisSize.min,
                                                 crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
+                                                    CrossAxisAlignment.center,
                                                 children: [
                                                   Icon(
                                                     diagnosticIcon,
                                                     color: diagnosticColor,
                                                     size: 16,
                                                   ),
-                                                  SizedBox(width: 8),
-                                                  Text(
-                                                    diagnosticMessage,
-                                                    style: _hoverDetailsStyle
-                                                        .textStyle,
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      diagnosticMessage,
+                                                      softWrap: true,
+                                                      style: _hoverDetailsStyle
+                                                          .textStyle,
+                                                    ),
                                                   ),
                                                 ],
                                               ),
                                             ),
                                           ),
-                                        ),
-                                      ),
 
-                                    if (hoverMessage.isNotEmpty)
-                                      Flexible(
-                                        child: Card(
-                                          color: _hoverDetailsStyle
-                                              .backgroundColor,
-                                          shape: _hoverDetailsStyle.shape,
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(8.0),
-                                            child: RawScrollbar(
-                                              controller: hoverScrollController,
-                                              thumbVisibility: true,
-                                              thumbColor: _editorTheme['root']!
-                                                  .color!
-                                                  .withAlpha(100),
-                                              child: SingleChildScrollView(
-                                                controller:
-                                                    hoverScrollController,
-                                                child: MarkdownBlock(
-                                                  data: hoverMessage,
-                                                  config: MarkdownConfig.darkConfig.copy(
-                                                    configs: [
-                                                      PConfig(
-                                                        textStyle:
-                                                            _hoverDetailsStyle
-                                                                .textStyle,
-                                                      ),
-                                                      PreConfig(
-                                                        language:
-                                                            _controller
-                                                                .lspConfig
-                                                                ?.languageId
-                                                                .toLowerCase() ??
-                                                            "dart",
-                                                        theme: _editorTheme,
-                                                        textStyle: TextStyle(
-                                                          fontSize:
-                                                              _hoverDetailsStyle
-                                                                  .textStyle
-                                                                  .fontSize,
-                                                        ),
-                                                        styleNotMatched: TextStyle(
-                                                          color:
-                                                              _editorTheme['root']!
-                                                                  .color,
-                                                        ),
-                                                        decoration: BoxDecoration(
-                                                          color: _editorTheme['root']!
-                                                              .backgroundColor!,
-                                                          borderRadius:
-                                                              BorderRadius.zero,
-                                                          border: Border.all(
-                                                            width: 0.2,
-                                                            color:
-                                                                _editorTheme['root']!
-                                                                    .color ??
-                                                                Colors.grey,
+                                        if (hoverMessage.isNotEmpty)
+                                          Flexible(
+                                            child: Card(
+                                              color: _hoverDetailsStyle
+                                                  .backgroundColor,
+                                              shape: _hoverDetailsStyle.shape,
+                                              child: Padding(
+                                                padding: const EdgeInsets.all(
+                                                  8.0,
+                                                ),
+                                                child: RawScrollbar(
+                                                  controller:
+                                                      hoverScrollController,
+                                                  thumbVisibility: true,
+                                                  thumbColor:
+                                                      _editorTheme['root']!
+                                                          .color!
+                                                          .withAlpha(100),
+                                                  child: SingleChildScrollView(
+                                                    controller:
+                                                        hoverScrollController,
+                                                    child: MarkdownBlock(
+                                                      data: hoverMessage,
+                                                      selectable: false,
+                                                      generator:
+                                                          MarkdownGenerator(
+                                                            linesMargin:
+                                                                EdgeInsets.only(
+                                                                  top: 1,
+                                                                ),
                                                           ),
-                                                        ),
+                                                      config: MarkdownConfig.darkConfig.copy(
+                                                        configs: [
+                                                          PConfig(
+                                                            textStyle:
+                                                                _hoverDetailsStyle
+                                                                    .textStyle,
+                                                          ),
+                                                          CodeConfig(
+                                                            style: TextStyle(
+                                                              fontFamily:
+                                                                  _hoverDetailsStyle
+                                                                      .textStyle
+                                                                      .fontFamily ??
+                                                                  'monospace',
+                                                            ),
+                                                          ),
+                                                          PreConfig(
+                                                            language:
+                                                                _controller
+                                                                    .lspConfig
+                                                                    ?.languageId
+                                                                    .toLowerCase() ??
+                                                                'dart',
+                                                            builder: (code, language) => Container(
+                                                              width: double
+                                                                  .infinity,
+                                                              padding:
+                                                                  const EdgeInsets.all(
+                                                                    16,
+                                                                  ),
+                                                              decoration: BoxDecoration(
+                                                                color: _editorTheme['root']!
+                                                                    .backgroundColor!,
+                                                                borderRadius: widget
+                                                                    .markdownCodeBlockBorderRadius,
+                                                                border: Border.all(
+                                                                  width: 0.2,
+                                                                  color:
+                                                                      _editorTheme['root']!
+                                                                          .color ??
+                                                                      Colors
+                                                                          .grey,
+                                                                ),
+                                                              ),
+                                                              child: Text.rich(
+                                                                TextSpan(
+                                                                  children: highLightSpans(
+                                                                    code,
+                                                                    language:
+                                                                        language,
+                                                                    theme:
+                                                                        _editorTheme,
+                                                                    textStyle: TextStyle(
+                                                                      fontSize: _hoverDetailsStyle
+                                                                          .textStyle
+                                                                          .fontSize,
+                                                                      fontFamily:
+                                                                          _hoverDetailsStyle
+                                                                              .textStyle
+                                                                              .fontFamily ??
+                                                                          'monospace',
+                                                                    ),
+                                                                    styleNotMatched: TextStyle(
+                                                                      color: _editorTheme['root']!
+                                                                          .color,
+                                                                      fontFamily:
+                                                                          _hoverDetailsStyle
+                                                                              .textStyle
+                                                                              .fontFamily ??
+                                                                          'monospace',
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                                softWrap: true,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
                                                       ),
-                                                    ],
+                                                    ),
                                                   ),
                                                 ),
                                               ),
                                             ),
                                           ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                  ValueListenableBuilder<Offset?>(
-                    valueListenable: _aiOffsetNotifier,
-                    builder: (context, offvalue, child) {
-                      return _isMobile &&
-                              _aiNotifier.value != null &&
-                              offvalue != null &&
-                              _aiNotifier.value!.isNotEmpty
-                          ? Positioned(
-                              top:
-                                  offvalue.dy +
-                                  (widget.textStyle?.fontSize ?? 14) *
-                                      _aiNotifier.value!.split('\n').length +
-                                  15,
-                              left:
-                                  offvalue.dx +
-                                  (_aiNotifier.value!.split('\n')[0].length *
-                                      (widget.textStyle?.fontSize ?? 14) /
-                                      2),
-                              child: Row(
-                                children: [
-                                  InkWell(
-                                    onTap: () {
-                                      if (_aiNotifier.value == null) return;
-                                      _controller.insertAtCurrentCursor(
-                                        _aiNotifier.value!,
-                                      );
-                                      _aiNotifier.value = null;
-                                      _aiOffsetNotifier.value = null;
-                                    },
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        color: _editorTheme['root']
-                                            ?.backgroundColor,
-                                        borderRadius: BorderRadius.all(
-                                          Radius.circular(8),
-                                        ),
-                                        border: BoxBorder.all(
-                                          width: 1.5,
-                                          color: Color(0xff64b5f6),
-                                        ),
-                                      ),
-                                      child: Icon(
-                                        Icons.check,
-                                        color: _editorTheme['root']?.color,
-                                      ),
-                                    ),
-                                  ),
-                                  SizedBox(width: 30),
-                                  InkWell(
-                                    onTap: () {
-                                      _aiNotifier.value = null;
-                                      _aiOffsetNotifier.value = null;
-                                    },
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        color: _editorTheme['root']
-                                            ?.backgroundColor,
-                                        borderRadius: BorderRadius.all(
-                                          Radius.circular(8),
-                                        ),
-                                        border: BoxBorder.all(
-                                          width: 1.5,
-                                          color: Colors.red,
-                                        ),
-                                      ),
-                                      child: Icon(
-                                        Icons.close,
-                                        color: _editorTheme['root']?.color,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            )
-                          : SizedBox.shrink();
-                    },
-                  ),
-                  ValueListenableBuilder(
-                    valueListenable: _lspActionOffsetNotifier,
-                    builder: (_, offset, child) {
-                      if (offset == null ||
-                          _lspActionNotifier.value == null ||
-                          _controller.lspConfig == null) {
-                        return SizedBox.shrink();
-                      }
-
-                      return Positioned(
-                        width: screenWidth < 700
-                            ? screenWidth * 0.63
-                            : screenWidth * 0.3,
-                        top:
-                            offset.dy + (widget.textStyle?.fontSize ?? 14) + 10,
-                        left: offset.dx,
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(
-                            maxHeight: 400,
-                            maxWidth: 400,
-                            minWidth: 70,
-                          ),
-                          child: Card(
-                            shape: _suggestionStyle.shape,
-                            elevation: _suggestionStyle.elevation,
-                            color: _suggestionStyle.backgroundColor,
-                            margin: EdgeInsets.zero,
-                            child: RawScrollbar(
-                              controller: _actionScrollController,
-                              thumbVisibility: true,
-                              thumbColor: _editorTheme['root']!.color!
-                                  .withAlpha(80),
-                              child: ListView.builder(
-                                shrinkWrap: true,
-                                controller: _actionScrollController,
-                                itemExtent: _suggestionStyle.itemHeight ?? 24.0,
-                                itemCount: _lspActionNotifier.value!.length,
-                                itemBuilder: (_, indx) {
-                                  final actionData = _lspActionNotifier.value!
-                                      .cast<Map<String, dynamic>>();
-                                  return Tooltip(
-                                    message: actionData[indx]['title'],
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        color: indx == _actionSelIndex
-                                            ? (_suggestionStyle
-                                                      .selectedBackgroundColor ??
-                                                  _suggestionStyle.focusColor)
-                                            : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(3),
-                                      ),
-                                      height: _suggestionStyle.itemHeight,
-                                      padding: EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 2,
-                                      ),
-                                      child: InkWell(
-                                        hoverColor: _suggestionStyle.hoverColor,
-                                        splashColor:
-                                            _suggestionStyle.splashColor,
-                                        borderRadius: BorderRadius.circular(3),
-                                        onTap: () {
-                                          try {
-                                            (() async {
-                                              await _controller
-                                                  .applyWorkspaceEdit(
-                                                    actionData[indx],
-                                                  );
-                                            })();
-                                          } catch (e, st) {
-                                            debugPrint(
-                                              'Code action failed: $e\n$st',
-                                            );
-                                          } finally {
-                                            _lspActionNotifier.value = null;
-                                            _lspActionOffsetNotifier.value =
-                                                null;
-                                          }
-                                        },
-                                        child: Row(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.center,
-                                          children: [
-                                            SizedBox(
-                                              width:
-                                                  _suggestionStyle.iconSize ??
-                                                  16,
-                                              height:
-                                                  _suggestionStyle.iconSize ??
-                                                  16,
-                                              child: Icon(
-                                                Icons.lightbulb_outline,
-                                                color: Colors.yellowAccent,
-                                                size:
-                                                    _suggestionStyle.iconSize ??
-                                                    16,
-                                              ),
-                                            ),
-                                            const SizedBox(width: 8),
-                                            Expanded(
-                                              child: Text(
-                                                actionData[indx]['title'],
-                                                style:
-                                                    _suggestionStyle
-                                                        .labelTextStyle
-                                                        ?.copyWith(
-                                                          color:
-                                                              indx ==
-                                                                  _actionSelIndex
-                                                              ? Colors.white
-                                                              : _suggestionStyle
-                                                                    .labelTextStyle
-                                                                    ?.color,
-                                                        ) ??
-                                                    _suggestionStyle.textStyle
-                                                        .copyWith(
-                                                          color:
-                                                              indx ==
-                                                                  _actionSelIndex
-                                                              ? Colors.white
-                                                              : _suggestionStyle
-                                                                    .textStyle
-                                                                    .color,
-                                                        ),
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
+                                      ],
                                     ),
                                   );
                                 },
                               ),
                             ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ],
+                          );
+                        },
+                      ),
+                      ValueListenableBuilder<Offset?>(
+                        valueListenable: _aiOffsetNotifier,
+                        builder: (context, offvalue, child) {
+                          return _isMobile &&
+                                  _aiNotifier.value != null &&
+                                  offvalue != null &&
+                                  _aiNotifier.value!.isNotEmpty
+                              ? Positioned(
+                                  top:
+                                      offvalue.dy +
+                                      (widget.textStyle?.fontSize ?? 14) *
+                                          _aiNotifier.value!
+                                              .split('\n')
+                                              .length +
+                                      15,
+                                  left:
+                                      offvalue.dx +
+                                      (_aiNotifier.value!
+                                              .split('\n')[0]
+                                              .length *
+                                          (widget.textStyle?.fontSize ?? 14) /
+                                          2),
+                                  child: Row(
+                                    children: [
+                                      InkWell(
+                                        onTap: () {
+                                          if (_aiNotifier.value == null) return;
+                                          _controller.insertAtCurrentCursor(
+                                            _aiNotifier.value!,
+                                          );
+                                          _aiNotifier.value = null;
+                                          _aiOffsetNotifier.value = null;
+                                        },
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            color: _editorTheme['root']
+                                                ?.backgroundColor,
+                                            borderRadius: BorderRadius.all(
+                                              Radius.circular(8),
+                                            ),
+                                            border: BoxBorder.all(
+                                              width: 1.5,
+                                              color: Color(0xff64b5f6),
+                                            ),
+                                          ),
+                                          child: Icon(
+                                            Icons.check,
+                                            color: _editorTheme['root']?.color,
+                                          ),
+                                        ),
+                                      ),
+                                      SizedBox(width: 30),
+                                      InkWell(
+                                        onTap: () {
+                                          _aiNotifier.value = null;
+                                          _aiOffsetNotifier.value = null;
+                                        },
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            color: _editorTheme['root']
+                                                ?.backgroundColor,
+                                            borderRadius: BorderRadius.all(
+                                              Radius.circular(8),
+                                            ),
+                                            border: BoxBorder.all(
+                                              width: 1.5,
+                                              color: Colors.red,
+                                            ),
+                                          ),
+                                          child: Icon(
+                                            Icons.close,
+                                            color: _editorTheme['root']?.color,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                )
+                              : SizedBox.shrink();
+                        },
+                      ),
+                      ValueListenableBuilder(
+                        valueListenable: _lspActionOffsetNotifier,
+                        builder: (_, offset, child) {
+                          if (offset == null ||
+                              _lspActionNotifier.value == null ||
+                              _controller.lspConfig == null) {
+                            return SizedBox.shrink();
+                          }
+                          final actionTop =
+                              offset.dy +
+                              (widget.textStyle?.fontSize ?? 14) +
+                              10;
+                          final spaceBelow =
+                              popupHeight - actionTop - popupBottomGap;
+                          final spaceAbove = offset.dy - 10;
+                          final showAbove =
+                              spaceBelow < 400 && spaceAbove >= spaceBelow;
+
+                          return Positioned(
+                            width: screenWidth < 700
+                                ? screenWidth * 0.63
+                                : screenWidth * 0.3,
+                            top: showAbove ? null : actionTop,
+                            bottom: showAbove
+                                ? popupHeight - offset.dy + 10
+                                : null,
+                            left: offset.dx,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxHeight: max(
+                                  0.0,
+                                  min(
+                                    400.0,
+                                    showAbove ? spaceAbove : spaceBelow,
+                                  ),
+                                ),
+                                maxWidth: 400,
+                                minWidth: 70,
+                              ),
+                              child: Card(
+                                shape: _suggestionStyle.shape,
+                                elevation: _suggestionStyle.elevation,
+                                color: _suggestionStyle.backgroundColor,
+                                margin: EdgeInsets.zero,
+                                child: RawScrollbar(
+                                  controller: _actionScrollController,
+                                  thumbVisibility: true,
+                                  thumbColor: _editorTheme['root']!.color!
+                                      .withAlpha(80),
+                                  child: ListView.builder(
+                                    shrinkWrap: true,
+                                    controller: _actionScrollController,
+                                    itemExtent:
+                                        _suggestionStyle.itemHeight ?? 24.0,
+                                    itemCount: _lspActionNotifier.value!.length,
+                                    itemBuilder: (_, indx) {
+                                      final actionData = _lspActionNotifier
+                                          .value!
+                                          .cast<Map<String, dynamic>>();
+                                      return Tooltip(
+                                        message: actionData[indx]['title'],
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            color: indx == _actionSelIndex
+                                                ? (_suggestionStyle
+                                                          .selectedBackgroundColor ??
+                                                      _suggestionStyle
+                                                          .focusColor)
+                                                : Colors.transparent,
+                                            borderRadius: BorderRadius.circular(
+                                              3,
+                                            ),
+                                          ),
+                                          height: _suggestionStyle.itemHeight,
+                                          padding: EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 2,
+                                          ),
+                                          child: InkWell(
+                                            hoverColor:
+                                                _suggestionStyle.hoverColor,
+                                            splashColor:
+                                                _suggestionStyle.splashColor,
+                                            borderRadius: BorderRadius.circular(
+                                              3,
+                                            ),
+                                            onTap: () {
+                                              try {
+                                                (() async {
+                                                  await _controller
+                                                      .applyWorkspaceEdit(
+                                                        actionData[indx],
+                                                      );
+                                                })();
+                                              } catch (e, st) {
+                                                debugPrint(
+                                                  'Code action failed: $e\n$st',
+                                                );
+                                              } finally {
+                                                _lspActionNotifier.value = null;
+                                                _lspActionOffsetNotifier.value =
+                                                    null;
+                                              }
+                                            },
+                                            child: Row(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.center,
+                                              children: [
+                                                SizedBox(
+                                                  width:
+                                                      _suggestionStyle
+                                                          .iconSize ??
+                                                      16,
+                                                  height:
+                                                      _suggestionStyle
+                                                          .iconSize ??
+                                                      16,
+                                                  child: Icon(
+                                                    Icons.lightbulb_outline,
+                                                    color: Colors.yellowAccent,
+                                                    size:
+                                                        _suggestionStyle
+                                                            .iconSize ??
+                                                        16,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                Expanded(
+                                                  child: Text(
+                                                    actionData[indx]['title'],
+                                                    style:
+                                                        _suggestionStyle
+                                                            .labelTextStyle
+                                                            ?.copyWith(
+                                                              color:
+                                                                  indx ==
+                                                                      _actionSelIndex
+                                                                  ? Colors.white
+                                                                  : _suggestionStyle
+                                                                        .labelTextStyle
+                                                                        ?.color,
+                                                            ) ??
+                                                        _suggestionStyle
+                                                            .textStyle
+                                                            .copyWith(
+                                                              color:
+                                                                  indx ==
+                                                                      _actionSelIndex
+                                                                  ? Colors.white
+                                                                  : _suggestionStyle
+                                                                        .textStyle
+                                                                        .color,
+                                                            ),
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  );
+                },
               ),
             ),
           ],
         );
       },
+    );
+    if (widget.contextMenuBuilder == null) return editor;
+    return OverlayPortal(
+      controller: _contextMenuPortalController,
+      overlayLocation: OverlayChildLocation.rootOverlay,
+      overlayChildBuilder: _buildCustomContextMenu,
+      child: editor,
     );
   }
 
@@ -4217,6 +4733,7 @@ class _CodeField extends LeafRenderObjectWidget {
   final List<LspErrors> diagnostics;
   final ValueNotifier<bool> selectionActiveNotifier, isHoveringPopup;
   final ValueNotifier<Offset> contextMenuOffsetNotifier, offsetNotifier;
+  final ValueNotifier<int> contextMenuTextOffsetNotifier;
   final ValueNotifier<(Offset, Map<String, int>)?> hoverNotifier;
   final ValueNotifier<Map<String, dynamic>?> hoverContentNotifier;
   final ValueNotifier<List<dynamic>?> lspActionNotifier, suggestionNotifier;
@@ -4228,6 +4745,8 @@ class _CodeField extends LeafRenderObjectWidget {
   final String? filePath;
   final MatchHighlightStyle? matchHighlightStyle;
   final VoidCallback? onHoverSetByTap;
+  final ValueChanged<int>? onModifierTap;
+  final ValueChanged<_CodeFieldRenderer> onRendererCreated;
   final TextDirection textDirection;
   final GutterBuilder? gutterBuilder;
 
@@ -4254,6 +4773,7 @@ class _CodeField extends LeafRenderObjectWidget {
     required this.isMobile,
     required this.selectionActiveNotifier,
     required this.contextMenuOffsetNotifier,
+    required this.contextMenuTextOffsetNotifier,
     required this.offsetNotifier,
     required this.hoverNotifier,
     required this.hoverContentNotifier,
@@ -4266,6 +4786,7 @@ class _CodeField extends LeafRenderObjectWidget {
     required this.isHoveringPopup,
     required this.context,
     required this.lineWrap,
+    required this.onRendererCreated,
     this.textDirection = TextDirection.ltr,
     this.filePath,
     this.textStyle,
@@ -4277,11 +4798,12 @@ class _CodeField extends LeafRenderObjectWidget {
     this.ghostTextStyle,
     this.matchHighlightStyle,
     this.onHoverSetByTap,
+    this.onModifierTap,
   });
 
   @override
   RenderObject createRenderObject(BuildContext context) {
-    return _CodeFieldRenderer(
+    final renderObject = _CodeFieldRenderer(
       context: context,
       controller: controller,
       editorTheme: editorTheme,
@@ -4309,6 +4831,7 @@ class _CodeField extends LeafRenderObjectWidget {
       isMobile: isMobile,
       selectionActiveNotifier: selectionActiveNotifier,
       contextMenuOffsetNotifier: contextMenuOffsetNotifier,
+      contextMenuTextOffsetNotifier: contextMenuTextOffsetNotifier,
       hoverNotifier: hoverNotifier,
       hoverContentNotifier: hoverContentNotifier,
       lineWrap: lineWrap,
@@ -4323,8 +4846,11 @@ class _CodeField extends LeafRenderObjectWidget {
       ghostTextStyle: ghostTextStyle,
       filePath: filePath,
       onHoverSetByTap: onHoverSetByTap,
+      onModifierTap: onModifierTap,
       textDirection: textDirection,
     );
+    onRendererCreated(renderObject);
+    return renderObject;
   }
 
   @override
@@ -4332,6 +4858,7 @@ class _CodeField extends LeafRenderObjectWidget {
     BuildContext context,
     covariant _CodeFieldRenderer renderObject,
   ) {
+    onRendererCreated(renderObject);
     if (semanticTokens != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         renderObject.updateSemanticTokens(
@@ -4370,6 +4897,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final bool isMobile;
   final ValueNotifier<bool> selectionActiveNotifier, isHoveringPopup;
   final ValueNotifier<Offset> contextMenuOffsetNotifier, offsetNotifier;
+  final ValueNotifier<int> contextMenuTextOffsetNotifier;
   final ValueNotifier<(Offset, Map<String, int>)?> hoverNotifier;
   final ValueNotifier<Map<String, dynamic>?> hoverContentNotifier;
   final ValueNotifier<List<dynamic>?> lspActionNotifier, suggestionNotifier;
@@ -4379,6 +4907,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final BuildContext context;
   final LspConfig? lspConfig;
   final VoidCallback? onHoverSetByTap;
+  final ValueChanged<int>? onModifierTap;
   final Map<int, double> _lineWidthCache = {};
   final Map<int, String> _lineTextCache = {};
   final Map<int, Rect> _actionBulbRects = {};
@@ -4750,6 +5279,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     required this.isMobile,
     required this.selectionActiveNotifier,
     required this.contextMenuOffsetNotifier,
+    required this.contextMenuTextOffsetNotifier,
     required this.offsetNotifier,
     required this.hoverNotifier,
     required this.hoverContentNotifier,
@@ -4779,6 +5309,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     this.filePath,
     this.matchHighlightStyle,
     this.onHoverSetByTap,
+    this.onModifierTap,
     EdgeInsets? innerPadding,
     this._textStyle,
     this._ghostTextStyle,
@@ -11275,12 +11806,20 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       _cachedMagnifiedLine = null;
       _cachedMagnifiedOffset = null;
 
-      contextMenuOffsetNotifier.value = localPosition;
+      _showContextMenu(localPosition, textOffset);
       markNeedsPaint();
       return;
     }
 
     if (event is PointerDownEvent && event.buttons == kPrimaryButton) {
+      if (!isMobile &&
+          onModifierTap != null &&
+          _isOffsetOverWord(textOffset) &&
+          (HardwareKeyboard.instance.isMetaPressed ||
+              HardwareKeyboard.instance.isControlPressed)) {
+        onModifierTap!(textOffset);
+        return;
+      }
       if (controller.connection == null ||
           !controller.connection!.attached ||
           !focusNode.hasFocus) {
@@ -11303,7 +11842,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         debugPrint(e.toString());
       }
       if (contextMenuOffsetNotifier.value.dx >= 0) {
-        contextMenuOffsetNotifier.value = const Offset(-1, -1);
+        _hideContextMenu();
       }
 
       if (lspActionNotifier.value != null && _actionBulbRects.isNotEmpty) {
@@ -11350,7 +11889,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
         _dtap.onDoubleTap = () {
           _selectWordAtOffset(textOffset);
-          contextMenuOffsetNotifier.value = localPosition;
+          _showContextMenu(localPosition, textOffset);
         };
 
         _onetap.onTap = () {
@@ -11577,6 +12116,23 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         _showBubble = true;
       }
     }
+  }
+
+  void _showContextMenu(Offset offset, int textOffset) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!attached) return;
+      hoverNotifier.value = null;
+      hoverContentNotifier.value = null;
+      contextMenuTextOffsetNotifier.value = textOffset;
+      contextMenuOffsetNotifier.value = offset;
+    });
+  }
+
+  void _hideContextMenu() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!attached) return;
+      contextMenuOffsetNotifier.value = const Offset(-1, -1);
+    });
   }
 
   void _selectWordAtOffset(int offset) {

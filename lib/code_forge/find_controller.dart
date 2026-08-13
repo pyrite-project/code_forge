@@ -152,6 +152,20 @@ class FindController extends ChangeNotifier {
     }
   }
 
+  RegExp _buildRegExp(String query) {
+    String pattern = query;
+
+    if (!_isRegex) {
+      pattern = RegExp.escape(pattern);
+    }
+
+    if (_matchWholeWord) {
+      pattern = r'\b' + pattern + r'\b';
+    }
+
+    return RegExp(pattern, caseSensitive: _caseSensitive, multiLine: true);
+  }
+
   /// Performs a text search.
   ///
   /// [query] is the text to search for.
@@ -164,25 +178,8 @@ class FindController extends ChangeNotifier {
       return;
     }
 
-    final text = _codeController.text;
-    String pattern = query;
-
-    if (!_isRegex) {
-      pattern = RegExp.escape(pattern);
-    }
-
-    if (_matchWholeWord) {
-      pattern = r'\b' + pattern + r'\b';
-    }
-
     try {
-      final regExp = RegExp(
-        pattern,
-        caseSensitive: _caseSensitive,
-        multiLine: true,
-      );
-
-      _matches = regExp.allMatches(text).toList();
+      _matches = _buildRegExp(query).allMatches(_codeController.text).toList();
     } catch (e) {
       _matches = [];
       _currentMatchIndex = -1;
@@ -247,36 +244,66 @@ class FindController extends ChangeNotifier {
     if (_currentMatchIndex < 0 || _currentMatchIndex >= _matches.length) return;
 
     final match = _matches[_currentMatchIndex];
-    _codeController.replaceRange(
-      match.start,
-      match.end,
-      replaceInputController.text,
-    );
+    final replacement = _replacementFor(match);
+    _codeController.replaceRange(match.start, match.end, replacement);
+    find(_lastQuery, scrollToMatch: false);
+    _scrollToCurrentMatch();
+    _updateHighlights();
   }
 
   /// Replaces all matches with the text in [replaceInputController].
   void replaceAll() {
-    if (_matches.isEmpty) return;
-
-    final text = _codeController.text;
-    String pattern = _lastQuery;
-
-    if (!_isRegex) {
-      pattern = RegExp.escape(_lastQuery);
-    }
-
-    if (_matchWholeWord) {
-      pattern = '\\b$pattern\\b';
-    }
+    if (_matches.isEmpty || _lastQuery.isEmpty) return;
 
     try {
-      final regExp = RegExp(pattern, caseSensitive: _caseSensitive);
-      final newText = text.replaceAll(regExp, replaceInputController.text);
+      final text = _codeController.text;
+      final regExp = _buildRegExp(_lastQuery);
+      final newText = text.replaceAllMapped(regExp, _replacementFor);
 
       _codeController.replaceRange(0, text.length, newText);
+      find(_lastQuery, scrollToMatch: false);
     } catch (e) {
       debugPrint('FindController: Replace All failed. Error: $e');
     }
+  }
+
+  String _replacementFor(Match match) {
+    final replacement = replaceInputController.text;
+    if (!_isRegex || match is! RegExpMatch) {
+      return replacement;
+    }
+
+    return expandRegexReplacement(replacement, match);
+  }
+
+  /// Expands common regex replacement placeholders such as `$1`, `${name}`,
+  /// `$&`, and `$$`.
+  static String expandRegexReplacement(String replacement, RegExpMatch match) {
+    return replacement.replaceAllMapped(
+      RegExp(r'\$(\$|&|0|[1-9][0-9]?|\{[A-Za-z_][A-Za-z0-9_]*\})'),
+      (placeholder) {
+        final token = placeholder.group(1)!;
+        if (token == r'$') {
+          return r'$';
+        }
+        if (token == '&' || token == '0') {
+          return match.group(0) ?? '';
+        }
+        if (token.startsWith('{')) {
+          final name = token.substring(1, token.length - 1);
+          try {
+            return match.namedGroup(name) ?? '';
+          } on ArgumentError {
+            return '';
+          }
+        }
+        final groupIndex = int.tryParse(token);
+        if (groupIndex == null || groupIndex > match.groupCount) {
+          return '';
+        }
+        return match.group(groupIndex) ?? '';
+      },
+    );
   }
 
   void _clearMatches() {

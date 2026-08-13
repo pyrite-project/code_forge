@@ -454,10 +454,26 @@ class CustomContextMenu {
   /// The action to be performed on pressing the context menu item.
   final VoidCallback onPress;
 
+  /// Whether this item should be included when the menu is opened.
+  final bool Function()? visible;
+
+  /// Whether this item should be included for the text offset that opened the menu.
+  final bool Function(int textOffset)? visibleAt;
+
+  /// The action to perform with the text offset that opened the menu.
+  final void Function(int textOffset)? onPressAt;
+
+  /// Optional icon shown before the label.
+  final IconData? icon;
+
   const CustomContextMenu({
     required this.label,
     required this.description,
     required this.onPress,
+    this.visible,
+    this.visibleAt,
+    this.onPressAt,
+    this.icon,
   });
 }
 
