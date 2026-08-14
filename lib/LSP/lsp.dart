@@ -43,7 +43,9 @@ sealed class LspConfig {
   final StreamController<Map<String, dynamic>> _responseController =
       StreamController.broadcast();
   static const _requestTimeout = Duration(seconds: 15);
+  static const _maxRequestRetries = 3;
   int _nextId = 1;
+  final _pendingRequests = <int, Completer<Map<String, dynamic>>>{};
   final _openDocuments = <String, int>{};
   List<String>? _serverTokenTypes, _serverTokenModifiers;
   bool _serverSupportsSemanticTokensRange = false;
@@ -58,19 +60,7 @@ sealed class LspConfig {
 
   Future<Map<String, dynamic>> _waitForResponse(int id) {
     final completer = Completer<Map<String, dynamic>>();
-    late final StreamSubscription<Map<String, dynamic>> subscription;
-    subscription = _responseController.stream.listen(
-      (response) {
-        if (response['id'] == id && !completer.isCompleted) {
-          completer.complete(response);
-        }
-      },
-      onDone: () {
-        if (!completer.isCompleted) {
-          completer.completeError(StateError('LSP response stream closed'));
-        }
-      },
-    );
+    _pendingRequests[id] = completer;
     return completer.future
         .timeout(
           _requestTimeout,
@@ -78,7 +68,30 @@ sealed class LspConfig {
             'LSP request $id timed out after ${_requestTimeout.inSeconds}s',
           ),
         )
-        .whenComplete(subscription.cancel);
+        .whenComplete(() => _pendingRequests.remove(id));
+  }
+
+  void _handleResponse(Map<String, dynamic> response) {
+    final id = response['id'];
+    if (id is num) {
+      final completer = _pendingRequests.remove(id.toInt());
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(response);
+      }
+    }
+    if (!_responseController.isClosed) _responseController.add(response);
+  }
+
+  void _failPendingRequests(Object error, [StackTrace? stackTrace]) {
+    final pending = List<Completer<Map<String, dynamic>>>.from(
+      _pendingRequests.values,
+    );
+    _pendingRequests.clear();
+    for (final completer in pending) {
+      if (!completer.isCompleted) {
+        completer.completeError(error, stackTrace ?? StackTrace.current);
+      }
+    }
   }
 
   /// The server's semantic token types legend.
@@ -148,8 +161,27 @@ sealed class LspConfig {
   void dispose();
 
   /// Sends a request to the LSP server and waits for a response.
-  /// This is used for synchronous operations that require a reply from the server.
+  /// Transient transport and JSON-RPC errors are retried up to three times.
   Future<Map<String, dynamic>> sendRequest({
+    required String method,
+    required Map<String, dynamic> params,
+  }) async {
+    for (var attempt = 0; attempt <= _maxRequestRetries; attempt++) {
+      try {
+        final response = await _sendRequestOnce(method: method, params: params);
+        if (response['error'] == null || attempt == _maxRequestRetries) {
+          return response;
+        }
+      } catch (error, stackTrace) {
+        if (attempt == _maxRequestRetries) {
+          Error.throwWithStackTrace(error, stackTrace);
+        }
+      }
+    }
+    throw StateError('LSP request failed: $method');
+  }
+
+  Future<Map<String, dynamic>> _sendRequestOnce({
     required String method,
     required Map<String, dynamic> params,
   });
@@ -326,6 +358,29 @@ sealed class LspConfig {
       },
     );
     await Future.delayed(Duration(milliseconds: 300));
+  }
+
+  /// Synchronizes a document even when it was not previously open in this
+  /// LSP instance.
+  Future<void> syncDocument(String filePath, String content) async {
+    if (_openDocuments.containsKey(filePath)) {
+      await updateDocument(filePath, content);
+      return;
+    }
+
+    const version = 1;
+    _openDocuments[filePath] = version;
+    await sendNotification(
+      method: 'textDocument/didOpen',
+      params: {
+        'textDocument': {
+          'uri': Uri.file(filePath).toString(),
+          'languageId': languageId,
+          'version': version,
+          'text': content,
+        },
+      },
+    );
   }
 
   /// Updates the document content in the LSP server.

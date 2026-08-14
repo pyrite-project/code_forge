@@ -177,7 +177,11 @@ class LspStdioConfig extends LspConfig {
       environment: environment,
       workingDirectory: workspacePath,
     );
-    _process.stdout.listen(_handleStdoutData);
+    _process.stdout.listen(
+      _handleStdoutData,
+      onError: _failPendingRequests,
+      onDone: () => _failPendingRequests(StateError('LSP stdio closed')),
+    );
     _process.stderr.listen((data) => debugPrint(utf8.decode(data)));
   }
 
@@ -186,28 +190,26 @@ class LspStdioConfig extends LspConfig {
   Process get process => _process;
 
   void _handleStdoutData(List<int> data) {
-    _buffer.addAll(data);
-    while (_buffer.isNotEmpty) {
-      final headerEnd = _findHeaderEnd();
-      if (headerEnd == -1) return;
-      final header = utf8.decode(_buffer.sublist(0, headerEnd));
-      final contentLength = int.parse(
-        RegExp(r'Content-Length: (\d+)').firstMatch(header)?.group(1) ?? '0',
-      );
-      if (_buffer.length < headerEnd + 4 + contentLength) return;
-      final messageStart = headerEnd + 4;
-      final messageEnd = messageStart + contentLength;
-      final messageBytes = _buffer.sublist(messageStart, messageEnd);
-      _buffer.removeRange(0, messageEnd);
-      try {
-        final json = jsonDecode(utf8.decode(messageBytes));
-        _responseController.add(json);
-      } catch (e) {
-        throw FormatException(
-          'Invalid JSON message $e',
-          utf8.decode(messageBytes),
+    try {
+      _buffer.addAll(data);
+      while (_buffer.isNotEmpty) {
+        final headerEnd = _findHeaderEnd();
+        if (headerEnd == -1) return;
+        final header = utf8.decode(_buffer.sublist(0, headerEnd));
+        final contentLength = int.parse(
+          RegExp(r'Content-Length: (\d+)').firstMatch(header)?.group(1) ?? '0',
         );
+        if (_buffer.length < headerEnd + 4 + contentLength) return;
+        final messageStart = headerEnd + 4;
+        final messageEnd = messageStart + contentLength;
+        final messageBytes = _buffer.sublist(messageStart, messageEnd);
+        _buffer.removeRange(0, messageEnd);
+        final json = jsonDecode(utf8.decode(messageBytes));
+        if (json is! Map) throw const FormatException('Expected JSON object');
+        _handleResponse(Map<String, dynamic>.from(json));
       }
+    } catch (error, stackTrace) {
+      _failPendingRequests(error, stackTrace);
     }
   }
 
@@ -224,7 +226,7 @@ class LspStdioConfig extends LspConfig {
   }
 
   @override
-  Future<Map<String, dynamic>> sendRequest({
+  Future<Map<String, dynamic>> _sendRequestOnce({
     required String method,
     required Map<String, dynamic> params,
   }) async {
@@ -289,6 +291,7 @@ class LspStdioConfig extends LspConfig {
 
   @override
   void dispose() {
+    _failPendingRequests(StateError('LSP stdio disposed'));
     _process.kill();
     _responseController.close();
   }

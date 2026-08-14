@@ -42,18 +42,23 @@ class LspSocketConfig extends LspConfig {
   /// This method is used to initialize the LSP server. and it's used internally by the [CodeCrafter] widget.
   /// Calling it directly is not recommended and may crash the LSP server if called multiple times.
   Future<void> connect() async {
-    _channel.stream.listen((data) {
-      try {
-        final json = jsonDecode(data as String);
-        _responseController.add(json);
-      } catch (e) {
-        throw FormatException('Invalid JSON response: $data', e);
-      }
-    });
+    _channel.stream.listen(
+      (data) {
+        try {
+          final json = jsonDecode(data as String);
+          if (json is! Map) throw const FormatException('Expected JSON object');
+          _handleResponse(Map<String, dynamic>.from(json));
+        } catch (error, stackTrace) {
+          _failPendingRequests(error, stackTrace);
+        }
+      },
+      onError: _failPendingRequests,
+      onDone: () => _failPendingRequests(StateError('LSP socket closed')),
+    );
   }
 
   @override
-  Future<Map<String, dynamic>> sendRequest({
+  Future<Map<String, dynamic>> _sendRequestOnce({
     required String method,
     required Map<String, dynamic> params,
   }) async {
@@ -94,6 +99,7 @@ class LspSocketConfig extends LspConfig {
   @override
   void dispose() {
     _channel.sink.close();
+    _failPendingRequests(StateError('LSP socket disposed'));
     _responseController.close();
   }
 }
