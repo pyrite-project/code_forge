@@ -83,10 +83,17 @@ class CodeForgeController implements DeltaTextInputClient {
   bool deleteFoldRangeOnDeletingFirstLine = false;
   bool _lspReady = false, _isTyping = false, _isDisposed = false;
   bool _usesCclsSemanticHighlight = false, _suppressLspFallbackSync = false;
+  bool _signatureHelpInFlight = false, _signatureHelpPending = false;
   bool _cclsForcedRefreshAttempted = false;
   bool _lspFoldRangesAdjustedNotFetched = false;
-  bool _inlayHintsVisible = false, documentHighlightsChanged = false;
-  int _imeProjectionStartOffset = 0, _completionRequestId = 0;
+  bool _inlayHintsVisible = false, _inlayHintsTemporary = false;
+  bool _documentColorsEnabled = true, _forceDocumentColorRequests = false;
+  bool _readOnlyBeforeInlayHints = false, documentHighlightsChanged = false;
+  int _imeProjectionStartOffset = 0,
+      _completionRequestId = 0,
+      _codeActionRequestId = 0,
+      _inlayHintsRequestId = 0,
+      _documentColorsRequestId = 0;
   int _cachedTextVersion = -1, _currentVersion = 0, _semanticTokensVersion = 0;
   int _bufferLineRopeStart = 0, _bufferLineOriginalLength = 0;
   int? dirtyLine, _bufferLineIndex;
@@ -138,14 +145,31 @@ class CodeForgeController implements DeltaTextInputClient {
 
           if (data['method'] == 'workspace/configuration') {
             final id = data['id'];
-            await lspConfig!.sendResponse(id, [
-              lspConfig!.workspaceConfiguration,
-            ]);
+            final params = data['params'] as Map?;
+            final items = params?['items'];
+            final configurationItems = items is List ? items : const [null];
+            await lspConfig!.sendResponse(
+              id,
+              configurationItems
+                  .map(
+                    (item) => LspConfig.workspaceConfigurationForSection(
+                      lspConfig!.workspaceConfiguration,
+                      item is Map ? item['section'] : null,
+                    ),
+                  )
+                  .toList(),
+            );
           }
 
           if (data['method'] == 'textDocument/publishDiagnostics') {
-            final List<dynamic> rawDiagnostics =
-                data['params']?['diagnostics'] ?? [];
+            final params = data['params'] as Map?;
+            final filePath = openedFile;
+            if (filePath == null ||
+                params?['uri'] != Uri.file(filePath).toString()) {
+              return;
+            }
+            final requestId = ++_codeActionRequestId;
+            final List<dynamic> rawDiagnostics = params?['diagnostics'] ?? [];
             if (rawDiagnostics.isNotEmpty) {
               final List<LspErrors> errors = [];
               for (final item in rawDiagnostics) {
@@ -173,8 +197,9 @@ class CodeForgeController implements DeltaTextInputClient {
               _codeActionTimer = Timer(
                 const Duration(milliseconds: 250),
                 () async {
+                  if (_isDisposed || requestId != _codeActionRequestId) return;
                   if (errors.isEmpty) {
-                    if (!_isDisposed) codeActionsNotifier.value = null;
+                    codeActionsNotifier.value = null;
                     return;
                   }
                   int minStartLine = errors
@@ -191,23 +216,31 @@ class CodeForgeController implements DeltaTextInputClient {
                       .reduce((a, b) => a > b ? a : b);
 
                   try {
-                    final actions = await lspConfig!.getCodeActions(
-                      filePath: openedFile!,
+                    final config = lspConfig;
+                    if (config == null || openedFile != filePath) return;
+                    final actions = await config.getCodeActions(
+                      filePath: filePath,
                       startLine: minStartLine,
                       startCharacter: minStartChar,
                       endLine: maxEndLine,
                       endCharacter: maxEndChar,
                       diagnostics: rawDiagnostics.cast<Map<String, dynamic>>(),
                     );
-                    if (!_isDisposed) codeActionsNotifier.value = actions;
+                    if (!_isDisposed &&
+                        requestId == _codeActionRequestId &&
+                        openedFile == filePath) {
+                      codeActionsNotifier.value = actions;
+                    }
                   } catch (e) {
                     debugPrint('Error fetching code actions: $e');
                   }
                 },
               );
             } else {
-              if (!_isDisposed) diagnosticsNotifier.value = [];
-              if (!_isDisposed) codeActionsNotifier.value = null;
+              if (!_isDisposed && requestId == _codeActionRequestId) {
+                diagnosticsNotifier.value = [];
+                codeActionsNotifier.value = null;
+              }
             }
           }
 
@@ -320,7 +353,7 @@ class CodeForgeController implements DeltaTextInputClient {
         await lspConfig!.saveDocument(openedFile!, text);
       }
 
-      await fetchDocumentColors();
+      await fetchDocumentColors(force: _forceDocumentColorRequests);
       await fetchLSPFoldRanges();
     } catch (e) {
       debugPrint('Error opening LSP document: $e');
@@ -390,7 +423,7 @@ class CodeForgeController implements DeltaTextInputClient {
     _documentColorTimer?.cancel();
     _documentColorTimer = Timer(_documentColorDebounce, () {
       if (!_isDisposed && _lspReady) {
-        fetchDocumentColors();
+        fetchDocumentColors(force: _forceDocumentColorRequests);
       }
     });
   }
@@ -459,11 +492,17 @@ class CodeForgeController implements DeltaTextInputClient {
   ) async {
     if (_isDisposed || !_lspReady || openedFile == null) return;
     await Future<void>.delayed(Duration.zero);
-    final completions = await lspConfig!.getCompletions(
-      openedFile!,
-      line,
-      character,
-    );
+    List<LspCompletion> completions;
+    try {
+      completions = await lspConfig!.getCompletions(
+        openedFile!,
+        line,
+        character,
+      );
+    } catch (error) {
+      debugPrint('Error fetching LSP completions: $error');
+      completions = [];
+    }
     if (_isDisposed || requestId != _completionRequestId) return;
     _suggestions = completions;
     _sortSuggestions(prefix);
@@ -560,6 +599,11 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Open a file using the controller API instead of passing `filePath` parameter to [CodeForge]
   set openedFile(String? file) {
     final previousFile = _openedFile;
+    if (previousFile != file) {
+      _codeActionRequestId++;
+      diagnosticsNotifier.value = [];
+      codeActionsNotifier.value = null;
+    }
     _openedFile = file;
     if (openedFile != null) {
       text = File(_openedFile!).readAsStringSync();
@@ -697,8 +741,14 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Returns whether inlay hints are currently visible
   bool get inlayHintsVisible => _inlayHintsVisible;
 
+  /// Whether the current inlay hints were opened as a temporary read-only view.
+  bool get inlayHintsTemporary => _inlayHintsTemporary;
+
   /// Returns the current document colors
   List<DocumentColor> get documentColors => List.unmodifiable(_documentColors);
+
+  /// Whether document color requests bypass the initialization capability.
+  bool get forceDocumentColorRequests => _forceDocumentColorRequests;
 
   /// Returns the current document highlights
   List<DocumentHighlight> get documentHighlights =>
@@ -1304,8 +1354,8 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Shows inlay hints in the editor.
   ///
   /// This fetches inlay hints from the LSP server for the visible range
-  /// and displays them inline in the code. Sets readOnly to true while
-  /// hints are visible to prevent user input.
+  /// and displays them inline in the code. By default, hints are shown as a
+  /// temporary read-only view; pass [readOnly] as false for persistent hints.
   ///
   /// Inlay hints show type annotations (kind: 1) and parameter names (kind: 2).
   ///
@@ -1314,11 +1364,22 @@ class CodeForgeController implements DeltaTextInputClient {
   /// // Call this when Ctrl+Alt is pressed
   /// await controller.showInlayHints();
   /// ```
-  Future<void> showInlayHints() async {
-    if (_inlayHintsVisible || lspConfig == null || openedFile == null) return;
+  Future<void> showInlayHints({bool readOnly = true}) async {
+    if (_inlayHintsVisible) {
+      if (!readOnly && _inlayHintsTemporary) {
+        _inlayHintsTemporary = false;
+        this.readOnly = _readOnlyBeforeInlayHints;
+        notifyListeners();
+      }
+      return;
+    }
+    if (lspConfig == null || openedFile == null) return;
 
     _inlayHintsVisible = true;
-    readOnly = true;
+    _inlayHintsTemporary = readOnly;
+    _readOnlyBeforeInlayHints = this.readOnly;
+    if (readOnly) this.readOnly = true;
+    final requestId = ++_inlayHintsRequestId;
 
     try {
       final endLine = lineCount > 500 ? 500 : lineCount;
@@ -1328,7 +1389,10 @@ class CodeForgeController implements DeltaTextInputClient {
         0,
         endLine,
         0,
+        force: true,
       );
+
+      if (!_inlayHintsVisible || requestId != _inlayHintsRequestId) return;
 
       final result = response['result'];
       if (result is List) {
@@ -1343,15 +1407,17 @@ class CodeForgeController implements DeltaTextInputClient {
       inlayHintsChanged = true;
       notifyListeners();
     } catch (e) {
+      if (requestId != _inlayHintsRequestId) return;
       debugPrint('Error fetching inlay hints: $e');
       _inlayHintsVisible = false;
-      readOnly = false;
+      _inlayHintsTemporary = false;
+      this.readOnly = _readOnlyBeforeInlayHints;
     }
   }
 
   /// Hides inlay hints from the editor.
   ///
-  /// This clears all inlay hints and restores the editor to editable mode.
+  /// This clears all inlay hints and restores the previous read-only state.
   ///
   /// Example:
   /// ```dart
@@ -1361,9 +1427,11 @@ class CodeForgeController implements DeltaTextInputClient {
   void hideInlayHints() {
     if (!_inlayHintsVisible) return;
 
+    _inlayHintsRequestId++;
     _inlayHintsVisible = false;
+    _inlayHintsTemporary = false;
     _inlayHints = [];
-    readOnly = false;
+    readOnly = _readOnlyBeforeInlayHints;
     inlayHintsChanged = true;
     notifyListeners();
   }
@@ -1394,11 +1462,21 @@ class CodeForgeController implements DeltaTextInputClient {
   /// ```dart
   /// await controller.fetchDocumentColors();
   /// ```
-  Future<void> fetchDocumentColors() async {
-    if (lspConfig == null || openedFile == null) return;
+  Future<void> fetchDocumentColors({bool force = false}) async {
+    if (!_documentColorsEnabled || lspConfig == null || openedFile == null) {
+      return;
+    }
+
+    final requestId = ++_documentColorsRequestId;
 
     try {
-      final response = await lspConfig!.getDocumentColor(openedFile!);
+      final response = await lspConfig!.getDocumentColor(
+        openedFile!,
+        force: force,
+      );
+      if (!_documentColorsEnabled || requestId != _documentColorsRequestId) {
+        return;
+      }
       final result = response['result'];
 
       if (result is List) {
@@ -1427,8 +1505,28 @@ class CodeForgeController implements DeltaTextInputClient {
     notifyListeners();
   }
 
+  /// Enables or disables document color swatches and their color picker.
+  ///
+  /// [force] supports existing LSP sessions that were initialized before they
+  /// advertised document color capability.
+  void setDocumentColorsEnabled(bool enabled, {bool force = false}) {
+    _documentColorsEnabled = enabled;
+    _forceDocumentColorRequests = enabled && force;
+    _documentColorsRequestId++;
+
+    if (!enabled) {
+      _documentColors = [];
+      documentColorsChanged = true;
+      notifyListeners();
+      return;
+    }
+
+    unawaited(fetchDocumentColors(force: _forceDocumentColorRequests));
+  }
+
   /// Clears all document colors.
   void clearDocumentColors() {
+    _documentColorsRequestId++;
     _documentColors = [];
     documentColorsChanged = true;
     notifyListeners();
@@ -4681,17 +4779,38 @@ class CodeForgeController implements DeltaTextInputClient {
   /// for the current cursor position, displaying available parameters and
   /// highlighting the parameter in focus within function parentheses.
   Future<void> callSignatureHelp() async {
-    if (lspConfig != null) {
-      final cursorPosition = selection.extentOffset;
-      final line = getLineAtOffset(cursorPosition);
-      final lineStartOffset = getLineStartOffset(line);
-      final character = cursorPosition - lineStartOffset;
-      signatureNotifier.value = await lspConfig!.getSignatureHelp(
-        openedFile!,
-        line,
-        character,
-        1,
-      );
+    if (lspConfig == null || openedFile == null || _isDisposed) return;
+    if (_signatureHelpInFlight) {
+      _signatureHelpPending = true;
+      return;
+    }
+
+    _signatureHelpInFlight = true;
+    try {
+      do {
+        _signatureHelpPending = false;
+        final config = lspConfig;
+        final filePath = openedFile;
+        if (config == null || filePath == null || _isDisposed) return;
+
+        final cursorPosition = selection.extentOffset;
+        final line = getLineAtOffset(cursorPosition);
+        final lineStartOffset = getLineStartOffset(line);
+        final character = cursorPosition - lineStartOffset;
+        final signature = await config.getSignatureHelp(
+          filePath,
+          line,
+          character,
+          1,
+        );
+        if (!_isDisposed && config == lspConfig && filePath == openedFile) {
+          signatureNotifier.value = signature;
+        }
+      } while (_signatureHelpPending);
+    } catch (error) {
+      debugPrint('Error fetching LSP signature help: $error');
+    } finally {
+      _signatureHelpInFlight = false;
     }
   }
 

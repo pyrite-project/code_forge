@@ -236,10 +236,7 @@ class LspStdioConfig extends LspConfig {
       'params': params,
     };
 
-    final responseFuture = _responseController.stream.firstWhere(
-      (response) => response['id'] == id,
-      orElse: () => throw TimeoutException('No response for request $id'),
-    );
+    final responseFuture = _waitForResponse(id);
 
     await _sendLspMessage(request);
 

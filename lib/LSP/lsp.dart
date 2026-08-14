@@ -38,10 +38,11 @@ sealed class LspConfig {
 
   /// Configuration settings for the workspace.
   /// These are sent to the server via workspace/didChangeConfiguration notifications.
-  final Map<String, dynamic> workspaceConfiguration;
+  Map<String, dynamic> workspaceConfiguration;
 
   final StreamController<Map<String, dynamic>> _responseController =
       StreamController.broadcast();
+  static const _requestTimeout = Duration(seconds: 15);
   int _nextId = 1;
   final _openDocuments = <String, int>{};
   List<String>? _serverTokenTypes, _serverTokenModifiers;
@@ -54,6 +55,31 @@ sealed class LspConfig {
   /// Stream of responses from the LSP server.
   /// Use this to listen for notifications like diagnostics.
   Stream<Map<String, dynamic>> get responses => _responseController.stream;
+
+  Future<Map<String, dynamic>> _waitForResponse(int id) {
+    final completer = Completer<Map<String, dynamic>>();
+    late final StreamSubscription<Map<String, dynamic>> subscription;
+    subscription = _responseController.stream.listen(
+      (response) {
+        if (response['id'] == id && !completer.isCompleted) {
+          completer.complete(response);
+        }
+      },
+      onDone: () {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('LSP response stream closed'));
+        }
+      },
+    );
+    return completer.future
+        .timeout(
+          _requestTimeout,
+          onTimeout: () => throw TimeoutException(
+            'LSP request $id timed out after ${_requestTimeout.inSeconds}s',
+          ),
+        )
+        .whenComplete(subscription.cancel);
+  }
 
   /// The server's semantic token types legend.
   /// Returns null if not yet initialized.
@@ -86,6 +112,24 @@ sealed class LspConfig {
       "highlight": {'enabled': true, 'lsRanges': true},
       ...initializationOptions,
     });
+  }
+
+  void updateWorkspaceConfiguration(Map<String, dynamic> configuration) {
+    workspaceConfiguration = configuration;
+  }
+
+  static dynamic workspaceConfigurationForSection(
+    Map<String, dynamic> configuration,
+    Object? section,
+  ) {
+    if (section is! String || section.isEmpty) return configuration;
+
+    dynamic value = configuration;
+    for (final segment in section.split('.')) {
+      if (value is! Map || !value.containsKey(segment)) return null;
+      value = value[segment];
+    }
+    return value;
   }
 
   @override
@@ -602,8 +646,9 @@ sealed class LspConfig {
     required double green,
     required double alpha,
     required Map<String, dynamic> range,
+    bool force = false,
   }) async {
-    if (!capabilities.documentColor) return {'result': []};
+    if (!force && !capabilities.documentColor) return {'result': []};
 
     /// Requests color presentation(s) for a color at a given range.
     ///
@@ -632,8 +677,11 @@ sealed class LspConfig {
   /// (ranges and color values) in `response['result']`. This method returns
   /// the raw server response as a map; callers should read `response['result']`
   /// to obtain the list of color entries.
-  Future<Map<String, dynamic>> getDocumentColor(String filePath) async {
-    if (!capabilities.documentColor) return {'result': []};
+  Future<Map<String, dynamic>> getDocumentColor(
+    String filePath, {
+    bool force = false,
+  }) async {
+    if (!force && !capabilities.documentColor) return {'result': []};
     final response = await sendRequest(
       method: "textDocument/documentColor",
       params: {
@@ -673,9 +721,10 @@ sealed class LspConfig {
     int startLine,
     int startCharacter,
     int endLine,
-    int endCharacter,
-  ) async {
-    if (!capabilities.inlayHint) return {'result': []};
+    int endCharacter, {
+    bool force = false,
+  }) async {
+    if (!force && !capabilities.inlayHint) return {'result': []};
     final response = await sendRequest(
       method: "textDocument/inlayHint",
       params: {

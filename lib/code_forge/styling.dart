@@ -502,7 +502,7 @@ class SuggestionStyle extends OverlayStyle {
 /// Example:
 /// ```dart
 /// HoverDetailsStyle(
-///   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+///   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
 ///   backgroundColor: Colors.grey[850]!,
 ///   focusColor: Colors.blue.withOpacity(0.3),
 ///   hoverColor: Colors.blue.withOpacity(0.1),
