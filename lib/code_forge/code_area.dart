@@ -16,6 +16,7 @@ import 'package:vector_math/vector_math_64.dart' show Vector3;
 
 import '../code_forge.dart';
 import '../src/rust/api/editor.dart';
+import './root_overlay_portal.dart';
 import './syntax_highlighter.dart';
 
 const int kSemanticTokenViewportPaddingLines = 1500;
@@ -3513,7 +3514,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           }
                           return ValueListenableBuilder(
                             valueListenable: _suggestionNotifier,
-                            builder: (_, sugg, child) {
+                            builder: (context, sugg, child) {
                               if (_aiNotifier.value != null) {
                                 return SizedBox.shrink();
                               }
@@ -3523,10 +3524,24 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 return SizedBox.shrink();
                               }
                               final completionScrlCtrl = ScrollController();
-                              final desiredWidth = screenWidth < 700
-                                  ? screenWidth * 0.63
-                                  : screenWidth * 0.3;
-                              final suggestionWidth = min(desiredWidth, 400.0);
+                              final overlayBounds =
+                                  CodeForgeRootOverlayGeometry.maybeOf(
+                                    context,
+                                  )?.overlayBoundsInTarget ??
+                                  Rect.fromLTWH(
+                                    0,
+                                    0,
+                                    screenWidth,
+                                    popupHeight,
+                                  );
+                              final viewportWidth = overlayBounds.width;
+                              final desiredWidth = viewportWidth < 700
+                                  ? viewportWidth * 0.63
+                                  : min(viewportWidth * 0.4, 520.0);
+                              final suggestionWidth = min(
+                                desiredWidth,
+                                max(70.0, viewportWidth - 20),
+                              );
                               final itemExtent =
                                   _suggestionStyle.itemHeight ?? 24.0;
                               final estimatedHeight = min(
@@ -3534,21 +3549,23 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 400.0,
                               );
                               double adjustedLeft = offset.dx;
-                              if (adjustedLeft + suggestionWidth >
-                                  screenWidth) {
-                                adjustedLeft = screenWidth - suggestionWidth;
-                              }
-                              if (adjustedLeft < 0) {
-                                adjustedLeft = 0;
-                              }
+                              final minimumLeft = overlayBounds.left + 10;
+                              final maximumLeft =
+                                  overlayBounds.right - suggestionWidth - 10;
+                              adjustedLeft = maximumLeft < minimumLeft
+                                  ? minimumLeft
+                                  : adjustedLeft
+                                        .clamp(minimumLeft, maximumLeft)
+                                        .toDouble();
                               final fontSize = widget.textStyle?.fontSize ?? 14;
                               final spaceBelow =
-                                  popupHeight -
+                                  overlayBounds.bottom -
                                   offset.dy -
                                   fontSize -
                                   popupBottomGap -
                                   10;
-                              final spaceAbove = offset.dy - 10;
+                              final spaceAbove =
+                                  offset.dy - overlayBounds.top - 10;
                               final shouldPositionAbove =
                                   estimatedHeight > spaceBelow &&
                                   spaceAbove >= spaceBelow;
@@ -3583,7 +3600,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                         child: ConstrainedBox(
                                           constraints: BoxConstraints(
                                             maxHeight: availableHeight,
-                                            maxWidth: 400,
+                                            maxWidth: suggestionWidth,
                                             minWidth: 70,
                                           ),
                                           child: Card(
@@ -3968,9 +3985,9 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                 (widget.textStyle?.fontSize ??
                                                     14) +
                                                 10 +
-                                                (screenWidth < 700
+                                                (viewportWidth < 700
                                                     ? (offset.dy <
-                                                                  (screenWidth /
+                                                                  (viewportWidth /
                                                                       2) &&
                                                               400 < popupHeight)
                                                           ? (((widget.textStyle?.fontSize ??
@@ -3984,19 +4001,23 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           : -100
                                                     : 0);
                                             return Positioned(
-                                              width: screenWidth < 700
-                                                  ? screenWidth * 0.63
+                                              width: viewportWidth < 700
+                                                  ? viewportWidth * 0.63
                                                   : null,
                                               top: documentationTop,
-                                              left: screenWidth < 700
-                                                  ? offset.dx
+                                              left: viewportWidth < 700
+                                                  ? adjustedLeft
                                                   : ((adjustedLeft +
                                                                 suggestionWidth +
                                                                 420) >
-                                                            screenWidth
-                                                        ? adjustedLeft -
-                                                              420 -
-                                                              10
+                                                            overlayBounds.right
+                                                        ? max(
+                                                            overlayBounds.left +
+                                                                10,
+                                                            adjustedLeft -
+                                                                420 -
+                                                                10,
+                                                          )
                                                         : adjustedLeft +
                                                               suggestionWidth),
                                               child: ConstrainedBox(
@@ -4006,7 +4027,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                     400.0,
                                                     max(
                                                       0.0,
-                                                      popupHeight -
+                                                      overlayBounds.bottom -
                                                           documentationTop -
                                                           popupBottomGap,
                                                     ),
@@ -4101,33 +4122,58 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                             },
                           );
                         },
+                      ).inCodeForgeRootOverlay(
+                        targetSize: Size(
+                          popupConstraints.maxWidth,
+                          popupHeight,
+                        ),
                       ),
                       ValueListenableBuilder(
                         valueListenable: _hoverNotifier,
-                        builder: (_, hov, c) {
+                        builder: (context, hov, c) {
                           if (hov == null || _controller.lspConfig == null) {
                             return SizedBox.shrink();
                           }
                           final Offset position = hov.$1;
-                          final width = _isMobile
-                              ? screenWidth * 0.63
-                              : screenWidth * 0.3;
+                          final overlayBounds =
+                              CodeForgeRootOverlayGeometry.maybeOf(
+                                context,
+                              )?.overlayBoundsInTarget ??
+                              Rect.fromLTWH(
+                                0,
+                                0,
+                                screenWidth,
+                                popupHeight,
+                              );
+                          final viewportWidth = overlayBounds.width;
+                          final desiredWidth = _isMobile
+                              ? viewportWidth * 0.63
+                              : min(viewportWidth * 0.4, 520.0);
+                          final width = min(
+                            desiredWidth,
+                            max(70.0, viewportWidth - 20),
+                          );
                           final maxHeight = min(
-                            _isMobile ? popupHeight * 0.4 : 550.0,
-                            popupHeight - popupBottomGap,
+                            _isMobile ? overlayBounds.height * 0.4 : 550.0,
+                            overlayBounds.height - popupBottomGap * 2,
                           );
 
                           double adjustedLeft = position.dx;
-                          if (adjustedLeft + width > screenWidth) {
-                            adjustedLeft = screenWidth - width;
-                          }
-                          if (adjustedLeft < 0) {
-                            adjustedLeft = 0;
-                          }
+                          final minimumLeft = overlayBounds.left + 10;
+                          final maximumLeft =
+                              overlayBounds.right - width - 10;
+                          adjustedLeft = maximumLeft < minimumLeft
+                              ? minimumLeft
+                              : adjustedLeft
+                                    .clamp(minimumLeft, maximumLeft)
+                                    .toDouble();
 
                           final spaceBelow =
-                              popupHeight - position.dy - popupBottomGap;
-                          final spaceAbove = position.dy - 10;
+                              overlayBounds.bottom -
+                              position.dy -
+                              popupBottomGap;
+                          final spaceAbove =
+                              position.dy - overlayBounds.top - 10;
                           final shouldPositionAbove =
                               maxHeight > spaceBelow &&
                               spaceAbove >= spaceBelow;
@@ -4402,6 +4448,11 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                             ),
                           );
                         },
+                      ).inCodeForgeRootOverlay(
+                        targetSize: Size(
+                          popupConstraints.maxWidth,
+                          popupHeight,
+                        ),
                       ),
                       ValueListenableBuilder<Offset?>(
                         valueListenable: _aiOffsetNotifier,

@@ -51,6 +51,7 @@ sealed class LspConfig {
   bool _serverSupportsSemanticTokensRange = false;
   bool _serverSupportsSemanticTokensFull = false;
   final Map<String, dynamic> _initOptions = {};
+  Future<void>? _initialization;
 
   bool isInitialized = false;
 
@@ -205,7 +206,12 @@ sealed class LspConfig {
   ///
   /// This method is used internally by the [CodeForge] widget and calling it directly is not recommended.
   /// It may crash the LSP server if called multiple times.
-  Future<void> initialize() async {
+  Future<void> initialize() {
+    if (isInitialized) return Future.value();
+    return _initialization ??= _initialize();
+  }
+
+  Future<void> _initialize() async {
     final workspaceUri = Uri.directory(workspacePath).toString();
     final response = await sendRequest(
       method: 'initialize',
