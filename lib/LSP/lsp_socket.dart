@@ -27,6 +27,9 @@ class LspSocketConfig extends LspConfig {
   /// The URL of the LSP server to connect to via WebSocket.
   final String serverUrl;
   final WebSocketChannel _channel;
+  bool _streamListening = false;
+  Object? _connectionError;
+  StackTrace? _connectionStackTrace;
 
   LspSocketConfig({
     required super.workspacePath,
@@ -37,24 +40,59 @@ class LspSocketConfig extends LspConfig {
     super.workspaceConfiguration,
     super.disableWarning,
     super.disableError,
-  }) : _channel = WebSocketChannel.connect(Uri.parse(serverUrl));
+  }) : _channel = WebSocketChannel.connect(Uri.parse(serverUrl)) {
+    // web_socket_channel exposes connection failures through both `ready` and
+    // the stream. Observe `ready` even when a caller never reaches connect()
+    // so a refused endpoint cannot become an unhandled Future error.
+    unawaited(_observeReady());
+  }
+
+  Future<void> _observeReady() async {
+    try {
+      await _channel.ready;
+    } catch (error, stackTrace) {
+      _connectionError = error;
+      _connectionStackTrace = stackTrace;
+      _failPendingRequests(error, stackTrace);
+    }
+  }
 
   /// This method is used to initialize the LSP server. and it's used internally by the [CodeCrafter] widget.
   /// Calling it directly is not recommended and may crash the LSP server if called multiple times.
   Future<void> connect() async {
-    _channel.stream.listen(
-      (data) {
-        try {
-          final json = jsonDecode(data as String);
-          if (json is! Map) throw const FormatException('Expected JSON object');
-          _handleResponse(Map<String, dynamic>.from(json));
-        } catch (error, stackTrace) {
-          _failPendingRequests(error, stackTrace);
-        }
-      },
-      onError: _failPendingRequests,
-      onDone: () => _failPendingRequests(StateError('LSP socket closed')),
-    );
+    if (!_streamListening) {
+      _streamListening = true;
+      _channel.stream.listen(
+        (data) {
+          try {
+            final json = jsonDecode(data as String);
+            if (json is! Map) {
+              throw const FormatException('Expected JSON object');
+            }
+            _handleResponse(Map<String, dynamic>.from(json));
+          } catch (error, stackTrace) {
+            _failPendingRequests(error, stackTrace);
+          }
+        },
+        onError: _failPendingRequests,
+        onDone: () => _failPendingRequests(StateError('LSP socket closed')),
+      );
+    }
+    try {
+      await _channel.ready;
+    } catch (error, stackTrace) {
+      _connectionError = error;
+      _connectionStackTrace = stackTrace;
+      _failPendingRequests(error, stackTrace);
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+    final error = _connectionError;
+    if (error != null) {
+      Error.throwWithStackTrace(
+        error,
+        _connectionStackTrace ?? StackTrace.current,
+      );
+    }
   }
 
   @override
