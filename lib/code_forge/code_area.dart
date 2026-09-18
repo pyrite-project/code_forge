@@ -573,7 +573,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         widget.scrollbarDecoration ??
         ScrollbarDecoration(
           thumbColor: _editorTheme['root']?.color?.withAlpha(150),
-          thickness: 15,
+          thickness: 8,
           lineNumberStyle: TextStyle(
             color: _editorTheme['root']?.backgroundColor ?? Colors.black,
             fontSize: widget.textStyle?.fontSize ?? 14,
@@ -1876,16 +1876,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       builder: (_, constraints) {
         return Column(
           children: [
-            if (widget.finderBuilder != null)
-              ListenableBuilder(
-                listenable: _findController,
-                builder: (context, _) {
-                  if (!_findController.isActive) {
-                    return const SizedBox.shrink();
-                  }
-                  return widget.finderBuilder!(context, _findController);
-                },
-              ),
             Expanded(
               child: LayoutBuilder(
                 builder: (_, popupConstraints) {
@@ -3289,6 +3279,35 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           ),
                         ),
                       ),
+                      if (widget.finderBuilder != null)
+                        ListenableBuilder(
+                          listenable: _findController,
+                          builder: (context, _) {
+                            if (!_findController.isActive) {
+                              return const SizedBox.shrink();
+                            }
+                            // VSCode-style floating finder anchored to the
+                            // top-right corner of the editor viewport. It
+                            // overlays the code instead of pushing it down.
+                            return Positioned(
+                              top: 8,
+                              left: 12,
+                              right: 12,
+                              child: Align(
+                                alignment: Alignment.topRight,
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 480,
+                                  ),
+                                  child: widget.finderBuilder!(
+                                    context,
+                                    _findController,
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                       _buildContextMenu(),
                       ValueListenableBuilder(
                         valueListenable: _offsetNotifier,
