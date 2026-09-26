@@ -149,6 +149,17 @@ class _CodeForgeContextMenuLayoutDelegate extends SingleChildLayoutDelegate {
 /// )
 /// ```
 class CodeForge extends StatefulWidget {
+  /// Default border radius for fenced Markdown code blocks in LSP popups.
+  static const BorderRadius defaultMarkdownCodeBlockBorderRadius =
+      _overlayInnerBorderRadius;
+
+  /// Default outer border radius for LSP hover and documentation popups.
+  ///
+  /// The extra 8 pixels account for the popup padding around the default code
+  /// block, keeping the two rounded surfaces concentric.
+  static const BorderRadius defaultHoverDetailsBorderRadius =
+      _overlayOuterBorderRadius;
+
   /// The controller for managing the editor's text content and selection.
   ///
   /// If not provided, an internal controller will be created.
@@ -426,7 +437,7 @@ class CodeForge extends StatefulWidget {
     this.ghostTextStyle,
     this.suggestionStyle,
     this.hoverDetailsStyle,
-    this.markdownCodeBlockBorderRadius = _overlayInnerBorderRadius,
+    this.markdownCodeBlockBorderRadius = defaultMarkdownCodeBlockBorderRadius,
     this.matchHighlightStyle,
     this.extraLanguages = const [],
     this.finderBuilder,
@@ -655,7 +666,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         widget.hoverDetailsStyle ??
         HoverDetailsStyle(
           shape: RoundedRectangleBorder(
-            borderRadius: _overlayOuterBorderRadius,
+            borderRadius: CodeForge.defaultHoverDetailsBorderRadius,
             side: BorderSide(
               color: _editorTheme['root']!.color ?? Colors.grey[400]!,
               width: 0.2,
@@ -1574,8 +1585,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     final localSelectionHandleBounds = _isMobile
         ? renderObject?.selectionHandleBounds
         : null;
-    final globalSelectionHandleBounds = localSelectionHandleBounds == null ||
-            renderObject == null
+    final globalSelectionHandleBounds =
+        localSelectionHandleBounds == null || renderObject == null
         ? null
         : Rect.fromPoints(
             renderObject.localToGlobal(localSelectionHandleBounds.topLeft),
@@ -3622,12 +3633,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                   CodeForgeRootOverlayGeometry.maybeOf(
                                     context,
                                   )?.overlayBoundsInTarget ??
-                                  Rect.fromLTWH(
-                                    0,
-                                    0,
-                                    screenWidth,
-                                    popupHeight,
-                                  );
+                                  Rect.fromLTWH(0, 0, screenWidth, popupHeight);
                               final viewportWidth = overlayBounds.width;
                               final desiredWidth = viewportWidth < 700
                                   ? viewportWidth * 0.63
@@ -4233,12 +4239,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                               CodeForgeRootOverlayGeometry.maybeOf(
                                 context,
                               )?.overlayBoundsInTarget ??
-                              Rect.fromLTWH(
-                                0,
-                                0,
-                                screenWidth,
-                                popupHeight,
-                              );
+                              Rect.fromLTWH(0, 0, screenWidth, popupHeight);
                           final viewportWidth = overlayBounds.width;
                           final desiredWidth = _isMobile
                               ? viewportWidth * 0.63
@@ -4254,8 +4255,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
                           double adjustedLeft = position.dx;
                           final minimumLeft = overlayBounds.left + 10;
-                          final maximumLeft =
-                              overlayBounds.right - width - 10;
+                          final maximumLeft = overlayBounds.right - width - 10;
                           adjustedLeft = maximumLeft < minimumLeft
                               ? minimumLeft
                               : adjustedLeft
@@ -7590,12 +7590,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final paragraphWidth = lineWrap
         ? _wrapWidth
         : (isRTL ? contentWidth : null);
-    final para = _paragraphCache[lineIndex] ??
-        _buildHighlightedParagraph(
-          lineIndex,
-          lineText,
-          width: paragraphWidth,
-        );
+    final para =
+        _paragraphCache[lineIndex] ??
+        _buildHighlightedParagraph(lineIndex, lineText, width: paragraphWidth);
     final lineY = _getLineYOffset(lineIndex, _hasActiveFolds);
     final visualYOffset = _getTotalVirtualOffset(lineIndex);
     final localY = contentPosition.dy - lineY - visualYOffset;
@@ -12324,11 +12321,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
         _dtap.onDoubleTap = () {
           _selectWordAtOffset(textOffset);
-          _showContextMenu(
-            localPosition,
-            textOffset,
-            anchorToSelection: true,
-          );
+          _showContextMenu(localPosition, textOffset, anchorToSelection: true);
         };
 
         _onetap.onTap = () {
@@ -12515,7 +12508,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         }
 
         if (_reopenSelectionMenuGesture) {
-          if ((localPosition - (_pointerDownPosition ?? localPosition)).distance >
+          if ((localPosition - (_pointerDownPosition ?? localPosition))
+                  .distance >
               10) {
             _reopenSelectionMenuMoved = true;
           }
@@ -12566,11 +12560,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         _reopenSelectionMenuMoved = false;
         markNeedsPaint();
         if (reopenMenu) {
-          _showContextMenu(
-            localPosition,
-            textOffset,
-            anchorToSelection: true,
-          );
+          _showContextMenu(localPosition, textOffset, anchorToSelection: true);
         }
         return;
       }
@@ -12619,11 +12609,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
 
       if (shouldShowSelectionMenu) {
-        _showContextMenu(
-          localPosition,
-          textOffset,
-          anchorToSelection: true,
-        );
+        _showContextMenu(localPosition, textOffset, anchorToSelection: true);
       }
 
       _longPressSelection = false;
