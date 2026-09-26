@@ -87,9 +87,19 @@ class _CodeForgeRootOverlayPortalState
           child: Transform(
             transform: layoutInfo.childPaintTransform,
             alignment: Alignment.topLeft,
+            // The overlay child is laid out in the *target's* coordinate space,
+            // so its box has to be the target's size — here the editor
+            // viewport handed in as [CodeForgeRootOverlayPortal.targetSize].
+            //
+            // Using `layoutInfo.childSize` instead sized this box to the whole
+            // root overlay. That is invisible to `Positioned(top: ..)` (which
+            // measures from the top of the box) but shifts every popup anchored
+            // with `Positioned(bottom: ..)` down by the difference: the hover
+            // popup is anchored with `bottom`, so it landed hundreds of pixels
+            // below the word whenever it flipped above the cursor.
             child: SizedBox(
-              width: layoutInfo.childSize.width,
-              height: layoutInfo.childSize.height,
+              width: widget.targetSize.width,
+              height: widget.targetSize.height,
               child: _OverflowHitTestStack(children: [widget.overlayChild]),
             ),
           ),

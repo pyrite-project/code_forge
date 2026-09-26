@@ -22,6 +22,12 @@ import './syntax_highlighter.dart';
 const int kSemanticTokenViewportPaddingLines = 1500;
 const int kExactWrappedHeightThreshold = 512;
 const int kWrappedHeightSampleSize = 64;
+
+/// Gap kept between the hovered line and the LSP hover popup.
+///
+/// Deliberately smaller than `popupBottomGap`: the hover popup is anchored to
+/// the line being documented, so a wide gap reads as a detached popup.
+const double kHoverAnchorGap = 6.0;
 const double _overlayInnerRadius = 8.0;
 const double _overlayPadding = 8.0;
 const double _overlayOuterRadius = _overlayInnerRadius + _overlayPadding;
@@ -4265,9 +4271,9 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           final spaceBelow =
                               overlayBounds.bottom -
                               position.dy -
-                              popupBottomGap;
+                              kHoverAnchorGap;
                           final spaceAbove =
-                              position.dy - overlayBounds.top - 10;
+                              position.dy - overlayBounds.top - kHoverAnchorGap;
                           final shouldPositionAbove =
                               maxHeight > spaceBelow &&
                               spaceAbove >= spaceBelow;
@@ -4279,134 +4285,112 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                             ),
                           );
 
-                          double? adjustedTop;
-                          double? adjustedBottom;
+                          // Position the popup from the anchor directly instead
+                          // of going through `Positioned(bottom: ..)`.
+                          //
+                          // `Positioned(bottom: ..)` measures from the bottom of
+                          // whatever box it is placed in, so the popup is only
+                          // anchored correctly while that box is exactly the
+                          // editor viewport. The hover popup is hosted in the
+                          // root overlay, where that box can be taller than the
+                          // editor, and every such pixel lands on the popup's
+                          // position - which pushed it hundreds of pixels below
+                          // the word whenever it flipped above the cursor.
+                          //
+                          // [CustomSingleChildLayout] hands us the child's real
+                          // laid-out height, so the offset only depends on the
+                          // anchor and the gap.
+                          return Positioned.fill(
+                            child: CustomSingleChildLayout(
+                              delegate: _HoverPopupLayoutDelegate(
+                                anchorY: position.dy,
+                                gap: kHoverAnchorGap,
+                                positionAbove: shouldPositionAbove,
+                                left: adjustedLeft,
+                              ),
+                              child: MouseRegion(
+                                onEnter: (_) => _isHoveringPopup.value = true,
+                                onExit: (_) => _isHoveringPopup.value = false,
+                                child: ValueListenableBuilder<Map<String, dynamic>?>(
+                                  valueListenable: _hoverContentNotifier,
+                                  builder: (_, data, _) {
+                                    if (data == null) {
+                                      return ConstrainedBox(
+                                        constraints: BoxConstraints(
+                                          maxWidth: width,
+                                          maxHeight: availableHeight,
+                                        ),
+                                        child: Card(
+                                          color: _hoverDetailsStyle
+                                              .backgroundColor,
+                                          shape: _hoverDetailsStyle.shape,
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(
+                                              _overlayPadding,
+                                            ),
+                                            child: Text(
+                                              "Loading...",
+                                              style:
+                                                  _hoverDetailsStyle.textStyle,
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    }
 
-                          if (shouldPositionAbove) {
-                            adjustedBottom = popupHeight - position.dy + 10;
-                          } else {
-                            adjustedTop = position.dy;
-                          }
+                                    final diagnosticMessage =
+                                        data['diagnostic'] ?? '';
+                                    final severity = data['severity'] ?? 0;
+                                    final hoverMessage = data['hover'] ?? '';
 
-                          return Positioned(
-                            top: adjustedTop,
-                            bottom: adjustedBottom,
-                            left: adjustedLeft,
-                            width: width,
-                            child: MouseRegion(
-                              onEnter: (_) => _isHoveringPopup.value = true,
-                              onExit: (_) => _isHoveringPopup.value = false,
-                              child: ValueListenableBuilder<Map<String, dynamic>?>(
-                                valueListenable: _hoverContentNotifier,
-                                builder: (_, data, _) {
-                                  if (data == null) {
+                                    if (diagnosticMessage.isEmpty &&
+                                        hoverMessage.isEmpty) {
+                                      return SizedBox.shrink();
+                                    }
+
+                                    IconData diagnosticIcon;
+                                    Color diagnosticColor;
+
+                                    switch (severity) {
+                                      case 1:
+                                        diagnosticIcon = Icons.error_outline;
+                                        diagnosticColor = Colors.red;
+                                        break;
+                                      case 2:
+                                        diagnosticIcon =
+                                            Icons.warning_amber_outlined;
+                                        diagnosticColor = Colors.orange;
+                                        break;
+                                      case 3:
+                                        diagnosticIcon = Icons.info_outline;
+                                        diagnosticColor = Colors.blue;
+                                        break;
+                                      case 4:
+                                        diagnosticIcon =
+                                            Icons.lightbulb_outline;
+                                        diagnosticColor = Colors.grey;
+                                        break;
+                                      default:
+                                        diagnosticIcon = Icons.info_outline;
+                                        diagnosticColor = Colors.grey;
+                                    }
+
+                                    final hoverScrollController =
+                                        ScrollController();
+
                                     return ConstrainedBox(
                                       constraints: BoxConstraints(
                                         maxWidth: width,
                                         maxHeight: availableHeight,
                                       ),
-                                      child: Card(
-                                        color:
-                                            _hoverDetailsStyle.backgroundColor,
-                                        shape: _hoverDetailsStyle.shape,
-                                        child: Padding(
-                                          padding: const EdgeInsets.all(
-                                            _overlayPadding,
-                                          ),
-                                          child: Text(
-                                            "Loading...",
-                                            style: _hoverDetailsStyle.textStyle,
-                                          ),
-                                        ),
-                                      ),
-                                    );
-                                  }
-
-                                  final diagnosticMessage =
-                                      data['diagnostic'] ?? '';
-                                  final severity = data['severity'] ?? 0;
-                                  final hoverMessage = data['hover'] ?? '';
-
-                                  if (diagnosticMessage.isEmpty &&
-                                      hoverMessage.isEmpty) {
-                                    return SizedBox.shrink();
-                                  }
-
-                                  IconData diagnosticIcon;
-                                  Color diagnosticColor;
-
-                                  switch (severity) {
-                                    case 1:
-                                      diagnosticIcon = Icons.error_outline;
-                                      diagnosticColor = Colors.red;
-                                      break;
-                                    case 2:
-                                      diagnosticIcon =
-                                          Icons.warning_amber_outlined;
-                                      diagnosticColor = Colors.orange;
-                                      break;
-                                    case 3:
-                                      diagnosticIcon = Icons.info_outline;
-                                      diagnosticColor = Colors.blue;
-                                      break;
-                                    case 4:
-                                      diagnosticIcon = Icons.lightbulb_outline;
-                                      diagnosticColor = Colors.grey;
-                                      break;
-                                    default:
-                                      diagnosticIcon = Icons.info_outline;
-                                      diagnosticColor = Colors.grey;
-                                  }
-
-                                  final hoverScrollController =
-                                      ScrollController();
-
-                                  return ConstrainedBox(
-                                    constraints: BoxConstraints(
-                                      maxWidth: width,
-                                      maxHeight: availableHeight,
-                                    ),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        if (diagnosticMessage.isNotEmpty)
-                                          Card(
-                                            surfaceTintColor: diagnosticColor,
-                                            color: _hoverDetailsStyle
-                                                .backgroundColor,
-                                            shape: _hoverDetailsStyle.shape,
-                                            child: Padding(
-                                              padding: const EdgeInsets.all(
-                                                _overlayPadding,
-                                              ),
-                                              child: Row(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.center,
-                                                children: [
-                                                  Icon(
-                                                    diagnosticIcon,
-                                                    color: diagnosticColor,
-                                                    size: 16,
-                                                  ),
-                                                  const SizedBox(width: 8),
-                                                  Expanded(
-                                                    child: Text(
-                                                      diagnosticMessage,
-                                                      softWrap: true,
-                                                      style: _hoverDetailsStyle
-                                                          .textStyle,
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-
-                                        if (hoverMessage.isNotEmpty)
-                                          Flexible(
-                                            child: Card(
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          if (diagnosticMessage.isNotEmpty)
+                                            Card(
+                                              surfaceTintColor: diagnosticColor,
                                               color: _hoverDetailsStyle
                                                   .backgroundColor,
                                               shape: _hoverDetailsStyle.shape,
@@ -4414,130 +4398,163 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                 padding: const EdgeInsets.all(
                                                   _overlayPadding,
                                                 ),
-                                                child: RawScrollbar(
-                                                  controller:
-                                                      hoverScrollController,
-                                                  thumbVisibility: true,
-                                                  thumbColor:
-                                                      _editorTheme['root']!
-                                                          .color!
-                                                          .withAlpha(100),
-                                                  child: SingleChildScrollView(
+                                                child: Row(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.center,
+                                                  children: [
+                                                    Icon(
+                                                      diagnosticIcon,
+                                                      color: diagnosticColor,
+                                                      size: 16,
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Expanded(
+                                                      child: Text(
+                                                        diagnosticMessage,
+                                                        softWrap: true,
+                                                        style:
+                                                            _hoverDetailsStyle
+                                                                .textStyle,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+
+                                          if (hoverMessage.isNotEmpty)
+                                            Flexible(
+                                              child: Card(
+                                                color: _hoverDetailsStyle
+                                                    .backgroundColor,
+                                                shape: _hoverDetailsStyle.shape,
+                                                child: Padding(
+                                                  padding: const EdgeInsets.all(
+                                                    _overlayPadding,
+                                                  ),
+                                                  child: RawScrollbar(
                                                     controller:
                                                         hoverScrollController,
-                                                    child: MarkdownBlock(
-                                                      data: hoverMessage,
-                                                      selectable: false,
-                                                      generator: MarkdownGenerator(
-                                                        linesMargin:
-                                                            EdgeInsets.only(
-                                                              top: 1,
+                                                    thumbVisibility: true,
+                                                    thumbColor:
+                                                        _editorTheme['root']!
+                                                            .color!
+                                                            .withAlpha(100),
+                                                    child: SingleChildScrollView(
+                                                      controller:
+                                                          hoverScrollController,
+                                                      child: MarkdownBlock(
+                                                        data: hoverMessage,
+                                                        selectable: false,
+                                                        generator: MarkdownGenerator(
+                                                          linesMargin:
+                                                              EdgeInsets.only(
+                                                                top: 1,
+                                                              ),
+                                                          generators: [
+                                                            SpanNodeGeneratorWithTag(
+                                                              tag: MarkdownTag
+                                                                  .hr
+                                                                  .name,
+                                                              generator: (_, _, _) =>
+                                                                  _HoverDividerNode(
+                                                                    Theme.of(
+                                                                          context,
+                                                                        )
+                                                                        .colorScheme
+                                                                        .outline,
+                                                                  ),
                                                             ),
-                                                        generators: [
-                                                          SpanNodeGeneratorWithTag(
-                                                            tag: MarkdownTag
-                                                                .hr
-                                                                .name,
-                                                            generator: (_, _, _) =>
-                                                                _HoverDividerNode(
-                                                                  Theme.of(
-                                                                        context,
-                                                                      )
-                                                                      .colorScheme
-                                                                      .outline,
-                                                                ),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                      config: MarkdownConfig.darkConfig.copy(
-                                                        configs: [
-                                                          PConfig(
-                                                            textStyle:
-                                                                _hoverDetailsStyle
-                                                                    .textStyle,
-                                                          ),
-                                                          CodeConfig(
-                                                            style: TextStyle(
-                                                              fontFamily:
+                                                          ],
+                                                        ),
+                                                        config: MarkdownConfig.darkConfig.copy(
+                                                          configs: [
+                                                            PConfig(
+                                                              textStyle:
                                                                   _hoverDetailsStyle
-                                                                      .textStyle
-                                                                      .fontFamily ??
-                                                                  'monospace',
+                                                                      .textStyle,
                                                             ),
-                                                          ),
-                                                          PreConfig(
-                                                            language:
-                                                                _controller
-                                                                    .lspConfig
-                                                                    ?.languageId
-                                                                    .toLowerCase() ??
-                                                                'dart',
-                                                            builder: (code, language) => Container(
-                                                              width: double
-                                                                  .infinity,
-                                                              padding:
-                                                                  const EdgeInsets.all(
-                                                                    16,
-                                                                  ),
-                                                              decoration: BoxDecoration(
-                                                                color: _editorTheme['root']!
-                                                                    .backgroundColor!,
-                                                                borderRadius: widget
-                                                                    .markdownCodeBlockBorderRadius,
-                                                                border: Border.all(
-                                                                  width: 0.2,
-                                                                  color:
-                                                                      _editorTheme['root']!
-                                                                          .color ??
-                                                                      Colors
-                                                                          .grey,
-                                                                ),
-                                                              ),
-                                                              child: Text.rich(
-                                                                TextSpan(
-                                                                  children: highLightSpans(
-                                                                    code,
-                                                                    language:
-                                                                        language,
-                                                                    theme:
-                                                                        _editorTheme,
-                                                                    textStyle: TextStyle(
-                                                                      fontSize: _hoverDetailsStyle
-                                                                          .textStyle
-                                                                          .fontSize,
-                                                                      fontFamily:
-                                                                          _hoverDetailsStyle
-                                                                              .textStyle
-                                                                              .fontFamily ??
-                                                                          'monospace',
-                                                                    ),
-                                                                    styleNotMatched: TextStyle(
-                                                                      color: _editorTheme['root']!
-                                                                          .color,
-                                                                      fontFamily:
-                                                                          _hoverDetailsStyle
-                                                                              .textStyle
-                                                                              .fontFamily ??
-                                                                          'monospace',
-                                                                    ),
-                                                                  ),
-                                                                ),
-                                                                softWrap: true,
+                                                            CodeConfig(
+                                                              style: TextStyle(
+                                                                fontFamily:
+                                                                    _hoverDetailsStyle
+                                                                        .textStyle
+                                                                        .fontFamily ??
+                                                                    'monospace',
                                                               ),
                                                             ),
-                                                          ),
-                                                        ],
+                                                            PreConfig(
+                                                              language:
+                                                                  _controller
+                                                                      .lspConfig
+                                                                      ?.languageId
+                                                                      .toLowerCase() ??
+                                                                  'dart',
+                                                              builder: (code, language) => Container(
+                                                                width: double
+                                                                    .infinity,
+                                                                padding:
+                                                                    const EdgeInsets.all(
+                                                                      16,
+                                                                    ),
+                                                                decoration: BoxDecoration(
+                                                                  color: _editorTheme['root']!
+                                                                      .backgroundColor!,
+                                                                  borderRadius:
+                                                                      widget
+                                                                          .markdownCodeBlockBorderRadius,
+                                                                  border: Border.all(
+                                                                    width: 0.2,
+                                                                    color:
+                                                                        _editorTheme['root']!
+                                                                            .color ??
+                                                                        Colors
+                                                                            .grey,
+                                                                  ),
+                                                                ),
+                                                                child: Text.rich(
+                                                                  TextSpan(
+                                                                    children: highLightSpans(
+                                                                      code,
+                                                                      language:
+                                                                          language,
+                                                                      theme:
+                                                                          _editorTheme,
+                                                                      textStyle: TextStyle(
+                                                                        fontSize: _hoverDetailsStyle
+                                                                            .textStyle
+                                                                            .fontSize,
+                                                                        fontFamily:
+                                                                            _hoverDetailsStyle.textStyle.fontFamily ??
+                                                                            'monospace',
+                                                                      ),
+                                                                      styleNotMatched: TextStyle(
+                                                                        color: _editorTheme['root']!
+                                                                            .color,
+                                                                        fontFamily:
+                                                                            _hoverDetailsStyle.textStyle.fontFamily ??
+                                                                            'monospace',
+                                                                      ),
+                                                                    ),
+                                                                  ),
+                                                                  softWrap:
+                                                                      true,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
                                                       ),
                                                     ),
                                                   ),
                                                 ),
                                               ),
                                             ),
-                                          ),
-                                      ],
-                                    ),
-                                  );
-                                },
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
                               ),
                             ),
                           );
@@ -12751,6 +12768,63 @@ class _BracketEntry {
   final String char;
   final int line;
   _BracketEntry(this.char, this.line);
+}
+
+/// Places the LSP hover popup relative to the anchor line.
+///
+/// The popup is hosted in the root overlay, where the box it is laid out in is
+/// not necessarily the editor viewport, so anchoring it with
+/// `Positioned(bottom: ..)` made its position depend on that box's height.
+/// Deriving the offset from the child's own laid-out height keeps the popup
+/// glued to the anchor no matter how tall the surrounding box is.
+class _HoverPopupLayoutDelegate extends SingleChildLayoutDelegate {
+  const _HoverPopupLayoutDelegate({
+    required this.anchorY,
+    required this.left,
+    required this.gap,
+    required this.positionAbove,
+  });
+
+  /// Anchor line, in the editor viewport's coordinates.
+  final double anchorY;
+
+  /// Horizontal anchor, in the editor viewport's coordinates.
+  final double left;
+
+  /// Gap kept between the anchor line and the popup.
+  final double gap;
+
+  /// Whether the popup is shown above the anchor instead of below it.
+  final bool positionAbove;
+
+  @override
+  BoxConstraints getConstraintsForChild(BoxConstraints constraints) =>
+      constraints.loosen();
+
+  @override
+  Size getSize(BoxConstraints constraints) => constraints.biggest;
+
+  @override
+  Offset getPositionForChild(Size size, Size childSize) => Offset(
+    left,
+    // The offset is derived from the anchor line alone. Deriving it from
+    // `size.height` (the height of whatever box the popup happens to be laid
+    // out in) instead inverts the relationship: the lower the anchor, the
+    // higher the popup.
+    positionAbove
+        // Bottom edge sits `gap` above the anchor line.
+        ? max(0, anchorY - gap - childSize.height)
+        // Top edge sits `gap` below the anchor line. `size.height` is only
+        // used here to keep the popup from being pushed out of the box.
+        : min(max(0, size.height - childSize.height), anchorY + gap),
+  );
+
+  @override
+  bool shouldRelayout(_HoverPopupLayoutDelegate oldDelegate) =>
+      oldDelegate.anchorY != anchorY ||
+      oldDelegate.left != left ||
+      oldDelegate.gap != gap ||
+      oldDelegate.positionAbove != positionAbove;
 }
 
 class _HoverDividerNode extends SpanNode {

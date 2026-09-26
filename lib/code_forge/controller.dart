@@ -2,11 +2,54 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../code_forge.dart';
 import '../src/rust/api/editor.dart';
 import 'rope.dart';
+
+/// A [Listenable] whose notifications never arrive while the framework is
+/// building the tree.
+///
+/// Listeners fire synchronously when no frame is in flight, and are coalesced
+/// onto the end of the current frame otherwise. Post-frame callbacks run before
+/// that frame is presented, so a repaint driven from here still lands in the
+/// frame that triggered it.
+class _FrameSafeNotifier implements Listenable {
+  final List<VoidCallback> _listeners = <VoidCallback>[];
+  bool _scheduled = false;
+
+  void notify() {
+    if (_listeners.isEmpty) return;
+    if (SchedulerBinding.instance.schedulerPhase == SchedulerPhase.idle) {
+      _fire();
+      return;
+    }
+    if (_scheduled) return;
+    _scheduled = true;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      _scheduled = false;
+      _fire();
+    });
+  }
+
+  void _fire() {
+    if (_listeners.isEmpty) return;
+    // Snapshot: a listener is allowed to remove itself while being called.
+    for (final listener in List<VoidCallback>.of(_listeners)) {
+      if (_listeners.contains(listener)) listener();
+    }
+  }
+
+  @override
+  void addListener(VoidCallback listener) => _listeners.add(listener);
+
+  @override
+  void removeListener(VoidCallback listener) => _listeners.remove(listener);
+
+  void clear() => _listeners.clear();
+}
 
 /// Controller for the [CodeForge] code editor widget.
 ///
@@ -42,6 +85,7 @@ class CodeForgeController implements DeltaTextInputClient {
   static const Duration _lspDocumentSyncDebounce = Duration(milliseconds: 200);
   final _isMobile = Platform.isAndroid || Platform.isIOS;
   final List<VoidCallback> _listeners = [];
+  final _FrameSafeNotifier _displayChanges = _FrameSafeNotifier();
   final List<LineDecoration> _lineDecorations = [];
   final List<GutterDecoration> _gutterDecorations = [];
   final List<({int line, int character})> _multiCursors = [];
@@ -191,7 +235,7 @@ class CodeForgeController implements DeltaTextInputClient {
                   );
                 }
               }
-              if (!_isDisposed) diagnosticsNotifier.value = errors;
+              if (!_isDisposed) _setDiagnostics(errors);
 
               _codeActionTimer?.cancel();
               _codeActionTimer = Timer(
@@ -238,7 +282,7 @@ class CodeForgeController implements DeltaTextInputClient {
               );
             } else {
               if (!_isDisposed && requestId == _codeActionRequestId) {
-                diagnosticsNotifier.value = [];
+                _setDiagnostics([]);
                 codeActionsNotifier.value = null;
               }
             }
@@ -575,6 +619,41 @@ class CodeForgeController implements DeltaTextInputClient {
   /// ```
   final ValueNotifier<List<LspErrors>> diagnosticsNotifier = ValueNotifier([]);
 
+  /// Fires when the values the editor *displays* change: the caret or the
+  /// selection, or the diagnostic list.
+  ///
+  /// This exists for consumers that live **outside** the editor's subtree and
+  /// therefore cannot act during the build phase — a status bar reading the
+  /// caret position, say. It is deliberately separate from
+  /// [notifyListeners], which the render path drives (`markNeedsPaint` and
+  /// friends) and whose synchronous timing must not change.
+  ///
+  /// It has to be a separate, frame-aware signal because this controller
+  /// notifies from inside the editor's own lifecycle: `openedFile=` clears
+  /// [diagnosticsNotifier] from `_CodeForgeState.initState`, and bracket
+  /// highlighting, fold recomputation and the buffer flush a caret move
+  /// triggers all run during the editor's build. A consumer attached to this
+  /// controller directly — or to [diagnosticsNotifier] — is therefore invoked
+  /// while the tree is building, which is exactly when calling `setState` or
+  /// writing a provider is rejected.
+  ///
+  /// Delivery is immediate when no frame is in flight, and otherwise deferred
+  /// to the end of the current frame. Deferring is free visually: post-frame
+  /// callbacks run before that frame is presented.
+  Listenable get displayChanges => _displayChanges;
+
+  /// Publishes a new diagnostic list through [diagnosticsNotifier] and signals
+  /// [displayChanges].
+  ///
+  /// The signal has to be raised here too, because some diagnostics writes
+  /// happen without a [notifyListeners] call — notably [openedFile], which
+  /// clears the list from `initState`.
+  void _setDiagnostics(List<LspErrors> errors) {
+    if (identical(diagnosticsNotifier.value, errors)) return;
+    diagnosticsNotifier.value = errors;
+    _displayChanges.notify();
+  }
+
   /// A [ValueNotifier] that returns LSP code actions if available.
   final ValueNotifier<List<dynamic>?> codeActionsNotifier = ValueNotifier(null);
 
@@ -601,7 +680,7 @@ class CodeForgeController implements DeltaTextInputClient {
     final previousFile = _openedFile;
     if (previousFile != file) {
       _codeActionRequestId++;
-      diagnosticsNotifier.value = [];
+      _setDiagnostics([]);
       codeActionsNotifier.value = null;
     }
     _openedFile = file;
@@ -2483,6 +2562,10 @@ class CodeForgeController implements DeltaTextInputClient {
     for (final listener in _listeners) {
       listener();
     }
+    // One extra line, after the loop: the render path above keeps its existing
+    // synchronous timing, while consumers outside the editor's subtree get a
+    // signal that is safe to act on. See [displayChanges].
+    _displayChanges.notify();
   }
 
   /// Moves the current line up by one line.
@@ -4618,6 +4701,7 @@ class CodeForgeController implements DeltaTextInputClient {
     _documentHighlightTimer?.cancel();
     _lspResponsesSubscription?.cancel();
     _listeners.clear();
+    _displayChanges.clear();
     connection?.close();
   }
 
