@@ -1042,6 +1042,29 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     return 'str|${item.toString()}';
   }
 
+  void _onCodeActionPopupOpened() {
+    if (!mounted) return;
+    setState(() {
+      _actionSelIndex = 0;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scrollToSelectedAction();
+    });
+  }
+
+  /// Closes the code action popup without discarding the fetched actions, so
+  /// the gutter lightbulbs stay visible.
+  void _closeCodeActionPopup() {
+    _lspActionOffsetNotifier.value = null;
+  }
+
+  /// Closes the popup and drops the cached actions. Used after an action has
+  /// been applied, because the returned edits no longer match the document.
+  void _dismissCodeActions() {
+    _lspActionNotifier.value = null;
+    _lspActionOffsetNotifier.value = null;
+  }
+
   Future<void> _fetchCodeActionsForCurrentPosition() async {
     if (_controller.lspConfig == null) return;
     final sel = _controller.selection;
@@ -2779,22 +2802,12 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                         .value![_actionSelIndex],
                                                                   );
                                                             })();
-                                                            _lspActionNotifier
-                                                                    .value =
-                                                                null;
-                                                            _lspActionOffsetNotifier
-                                                                    .value =
-                                                                null;
+                                                            _dismissCodeActions();
                                                             return KeyEventResult
                                                                 .handled;
                                                           case LogicalKeyboardKey
                                                               .escape:
-                                                            _lspActionNotifier
-                                                                    .value =
-                                                                null;
-                                                            _lspActionOffsetNotifier
-                                                                    .value =
-                                                                null;
+                                                            _closeCodeActionPopup();
                                                             return KeyEventResult
                                                                 .handled;
                                                           default:
@@ -3271,6 +3284,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                         _lspActionNotifier,
                                                     lspActionOffsetNotifier:
                                                         _lspActionOffsetNotifier,
+                                                    onCodeActionPopupOpened:
+                                                        _onCodeActionPopupOpened,
                                                     signatureNotifier:
                                                         _lspSignatureNotifier,
                                                     filePath: _filePath,
@@ -3371,25 +3386,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 ),
                               );
 
-                              double? adjustedTop;
-                              double? adjustedBottom;
-
-                              if (shouldPositionAbove) {
-                                adjustedBottom = popupHeight - offset.dy + 10;
-                              } else {
-                                adjustedTop = offset.dy + fontSize + 10;
-                              }
-
-                              return Positioned(
-                                width: desiredWidth,
-                                top: adjustedTop,
-                                bottom: adjustedBottom,
-                                left: adjustedLeft,
-                                child: ConstrainedBox(
-                                  constraints: BoxConstraints(
+                              return Positioned.fill(
+                                child: CustomSingleChildLayout(
+                                  delegate: _AnchoredPopupLayoutDelegate(
+                                    anchorY: offset.dy,
+                                    left: adjustedLeft,
+                                    positionAbove: shouldPositionAbove,
+                                    // Below the caret the popup has to clear
+                                    // the caret's own line.
+                                    gapBelow: fontSize + 10,
+                                    gapAbove: 10,
                                     maxWidth: desiredWidth,
-                                    maxHeight: availableHeight,
                                     minWidth: 70,
+                                    maxHeight: availableHeight,
                                   ),
                                   child: Card(
                                     color: _hoverDetailsStyle.backgroundColor,
@@ -3683,31 +3692,26 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 ),
                               );
 
-                              double? adjustedTop;
-                              double? adjustedBottom;
-
-                              if (shouldPositionAbove) {
-                                adjustedBottom = popupHeight - offset.dy + 10;
-                              } else {
-                                adjustedTop = offset.dy + fontSize + 10;
-                              }
-
                               return ValueListenableBuilder(
                                 valueListenable:
                                     _controller.selectedSuggestionNotifier,
                                 builder: (context, selected, child) {
                                   return Stack(
                                     children: [
-                                      Positioned(
-                                        width: suggestionWidth,
-                                        top: adjustedTop,
-                                        bottom: adjustedBottom,
-                                        left: adjustedLeft,
-                                        child: ConstrainedBox(
-                                          constraints: BoxConstraints(
-                                            maxHeight: availableHeight,
+                                      Positioned.fill(
+                                        child: CustomSingleChildLayout(
+                                          delegate: _AnchoredPopupLayoutDelegate(
+                                            anchorY: offset.dy,
+                                            left: adjustedLeft,
+                                            positionAbove: shouldPositionAbove,
+                                            // Below the caret the popup has to
+                                            // clear the caret's own line
+                                            // before it reads as attached.
+                                            gapBelow: fontSize + 10,
+                                            gapAbove: 10,
                                             maxWidth: suggestionWidth,
                                             minWidth: 70,
+                                            maxHeight: availableHeight,
                                           ),
                                           child: Card(
                                             shape: _suggestionStyle.shape,
@@ -4086,60 +4090,74 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                           _lspSignatureNotifier.value == null)
                                         Builder(
                                           builder: (_) {
+                                            // The documentation sits beside the
+                                            // completion list, so it is
+                                            // anchored to the list's own top
+                                            // edge rather than to the caret,
+                                            // and it is laid out with the same
+                                            // anchored delegate. A `top:` here
+                                            // would be measured against the
+                                            // whole overlay box, which is what
+                                            // used to throw this popup off the
+                                            // editor.
                                             final documentationTop =
-                                                offset.dy +
-                                                (widget.textStyle?.fontSize ??
-                                                    14) +
-                                                10 +
-                                                (viewportWidth < 700
-                                                    ? (offset.dy <
-                                                                  (viewportWidth /
-                                                                      2) &&
-                                                              400 < popupHeight)
-                                                          ? (((widget.textStyle?.fontSize ??
-                                                                            14) +
-                                                                        6.5) *
-                                                                    (_suggestionNotifier
-                                                                            .value
-                                                                            ?.length ??
-                                                                        0))
-                                                                .clamp(0, 400)
-                                                          : -100
-                                                    : 0);
-                                            return Positioned(
-                                              width: viewportWidth < 700
-                                                  ? viewportWidth * 0.63
-                                                  : null,
-                                              top: documentationTop,
-                                              left: viewportWidth < 700
-                                                  ? adjustedLeft
-                                                  : ((adjustedLeft +
-                                                                suggestionWidth +
-                                                                420) >
-                                                            overlayBounds.right
-                                                        ? max(
-                                                            overlayBounds.left +
-                                                                10,
-                                                            adjustedLeft -
-                                                                420 -
-                                                                10,
-                                                          )
-                                                        : adjustedLeft +
-                                                              suggestionWidth),
-                                              child: ConstrainedBox(
-                                                constraints: BoxConstraints(
-                                                  maxWidth: 420,
-                                                  maxHeight: min(
-                                                    400.0,
-                                                    max(
-                                                      0.0,
-                                                      overlayBounds.bottom -
-                                                          documentationTop -
-                                                          popupBottomGap,
+                                                offset.dy + fontSize + 10;
+                                            final documentationGapBelow =
+                                                viewportWidth < 700
+                                                ? (offset.dy <
+                                                              (viewportWidth /
+                                                                  2) &&
+                                                          400 < popupHeight)
+                                                      ? ((fontSize + 6.5) *
+                                                                (_suggestionNotifier
+                                                                        .value
+                                                                        ?.length ??
+                                                                    0))
+                                                            .clamp(0, 400)
+                                                      : -100
+                                                : 0;
+                                            final documentationLeft =
+                                                viewportWidth < 700
+                                                ? adjustedLeft
+                                                : ((adjustedLeft +
+                                                              suggestionWidth +
+                                                              420) >
+                                                          overlayBounds.right
+                                                      ? max(
+                                                          overlayBounds.left +
+                                                              10,
+                                                          adjustedLeft -
+                                                              420 -
+                                                              10,
+                                                        )
+                                                      : adjustedLeft +
+                                                            suggestionWidth);
+                                            return Positioned.fill(
+                                              child: CustomSingleChildLayout(
+                                                delegate:
+                                                    _AnchoredPopupLayoutDelegate(
+                                                      anchorY: documentationTop,
+                                                      left: documentationLeft,
+                                                      positionAbove: false,
+                                                      gapBelow:
+                                                          documentationGapBelow
+                                                              .toDouble(),
+                                                      maxWidth:
+                                                          viewportWidth < 700
+                                                          ? viewportWidth * 0.63
+                                                          : 420,
+                                                      minWidth: 70,
+                                                      maxHeight: min(
+                                                        400.0,
+                                                        max(
+                                                          0.0,
+                                                          overlayBounds.bottom -
+                                                              documentationTop -
+                                                              documentationGapBelow -
+                                                              popupBottomGap,
+                                                        ),
+                                                      ),
                                                     ),
-                                                  ),
-                                                  minWidth: 70,
-                                                ),
                                                 child: Card(
                                                   color: _hoverDetailsStyle
                                                       .backgroundColor,
@@ -4302,11 +4320,13 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           // anchor and the gap.
                           return Positioned.fill(
                             child: CustomSingleChildLayout(
-                              delegate: _HoverPopupLayoutDelegate(
+                              delegate: _AnchoredPopupLayoutDelegate(
                                 anchorY: position.dy,
-                                gap: kHoverAnchorGap,
+                                gapAbove: kHoverAnchorGap,
+                                gapBelow: kHoverAnchorGap,
                                 positionAbove: shouldPositionAbove,
                                 left: adjustedLeft,
+                                maxHeight: availableHeight,
                               ),
                               child: MouseRegion(
                                 onEnter: (_) => _isHoveringPopup.value = true,
@@ -4649,8 +4669,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                       ValueListenableBuilder(
                         valueListenable: _lspActionOffsetNotifier,
                         builder: (_, offset, child) {
+                          final actions = _lspActionNotifier.value;
                           if (offset == null ||
-                              _lspActionNotifier.value == null ||
+                              actions == null ||
+                              actions.isEmpty ||
                               _controller.lspConfig == null) {
                             return SizedBox.shrink();
                           }
@@ -4663,18 +4685,25 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           final spaceAbove = offset.dy - 10;
                           final showAbove =
                               spaceBelow < 400 && spaceAbove >= spaceBelow;
+                          // Anchored the same way as every other editor popup:
+                          // `Positioned(bottom: ..)` measured from the bottom of
+                          // the box the popup is laid out in, which is not the
+                          // editor viewport once the popup is hosted in the
+                          // root overlay.
+                          final actionWidth = screenWidth < 700
+                              ? screenWidth * 0.63
+                              : screenWidth * 0.3;
 
-                          return Positioned(
-                            width: screenWidth < 700
-                                ? screenWidth * 0.63
-                                : screenWidth * 0.3,
-                            top: showAbove ? null : actionTop,
-                            bottom: showAbove
-                                ? popupHeight - offset.dy + 10
-                                : null,
-                            left: offset.dx,
-                            child: ConstrainedBox(
-                              constraints: BoxConstraints(
+                          return Positioned.fill(
+                            child: CustomSingleChildLayout(
+                              delegate: _AnchoredPopupLayoutDelegate(
+                                anchorY: offset.dy,
+                                left: max(0, offset.dx),
+                                positionAbove: showAbove,
+                                gapBelow: actionTop - offset.dy,
+                                gapAbove: 10,
+                                maxWidth: actionWidth,
+                                minWidth: 70,
                                 maxHeight: max(
                                   0.0,
                                   min(
@@ -4682,8 +4711,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                     showAbove ? spaceAbove : spaceBelow,
                                   ),
                                 ),
-                                maxWidth: 400,
-                                minWidth: 70,
                               ),
                               child: Card(
                                 shape: _suggestionStyle.shape,
@@ -4707,103 +4734,120 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                           .cast<Map<String, dynamic>>();
                                       return Tooltip(
                                         message: actionData[indx]['title'],
-                                        child: Container(
-                                          decoration: BoxDecoration(
-                                            color: indx == _actionSelIndex
-                                                ? (_suggestionStyle
-                                                          .selectedBackgroundColor ??
-                                                      _suggestionStyle
-                                                          .focusColor)
-                                                : Colors.transparent,
-                                            borderRadius: BorderRadius.circular(
-                                              3,
+                                        // `container: true` keeps this tooltip
+                                        // anchor as its own semantics node. A
+                                        // Tooltip links its overlay content to
+                                        // the anchor with a traversal-parent
+                                        // identifier; when the anchor is merged
+                                        // into a neighbour's node --
+                                        // IndexedSemantics does this per
+                                        // ListView row -- that identifier is
+                                        // dropped rather than merged, orphaning
+                                        // the tooltip node and making Windows
+                                        // reject the whole accessibility update
+                                        // ("will not be in the tree and is not
+                                        // the new root"). These rows are
+                                        // exactly that ListView case.
+                                        // See flutter/flutter#182444.
+                                        child: Semantics(
+                                          container: true,
+                                          child: Container(
+                                            decoration: BoxDecoration(
+                                              color: indx == _actionSelIndex
+                                                  ? (_suggestionStyle
+                                                            .selectedBackgroundColor ??
+                                                        _suggestionStyle
+                                                            .focusColor)
+                                                  : Colors.transparent,
+                                              borderRadius:
+                                                  BorderRadius.circular(3),
                                             ),
-                                          ),
-                                          height: _suggestionStyle.itemHeight,
-                                          padding: EdgeInsets.symmetric(
-                                            horizontal: 8,
-                                            vertical: 2,
-                                          ),
-                                          child: InkWell(
-                                            hoverColor:
-                                                _suggestionStyle.hoverColor,
-                                            splashColor:
-                                                _suggestionStyle.splashColor,
-                                            borderRadius: BorderRadius.circular(
-                                              3,
+                                            height: _suggestionStyle.itemHeight,
+                                            padding: EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 2,
                                             ),
-                                            onTap: () {
-                                              try {
-                                                (() async {
-                                                  await _controller
-                                                      .applyWorkspaceEdit(
-                                                        actionData[indx],
-                                                      );
-                                                })();
-                                              } catch (e, st) {
-                                                debugPrint(
-                                                  'Code action failed: $e\n$st',
-                                                );
-                                              } finally {
-                                                _lspActionNotifier.value = null;
-                                                _lspActionOffsetNotifier.value =
-                                                    null;
-                                              }
-                                            },
-                                            child: Row(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.center,
-                                              children: [
-                                                SizedBox(
-                                                  width:
-                                                      _suggestionStyle
-                                                          .iconSize ??
-                                                      16,
-                                                  height:
-                                                      _suggestionStyle
-                                                          .iconSize ??
-                                                      16,
-                                                  child: Icon(
-                                                    Icons.lightbulb_outline,
-                                                    color: Colors.yellowAccent,
-                                                    size:
+                                            child: InkWell(
+                                              hoverColor:
+                                                  _suggestionStyle.hoverColor,
+                                              splashColor:
+                                                  _suggestionStyle.splashColor,
+                                              borderRadius:
+                                                  BorderRadius.circular(3),
+                                              onTap: () {
+                                                try {
+                                                  (() async {
+                                                    await _controller
+                                                        .applyWorkspaceEdit(
+                                                          actionData[indx],
+                                                        );
+                                                  })();
+                                                } catch (e, st) {
+                                                  debugPrint(
+                                                    'Code action failed: $e\n$st',
+                                                  );
+                                                } finally {
+                                                  _dismissCodeActions();
+                                                }
+                                              },
+                                              child: Row(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.center,
+                                                children: [
+                                                  SizedBox(
+                                                    width:
                                                         _suggestionStyle
                                                             .iconSize ??
                                                         16,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 8),
-                                                Expanded(
-                                                  child: Text(
-                                                    actionData[indx]['title'],
-                                                    style:
+                                                    height:
                                                         _suggestionStyle
-                                                            .labelTextStyle
-                                                            ?.copyWith(
-                                                              color:
-                                                                  indx ==
-                                                                      _actionSelIndex
-                                                                  ? Colors.white
-                                                                  : _suggestionStyle
-                                                                        .labelTextStyle
-                                                                        ?.color,
-                                                            ) ??
-                                                        _suggestionStyle
-                                                            .textStyle
-                                                            .copyWith(
-                                                              color:
-                                                                  indx ==
-                                                                      _actionSelIndex
-                                                                  ? Colors.white
-                                                                  : _suggestionStyle
-                                                                        .textStyle
-                                                                        .color,
-                                                            ),
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
+                                                            .iconSize ??
+                                                        16,
+                                                    child: Icon(
+                                                      Icons.lightbulb_outline,
+                                                      color:
+                                                          Colors.yellowAccent,
+                                                      size:
+                                                          _suggestionStyle
+                                                              .iconSize ??
+                                                          16,
+                                                    ),
                                                   ),
-                                                ),
-                                              ],
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      actionData[indx]['title'],
+                                                      style:
+                                                          _suggestionStyle
+                                                              .labelTextStyle
+                                                              ?.copyWith(
+                                                                color:
+                                                                    indx ==
+                                                                        _actionSelIndex
+                                                                    ? Colors
+                                                                          .white
+                                                                    : _suggestionStyle
+                                                                          .labelTextStyle
+                                                                          ?.color,
+                                                              ) ??
+                                                          _suggestionStyle
+                                                              .textStyle
+                                                              .copyWith(
+                                                                color:
+                                                                    indx ==
+                                                                        _actionSelIndex
+                                                                    ? Colors
+                                                                          .white
+                                                                    : _suggestionStyle
+                                                                          .textStyle
+                                                                          .color,
+                                                              ),
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
                                             ),
                                           ),
                                         ),
@@ -4967,6 +5011,7 @@ class _CodeField extends LeafRenderObjectWidget {
   final String? filePath;
   final MatchHighlightStyle? matchHighlightStyle;
   final VoidCallback? onHoverSetByTap;
+  final VoidCallback? onCodeActionPopupOpened;
   final ValueChanged<int>? onModifierTap;
   final ValueChanged<_CodeFieldRenderer> onRendererCreated;
   final TextDirection textDirection;
@@ -5020,6 +5065,7 @@ class _CodeField extends LeafRenderObjectWidget {
     this.ghostTextStyle,
     this.matchHighlightStyle,
     this.onHoverSetByTap,
+    this.onCodeActionPopupOpened,
     this.onModifierTap,
   });
 
@@ -5068,6 +5114,7 @@ class _CodeField extends LeafRenderObjectWidget {
       ghostTextStyle: ghostTextStyle,
       filePath: filePath,
       onHoverSetByTap: onHoverSetByTap,
+      onCodeActionPopupOpened: onCodeActionPopupOpened,
       onModifierTap: onModifierTap,
       textDirection: textDirection,
     );
@@ -5119,6 +5166,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final bool isMobile;
   final ValueNotifier<bool> selectionActiveNotifier, isHoveringPopup;
   final ValueNotifier<Offset> contextMenuOffsetNotifier, offsetNotifier;
+
+  /// Invoked when a gutter lightbulb opens the code action popup, so the
+  /// widget can reset the selected entry and scroll it into view.
+  final VoidCallback? onCodeActionPopupOpened;
   final ValueNotifier<int> contextMenuTextOffsetNotifier;
   final ValueNotifier<(Offset, Map<String, int>)?> hoverNotifier;
   final ValueNotifier<Map<String, dynamic>?> hoverContentNotifier;
@@ -5506,6 +5557,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     required this.selectionActiveNotifier,
     required this.contextMenuOffsetNotifier,
     required this.contextMenuTextOffsetNotifier,
+    this.onCodeActionPopupOpened,
     required this.offsetNotifier,
     required this.hoverNotifier,
     required this.hoverContentNotifier,
@@ -5688,6 +5740,11 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
     caretBlinkController.addListener(markNeedsPaint);
     controller.addListener(_onControllerChange);
+
+    // Code actions arrive asynchronously (debounced diagnostics or Ctrl+.), so
+    // nothing else would request a repaint when the list changes. Without this
+    // the gutter lightbulbs only show up on the next caret blink or scroll.
+    lspActionNotifier.addListener(markNeedsPaint);
 
     _lineHighlightAnimation = Tween<double>(begin: 0.55, end: 0.0).animate(
       CurvedAnimation(parent: lineHighlightController, curve: Curves.easeOut),
@@ -9293,6 +9350,53 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     }
   }
 
+  /// Opens the code action popup for a gutter lightbulb tap.
+  ///
+  /// Deliberately does not touch the caret, the focus node or the platform
+  /// input connection: the tap is a gutter gesture, and letting it run the
+  /// normal pointer-down path used to move the caret to the IME projection
+  /// window's start offset and scroll the editor there. Everything the popup
+  /// needs is in the two notifiers below.
+  ///
+  /// The popup's vertical anchor is the tapped lightbulb rather than the caret,
+  /// so the anchor follows the gutter row that was actually clicked.
+  void _openCodeActionsFromBulbTap(Offset tapPosition, int line) {
+    _openedLspActionFromBulbTap = true;
+    // Cancel the caret drag a previous tap may have left armed. A pointer move
+    // between this tap's down and up events would otherwise extend the
+    // selection from that stale offset, which moves the caret exactly the way
+    // this path exists to avoid.
+    _selectionTimer?.cancel();
+    _dragStartOffset = null;
+    _isDragging = false;
+    _selectionActive = false;
+    suggestionNotifier.value = null;
+    signatureNotifier.value = null;
+    // A lightbulb tap used to fall through to the shared pointer-down path,
+    // which dismissed an open context menu. Keep that, or a right-click menu
+    // would stay up underneath the code action popup.
+    if (contextMenuOffsetNotifier.value.dx >= 0) {
+      contextMenuOffsetNotifier.value = const Offset(-1, -1);
+    }
+    lspActionOffsetNotifier.value = tapPosition;
+
+    // Show the actions for the tapped line first, so the initially selected
+    // entry (Enter/Tab) is one that applies to that line.
+    final actions = lspActionNotifier.value?.cast<Map<String, dynamic>>();
+    if (actions == null) return;
+    final matching = actions
+        .where((a) => _codeActionTargetsLine(a, line))
+        .toList();
+    if (matching.isNotEmpty && matching.length != actions.length) {
+      lspActionNotifier.value = [
+        ...matching,
+        ...actions.where((a) => !_codeActionTargetsLine(a, line)),
+      ];
+    }
+
+    onCodeActionPopupOpened?.call();
+  }
+
   bool _codeActionTargetsLine(Map<String, dynamic> action, int line) {
     final path = filePath;
     if (path == null) return false;
@@ -12107,6 +12211,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   @override
   void dispose() {
     controller.removeListener(_onControllerChange);
+    lspActionNotifier.removeListener(markNeedsPaint);
     controller.setScrollCallback(null);
     isHoveringPopup.removeListener(_handleHoveringPopupChanged);
     _hoverDismissTimer?.cancel();
@@ -12266,6 +12371,28 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         onModifierTap!(textOffset);
         return;
       }
+      // A gutter lightbulb tap is a gesture on the gutter, not a caret move.
+      //
+      // It is handled before the focus/connection path below on purpose. That
+      // path attaches (or re-attaches) the platform input connection and pushes
+      // a fresh `setEditingState`, which a lightbulb tap should not trigger: the
+      // platform then reports a selection-only delta computed against the IME
+      // projection window -- whose offsets are local to that window, not to the
+      // document -- and the caret landed at the projection's window start, i.e.
+      // the end of the file for a caret near the top. `_ensureCaretVisible`
+      // then scrolled there, which is the jump to the bottom.
+      //
+      // The popup is driven entirely by `lspActionOffsetNotifier`, so opening it
+      // needs neither focus nor the connection.
+      if (lspActionNotifier.value != null && _actionBulbRects.isNotEmpty) {
+        for (final entry in _actionBulbRects.entries) {
+          if (entry.value.contains(localPosition)) {
+            _openCodeActionsFromBulbTap(event.localPosition, entry.key);
+            return;
+          }
+        }
+      }
+
       if (controller.connection == null ||
           !controller.connection!.attached ||
           !focusNode.hasFocus) {
@@ -12289,17 +12416,6 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
       if (contextMenuOffsetNotifier.value.dx >= 0) {
         _hideContextMenu();
-      }
-
-      if (lspActionNotifier.value != null && _actionBulbRects.isNotEmpty) {
-        for (final entry in _actionBulbRects.entries) {
-          if (entry.value.contains(localPosition)) {
-            _openedLspActionFromBulbTap = true;
-            suggestionNotifier.value = null;
-            lspActionOffsetNotifier.value = event.localPosition;
-            return;
-          }
-        }
       }
 
       if (_colorBoxHitAreas.isNotEmpty) {
@@ -12356,9 +12472,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
             onHoverSetByTap?.call();
           }
 
-          if (lspActionNotifier.value != null ||
-              lspActionOffsetNotifier.value != null) {
-            lspActionNotifier.value = null;
+          if (lspActionOffsetNotifier.value != null) {
             lspActionOffsetNotifier.value = null;
           }
         };
@@ -12442,8 +12556,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           if (signatureNotifier.value != null) {
             signatureNotifier.value = null;
           }
-          if (lspActionNotifier.value != null) {
-            lspActionNotifier.value = null;
+          if (lspActionOffsetNotifier.value != null) {
             lspActionOffsetNotifier.value = null;
           }
         };
@@ -12770,36 +12883,78 @@ class _BracketEntry {
   _BracketEntry(this.char, this.line);
 }
 
-/// Places the LSP hover popup relative to the anchor line.
+/// Places an in-editor popup relative to an anchor line.
 ///
-/// The popup is hosted in the root overlay, where the box it is laid out in is
-/// not necessarily the editor viewport, so anchoring it with
-/// `Positioned(bottom: ..)` made its position depend on that box's height.
-/// Deriving the offset from the child's own laid-out height keeps the popup
-/// glued to the anchor no matter how tall the surrounding box is.
-class _HoverPopupLayoutDelegate extends SingleChildLayoutDelegate {
-  const _HoverPopupLayoutDelegate({
+/// Every popup the editor hosts -- LSP hover, completion, code action and
+/// signature help -- positions itself through this delegate, so they all
+/// anchor the same way and cannot drift apart again.
+///
+/// Anchoring with `Positioned(bottom: ..)` is what these popups used to do, and
+/// it was wrong. `Positioned` measures from the bottom of whatever box it is
+/// laid out in, and a popup hosted in the root overlay sits in a box that is
+/// taller than the editor viewport. Every pixel of that difference landed on
+/// the popup's position, so flipping a popup above its anchor pushed it
+/// hundreds of pixels down -- far enough to look like the editor itself had
+/// scrolled away. Deriving the offset from the anchor plus the child's own
+/// laid-out height keeps the popup glued to the anchor no matter how tall the
+/// surrounding box is.
+class _AnchoredPopupLayoutDelegate extends SingleChildLayoutDelegate {
+  const _AnchoredPopupLayoutDelegate({
     required this.anchorY,
     required this.left,
-    required this.gap,
     required this.positionAbove,
+    this.gapBelow = 0,
+    this.gapAbove = 0,
+    this.maxWidth,
+    this.minWidth = 0,
+    this.maxHeight,
   });
 
   /// Anchor line, in the editor viewport's coordinates.
   final double anchorY;
 
-  /// Horizontal anchor, in the editor viewport's coordinates.
+  /// Left edge of the popup, in the editor viewport's coordinates.
+  ///
+  /// Callers clamp this against the overlay bounds themselves, because the
+  /// popup width is a caller decision: the completion documentation popup, for
+  /// instance, is positioned against the width of the list beside it.
   final double left;
-
-  /// Gap kept between the anchor line and the popup.
-  final double gap;
 
   /// Whether the popup is shown above the anchor instead of below it.
   final bool positionAbove;
 
+  /// Gap kept between the anchor and the popup when shown below it.
+  ///
+  /// Larger than [gapAbove] for a popup anchored to the caret's top edge: below
+  /// the anchor the caret's own line is still there, so the popup has to clear
+  /// the line height as well.
+  final double gapBelow;
+
+  /// Gap kept between the anchor and the popup when shown above it.
+  final double gapAbove;
+
+  /// Preferred popup width, or null to let the child size itself.
+  final double? maxWidth;
+
+  /// Minimum popup width, so a narrow popup does not collapse.
+  final double minWidth;
+
+  /// Upper bound on the popup height.
+  ///
+  /// Callers pass the room actually available on the chosen side of the
+  /// anchor, so a popup that flipped above the anchor is never taller than the
+  /// space it has.
+  final double? maxHeight;
+
   @override
-  BoxConstraints getConstraintsForChild(BoxConstraints constraints) =>
-      constraints.loosen();
+  BoxConstraints getConstraintsForChild(BoxConstraints constraints) {
+    final child = constraints.loosen();
+    return child.copyWith(
+      minWidth: minWidth,
+      maxWidth: maxWidth ?? child.maxWidth,
+      maxHeight: maxHeight ?? child.maxHeight,
+    );
+  }
 
   @override
   Size getSize(BoxConstraints constraints) => constraints.biggest;
@@ -12807,24 +12962,28 @@ class _HoverPopupLayoutDelegate extends SingleChildLayoutDelegate {
   @override
   Offset getPositionForChild(Size size, Size childSize) => Offset(
     left,
-    // The offset is derived from the anchor line alone. Deriving it from
-    // `size.height` (the height of whatever box the popup happens to be laid
-    // out in) instead inverts the relationship: the lower the anchor, the
+    // The vertical offset is derived from the anchor line alone. Deriving it
+    // from `size.height` (the height of whatever box the popup happens to be
+    // laid out in) instead inverts the relationship: the lower the anchor, the
     // higher the popup.
     positionAbove
-        // Bottom edge sits `gap` above the anchor line.
-        ? max(0, anchorY - gap - childSize.height)
-        // Top edge sits `gap` below the anchor line. `size.height` is only
-        // used here to keep the popup from being pushed out of the box.
-        : min(max(0, size.height - childSize.height), anchorY + gap),
+        // Bottom edge sits `gapAbove` above the anchor line.
+        ? max(0, anchorY - gapAbove - childSize.height)
+        // Top edge sits `gapBelow` below the anchor line. `size.height` is
+        // only used here to keep the popup from being pushed out of the box.
+        : min(max(0, size.height - childSize.height), anchorY + gapBelow),
   );
 
   @override
-  bool shouldRelayout(_HoverPopupLayoutDelegate oldDelegate) =>
+  bool shouldRelayout(_AnchoredPopupLayoutDelegate oldDelegate) =>
       oldDelegate.anchorY != anchorY ||
       oldDelegate.left != left ||
-      oldDelegate.gap != gap ||
-      oldDelegate.positionAbove != positionAbove;
+      oldDelegate.positionAbove != positionAbove ||
+      oldDelegate.gapBelow != gapBelow ||
+      oldDelegate.gapAbove != gapAbove ||
+      oldDelegate.maxWidth != maxWidth ||
+      oldDelegate.minWidth != minWidth ||
+      oldDelegate.maxHeight != maxHeight;
 }
 
 class _HoverDividerNode extends SpanNode {

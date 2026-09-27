@@ -246,29 +246,15 @@ class CodeForgeController implements DeltaTextInputClient {
                     codeActionsNotifier.value = null;
                     return;
                   }
-                  int minStartLine = errors
-                      .map((d) => d.range['start']?['line'] as int? ?? 0)
-                      .reduce((a, b) => a < b ? a : b);
-                  int minStartChar = errors
-                      .map((d) => d.range['start']?['character'] as int? ?? 0)
-                      .reduce((a, b) => a < b ? a : b);
-                  int maxEndLine = errors
-                      .map((d) => d.range['end']?['line'] as int? ?? 0)
-                      .reduce((a, b) => a > b ? a : b);
-                  int maxEndChar = errors
-                      .map((d) => d.range['end']?['character'] as int? ?? 0)
-                      .reduce((a, b) => a > b ? a : b);
-
                   try {
                     final config = lspConfig;
                     if (config == null || openedFile != filePath) return;
-                    final actions = await config.getCodeActions(
+                    final actions = await _fetchCodeActionsForDiagnostics(
+                      config: config,
                       filePath: filePath,
-                      startLine: minStartLine,
-                      startCharacter: minStartChar,
-                      endLine: maxEndLine,
-                      endCharacter: maxEndChar,
-                      diagnostics: rawDiagnostics.cast<Map<String, dynamic>>(),
+                      rawDiagnostics: rawDiagnostics
+                          .whereType<Map<String, dynamic>>()
+                          .toList(),
                     );
                     if (!_isDisposed &&
                         requestId == _codeActionRequestId &&
@@ -641,6 +627,54 @@ class CodeForgeController implements DeltaTextInputClient {
   /// to the end of the current frame. Deferring is free visually: post-frame
   /// callbacks run before that frame is presented.
   Listenable get displayChanges => _displayChanges;
+
+  /// Fetches code actions for a set of diagnostics.
+  ///
+  /// Diagnostics are grouped by the line they start on and one request is made
+  /// per line. Requesting a single range that spans the whole file produces
+  /// noisy or empty results on most language servers, and a single
+  /// [codeActionsNotifier] write cannot represent actions for several
+  /// unrelated regions.
+  Future<List<dynamic>> _fetchCodeActionsForDiagnostics({
+    required LspConfig config,
+    required String filePath,
+    required List<Map<String, dynamic>> rawDiagnostics,
+  }) async {
+    final byLine = <int, List<Map<String, dynamic>>>{};
+    for (final diagnostic in rawDiagnostics) {
+      final line = diagnostic['range']?['start']?['line'];
+      if (line is! int) continue;
+      byLine.putIfAbsent(line, () => []).add(diagnostic);
+    }
+
+    final actions = <dynamic>[];
+    for (final entry in byLine.entries) {
+      final lineDiagnostics = entry.value;
+      final startLine = lineDiagnostics
+          .map((d) => d['range']?['start']?['line'] as int? ?? entry.key)
+          .reduce((a, b) => a < b ? a : b);
+      final startChar = lineDiagnostics
+          .map((d) => d['range']?['start']?['character'] as int? ?? 0)
+          .reduce((a, b) => a < b ? a : b);
+      final endLine = lineDiagnostics
+          .map((d) => d['range']?['end']?['line'] as int? ?? entry.key)
+          .reduce((a, b) => a > b ? a : b);
+      final endChar = lineDiagnostics
+          .map((d) => d['range']?['end']?['character'] as int? ?? 0)
+          .reduce((a, b) => a > b ? a : b);
+
+      final result = await config.getCodeActions(
+        filePath: filePath,
+        startLine: startLine,
+        startCharacter: startChar,
+        endLine: endLine,
+        endCharacter: endChar,
+        diagnostics: lineDiagnostics,
+      );
+      actions.addAll(result);
+    }
+    return actions;
+  }
 
   /// Publishes a new diagnostic list through [diagnosticsNotifier] and signals
   /// [displayChanges].
