@@ -97,10 +97,23 @@ class _CodeForgeRootOverlayPortalState
             // with `Positioned(bottom: ..)` down by the difference: the hover
             // popup is anchored with `bottom`, so it landed hundreds of pixels
             // below the word whenever it flipped above the cursor.
-            child: SizedBox(
-              width: widget.targetSize.width,
-              height: widget.targetSize.height,
-              child: _OverflowHitTestStack(children: [widget.overlayChild]),
+            //
+            // `UnconstrainedBox` is what actually makes the width and height
+            // here take effect. The overlay lays its children out with tight
+            // constraints spanning the whole overlay, and a `SizedBox` under
+            // tight constraints cannot shrink: it defers to the parent and
+            // renders at the overlay's full size. That is precisely the bug
+            // described above, so the box has to be laid out without a
+            // constraint that would override the target size. It is positioned
+            // back at the top left so dropping the constraints does not move
+            // the child.
+            child: UnconstrainedBox(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                width: widget.targetSize.width,
+                height: widget.targetSize.height,
+                child: _OverflowHitTestStack(children: [widget.overlayChild]),
+              ),
             ),
           ),
         );
