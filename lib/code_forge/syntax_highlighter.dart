@@ -1,3 +1,4 @@
+import 'dart:math' show min;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -5,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:re_highlight/re_highlight.dart';
 
 import '../LSP/lsp.dart';
+import 'multiline_string.dart';
 
 class SemanticWordSpan {
   final int startChar;
@@ -43,7 +45,9 @@ class SyntaxHighlighter {
   final TextStyle? baseTextStyle;
   final String? languageId;
   final Map<int, HighlightedLine> _grammarCache = {}, _mergedCache = {};
+  final Map<int, HighlightedLine> _multilineCache = {};
   final Map<int, List<SemanticWordSpan>> _lineSemanticSpans = {};
+  late final MultilineStringTracker? _multilineTracker;
   final Map<String, TextSpan?> _lineSpanCache = {};
   late final String _langId;
   late final Highlight _highlight;
@@ -58,6 +62,11 @@ class SyntaxHighlighter {
   Future<void>? _preHighlightInFlight;
   int _preHighlightInFlightVersion = -1, _version = 0, _documentVersion = 0;
   bool _isEditing = false;
+
+  /// Supplies the text of any line by index so multi-line constructs can be
+  /// tracked across lines. Without it those constructs are left to the
+  /// per-line grammar, which is the previous behaviour.
+  String Function(int lineIndex)? lineTextProvider;
 
   SyntaxHighlighter({
     required this.language,
@@ -78,6 +87,26 @@ class SyntaxHighlighter {
     }
 
     _semanticMapping = getSemanticMapping(languageId ?? '');
+
+    // Lines are read one at a time, so a construct that opens on one line and
+    // closes several lines later is never seen whole by the grammar. The
+    // tracker recovers those stretches and the editor paints them as one
+    // string instead of as freshly parsed code.
+    final multilineSpec = resolveMultilineStringSpec(
+      languageId: languageId,
+      modeName: language.name,
+    );
+    _multilineTracker = multilineSpec == null
+        ? null
+        : MultilineStringTracker(multilineSpec);
+  }
+
+  /// Starts reporting the stretches of a line that belong to a multi-line
+  /// string or block comment. Called by the editor once it can hand over the
+  /// text of any line; until then the tracker stays inert.
+  void attachLineTextProvider(String Function(int lineIndex) provider) {
+    lineTextProvider = provider;
+    _multilineTracker?.lineText = provider;
   }
 
   void updateSemanticTokens(
@@ -129,7 +158,9 @@ class SyntaxHighlighter {
     _isEditing = false;
     _lineSpanCache.clear();
     _mergedCache.clear();
+    _multilineCache.clear();
     _grammarCache.clear();
+    _multilineTracker?.clear();
     _version++;
   }
 
@@ -163,6 +194,8 @@ class SyntaxHighlighter {
         ..addAll(shiftedSemanticSpans);
       _grammarCache.removeWhere((line, _) => line >= editLine);
       _mergedCache.removeWhere((line, _) => line >= editLine);
+      _multilineCache.removeWhere((line, _) => line >= editLine);
+      _multilineTracker?.invalidateFrom(editLine);
       _isEditing = false;
     } else if (insertedText.isNotEmpty || deletedText.isNotEmpty) {
       final lineSemanticSpans = _lineSemanticSpans[editLine];
@@ -246,32 +279,47 @@ class SyntaxHighlighter {
   void invalidateAll() {
     _grammarCache.clear();
     _mergedCache.clear();
+    _multilineCache.clear();
+    _multilineTracker?.clear();
     _documentVersion++;
     _version++;
   }
 
   void invalidateLines(Set<int> lines) {
-    for (final line in lines) {
-      _grammarCache.remove(line);
-      _mergedCache.remove(line);
-    }
+    if (lines.isEmpty) return;
+    // A line's own entry and everything after it is stale: a change can add
+    // or remove a construct opener, which changes the state every later line
+    // is read in.
+    _invalidateFrom(lines.reduce(min));
+  }
+
+  /// Drops every cached span from [from] down and forgets the multi-line state
+  /// derived from that point on. One line above is included because its own
+  /// trailing state is what decides how [from] is read.
+  void _invalidateFrom(int from) {
+    final start = from <= 0 ? 0 : from - 1;
+    _grammarCache.removeWhere((line, _) => line >= start);
+    _mergedCache.removeWhere((line, _) => line >= start);
+    _multilineCache.removeWhere((line, _) => line >= start);
+    _multilineTracker?.invalidateFrom(from);
     _version++;
   }
 
   void invalidateRange(int startLine, int endLine) {
-    for (int i = startLine; i <= endLine; i++) {
-      _grammarCache.remove(i);
-      _mergedCache.remove(i);
-    }
-    final keysToRemove = _grammarCache.keys.where((k) => k > endLine).toList();
-    for (final key in keysToRemove) {
-      _grammarCache.remove(key);
-      _mergedCache.remove(key);
-    }
-    _version++;
+    _invalidateFrom(startLine);
   }
 
-  TextSpan? getLineSpan(int lineIndex, String lineText) {
+  /// The span for a line, with any multi-line string or block comment painted
+  /// as one continuous run on top of whatever the per-line grammar produced.
+  ///
+  /// [textOffset] is where [lineText] starts inside the full line, so a caller
+  /// rendering only a slice still colours the slice correctly.
+  TextSpan? getLineSpan(int lineIndex, String lineText, {int textOffset = 0}) {
+    final span = _getUnstyledLineSpan(lineIndex, lineText);
+    return _applyMultilineStyles(lineIndex, lineText, span, textOffset);
+  }
+
+  TextSpan? _getUnstyledLineSpan(int lineIndex, String lineText) {
     final mergedCache = _mergedCache[lineIndex];
     if (mergedCache != null &&
         mergedCache.version == _version &&
@@ -332,6 +380,99 @@ class SyntaxHighlighter {
     _mergedCache[lineIndex] = HighlightedLine(lineText, mergedSpan, _version);
 
     return mergedSpan;
+  }
+
+  /// Repaints the stretches of a line that sit inside a multi-line construct.
+  ///
+  /// The per-line grammar sees only the single line it was handed, so a line
+  /// in the middle of a triple-quoted string is re-read as if it started
+  /// there: its words get keyword colours and its bare words get code
+  /// colours. Painting the whole construct as one string on top of that
+  /// result is what makes an interior line look like the string it is.
+  TextSpan? _applyMultilineStyles(
+    int lineIndex,
+    String lineText,
+    TextSpan? span,
+    int textOffset,
+  ) {
+    final tracker = _multilineTracker;
+    final provider = lineTextProvider;
+    if (tracker == null || provider == null || lineText.isEmpty) return span;
+
+    final cached = _multilineCache[lineIndex];
+    if (cached != null &&
+        cached.version == _version &&
+        cached.text == lineText) {
+      return cached.span;
+    }
+
+    final ranges = tracker.rangesForLine(
+      lineIndex,
+      provider,
+      textOffset: textOffset,
+    );
+    if (ranges.isEmpty) {
+      _multilineCache[lineIndex] = HighlightedLine(lineText, span, _version);
+      return span;
+    }
+
+    final flattened = <({String text, TextStyle? style})>[];
+    _flattenGrammarSpan(span, flattened, baseTextStyle);
+
+    final children = <TextSpan>[];
+    var position = 0;
+
+    for (final range in ranges) {
+      final start = range.start.clamp(0, lineText.length);
+      final end = range.end.clamp(0, lineText.length);
+      if (start > position) {
+        _addGrammarSegments(children, flattened, position, start, lineText);
+      }
+
+      if (start < end) {
+        // Everything inside the construct takes the construct's own theme
+        // entry, so an interior line of a docstring is uniformly string
+        // coloured instead of picking up code colours from the grammar.
+        children.add(
+          TextSpan(
+            text: lineText.substring(start, end),
+            style: _multilineStyleFor(range.scopeKey),
+          ),
+        );
+      }
+
+      position = end;
+    }
+
+    if (position < lineText.length) {
+      _addGrammarSegments(
+        children,
+        flattened,
+        position,
+        lineText.length,
+        lineText,
+      );
+    }
+
+    final result = children.isEmpty
+        ? span
+        : children.length == 1
+        ? children.first
+        : TextSpan(style: baseTextStyle, children: children);
+
+    _multilineCache[lineIndex] = HighlightedLine(lineText, result, _version);
+    return result;
+  }
+
+  /// The theme entry for a multi-line construct scope, falling back to the
+  /// plain string colour when a theme names no entry for that scope.
+  TextStyle _multilineStyleFor(String scopeKey) {
+    final style =
+        _resolvedTheme[scopeKey] ??
+        editorTheme[scopeKey] ??
+        _resolvedTheme['string'] ??
+        editorTheme['string'];
+    return style ?? baseTextStyle ?? editorTheme['root'] ?? const TextStyle();
   }
 
   TextSpan? _mergeGrammarAndSemantic(
@@ -878,6 +1019,12 @@ class SyntaxHighlighter {
       _mergedCache.removeWhere((line, _) => line < minKeep || line > maxKeep);
     }
 
+    if (_multilineCache.length > _maxLineCacheEntries) {
+      _multilineCache.removeWhere(
+        (line, _) => line < minKeep || line > maxKeep,
+      );
+    }
+
     if (_lineSemanticSpans.length > _maxLineCacheEntries) {
       _lineSemanticSpans.removeWhere(
         (line, _) => line < minKeep || line > maxKeep,
@@ -923,8 +1070,10 @@ class SyntaxHighlighter {
   void dispose() {
     _grammarCache.clear();
     _mergedCache.clear();
+    _multilineCache.clear();
     _lineSemanticSpans.clear();
     _lineSpanCache.clear();
+    _multilineTracker?.clear();
   }
 }
 
