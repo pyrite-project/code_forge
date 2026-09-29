@@ -961,7 +961,7 @@ class CodeForgeController implements DeltaTextInputClient {
   /// When [isShiftPressed] is true the secondary cursors are cleared.
   void moveMultiCursorsUp({bool isShiftPressed = false}) {
     if (_multiCursors.isEmpty) return;
-    final isAltPressed = HardwareKeyboard.instance.isAltPressed;
+    final isAltPressed = editorModifierKeys.isAltPressed;
     if (isShiftPressed && !isAltPressed) {
       clearMultiCursors();
       return;
@@ -994,7 +994,7 @@ class CodeForgeController implements DeltaTextInputClient {
   /// When [isShiftPressed] is true the secondary cursors are cleared.
   void moveMultiCursorsDown({bool isShiftPressed = false}) {
     if (_multiCursors.isEmpty) return;
-    final isAltPressed = HardwareKeyboard.instance.isAltPressed;
+    final isAltPressed = editorModifierKeys.isAltPressed;
     if (isShiftPressed && !isAltPressed) {
       clearMultiCursors();
       return;
@@ -2042,7 +2042,7 @@ class CodeForgeController implements DeltaTextInputClient {
   ///
   /// If [isShiftPressed] is true, extends the selection.
   void pressUpArrowKey({bool isShiftPressed = false}) {
-    if (HardwareKeyboard.instance.isAltPressed) return;
+    if (editorModifierKeys.isAltPressed) return;
     final currentLine = getLineAtOffset(selection.extentOffset);
 
     if (_isMobile &&
@@ -2105,7 +2105,7 @@ class CodeForgeController implements DeltaTextInputClient {
   ///
   /// If [isShiftPressed] is true, extends the selection.
   void pressDownArrowKey({bool isShiftPressed = false}) {
-    if (HardwareKeyboard.instance.isAltPressed) return;
+    if (editorModifierKeys.isAltPressed) return;
     final currentLine = getLineAtOffset(selection.extentOffset);
 
     if (_isMobile &&
