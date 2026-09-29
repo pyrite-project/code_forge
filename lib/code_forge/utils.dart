@@ -2,6 +2,341 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../LSP/lsp.dart';
+import 'multiline_string.dart';
+
+/// Net number of brackets a line leaves open, ignoring brackets that appear
+/// inside string literals.
+///
+/// Only used to tell a statement that continues onto the next line from one
+/// that starts there, so it is deliberately simple rather than a full lexer:
+/// escaped characters are skipped and quotes are tracked well enough to keep a
+/// bracket inside a string from being counted.
+///
+/// Braces are not counted. In the languages this editor highlights, a brace
+/// left open at the end of a line is a block header - "class A {", "} else {"
+/// - and treating it as a continuation would make every statement below it
+/// look like part of one enormous statement. Parentheses and square brackets
+/// carry no such meaning, so they are what actually carry a line over.
+int _openBracketDelta(String line) {
+  int delta = 0;
+  String? quote;
+  for (var i = 0; i < line.length; i++) {
+    final ch = line[i];
+
+    if (quote != null) {
+      if (ch == r'\') {
+        i++;
+      } else if (ch == quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (ch == '\'' || ch == '"') {
+      quote = ch;
+      continue;
+    }
+
+    if (ch == '(' || ch == '[') {
+      delta++;
+    } else if (ch == ')' || ch == ']') {
+      delta--;
+    }
+  }
+  return delta;
+}
+
+/// Whether a statement starting on [line] is still unfinished when it ends, so
+/// the next line continues it rather than starting a new one.
+///
+/// [masked] is [line] with the parts that sit inside a multi-line string or
+/// block comment blanked out, so a bracket or a backslash in a docstring is
+/// not mistaken for structure.
+///
+/// A line that ends with a backslash, or that leaves a parenthesis or square
+/// bracket open, continues. A line that closes everything it opens does not: a
+/// block header such as "class A {" also ends its line, and reading it as a
+/// continuation would drag every line below it to the header's indentation.
+bool _continuesStatement(String line, String masked) {
+  if (_endsWithLineContinuation(masked)) return true;
+  return _openBracketDelta(masked) > 0;
+}
+
+/// Replaces every stretch of [line] that lies inside a multi-line string or
+/// block comment with spaces, keeping the length and the leading indentation
+/// intact so offsets and [indentColumnsOf] still mean the same thing.
+///
+/// A docstring is prose. Reading its brackets as structure makes a line such
+/// as `"""Summary (see below` look like an unclosed call, which then drags
+/// every following line into one invented statement. Blanking the prose lets
+/// the guide logic see only the code around it.
+///
+/// The opening delimiter is masked together with the prose it starts. The
+/// tracker reports a range that begins *after* the delimiter, so the line that
+/// opens a docstring would otherwise keep its quotes as apparent code and be
+/// read as a statement of its own - inventing an indentation level for the
+/// prose and hanging a guide off a sentence.
+String _maskMultiline(
+  String line,
+  List<MultilineStringRange> ranges,
+  MultilineStringSpec spec,
+) {
+  if (ranges.isEmpty) return line;
+
+  final units = List<int>.of(line.codeUnits, growable: true);
+  for (final range in ranges) {
+    // An opener that this line starts sits immediately before the reported
+    // range, so it is masked too; otherwise the line that opens a multi-line
+    // construct would still look like code.
+    var start = range.start < 0 ? 0 : range.start;
+    for (var open = 0; open < spec.openers.length; open++) {
+      final opener = spec.openers[open];
+      if (start < opener.length) continue;
+      if (line.startsWith(opener, start - opener.length)) {
+        start -= opener.length;
+        break;
+      }
+    }
+    final end = range.end > units.length ? units.length : range.end;
+    for (var i = start; i < end; i++) {
+      units[i] = 0x20;
+    }
+  }
+  return String.fromCharCodes(units);
+}
+
+/// Whether [line] ends with a backslash outside a string, which continues the
+/// statement onto the next line in languages that use it.
+bool _endsWithLineContinuation(String line) {
+  var i = line.length - 1;
+  while (i >= 0 && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) {
+    i--;
+  }
+  return i >= 0 && line[i] == '\\';
+}
+
+/// Columns occupied by the leading whitespace of [line], expanding tabs to the
+/// next multiple of [tabSize].
+int indentColumnsOf(String line, int tabSize) {
+  var columns = 0;
+  for (var i = 0; i < line.length; i++) {
+    final ch = line[i];
+    if (ch == ' ') {
+      columns += 1;
+    } else if (ch == '\t') {
+      columns += tabSize <= 0 ? 1 : tabSize - (columns % tabSize);
+    } else {
+      break;
+    }
+  }
+  return columns;
+}
+
+/// One vertical run of an indent guide.
+class IndentGuideSegment {
+  const IndentGuideSegment({
+    required this.startLine,
+    required this.endLine,
+    required this.columns,
+  });
+
+  /// First line of the run, inclusive.
+  final int startLine;
+
+  /// Line after the run, exclusive.
+  final int endLine;
+
+  /// Indent level the guide is drawn at, in columns.
+  final int columns;
+}
+
+/// Vertical runs of indent guides covering `[firstLine, lastLine)`.
+///
+/// A guide is drawn at a level a line is indented *past*, which is what makes
+/// it sit one level before the text it marks: a body at column 4 is marked by
+/// a guide at column 0. The same rule also explains the level editors never
+/// draw - the deepest indentation present, since nothing is indented past it.
+///
+/// Levels come from the indentation of the lines that *start a statement*. A
+/// line that merely continues the statement above it is attributed to that
+/// statement and contributes no level of its own, which is what keeps a wrapped
+/// signature from inventing guides:
+/// ```
+/// def get_sub_buffer(self, fb: FrameBuffer, x: int, y: int,
+///                    w: int, h: int) -> bytearray:
+///     return sub_buffer
+/// ```
+/// The continuation is indented at column 19 and the body at column 4, but the
+/// statement it belongs to starts at column 0, so the only guide is at column 0.
+///
+/// A blank line adds no level of its own. One that carries whitespace still
+/// shows its indent on screen, so guides pass through it; one with no
+/// characters at all shows nothing, so it cuts the runs it falls inside and
+/// no guide is painted over it - nor does it light one up as the caret's.
+///
+/// A line that is nothing but string or comment prose behaves the same way for
+/// levels - it adds none of its own - but it does take part in runs, measured
+/// by its real leading whitespace. A docstring is indented past the statement
+/// that holds it, so the guides of the enclosing levels are drawn in front of
+/// it instead of only from the first code line below it.
+List<IndentGuideSegment> indentGuideSegments({
+  required int firstLine,
+  required int lastLine,
+  required int tabSize,
+  required String Function(int lineIndex) lineTextAt,
+  String? languageId,
+}) {
+  if (lastLine <= firstLine) return const [];
+
+  final count = lastLine - firstLine;
+  final indents = List<int>.filled(count, 0);
+  final blanks = List<bool>.filled(count, false);
+  // Real leading whitespace of a line that is nothing but prose, `null` for
+  // every other line. Prose contributes no level of its own, but it still
+  // occupies an indented position on screen, so the run scan needs to know
+  // where the line actually starts.
+  final proseIndents = List<int?>.filled(count, null);
+  // True for a line without a single character on it - `\r`-only lines from
+  // CRLF sources included. Such a line shows nothing on screen, so no guide
+  // is painted over it and the runs it falls inside are cut there.
+  final bare = List<bool>.filled(count, false);
+  // Multi-line strings and block comments carry prose, not structure, so the
+  // guide scan needs to know which stretches of each line belong to one. The
+  // tracker walks lines in order, which is exactly how this loop reads them.
+  // A language with no multi-line construct of its own gets an empty spec, so
+  // the tracker reports no ranges and every line is read as ordinary code.
+  final spec =
+      resolveMultilineStringSpec(languageId: languageId) ??
+      const MultilineStringSpec(
+        openers: <String>[],
+        closers: <String>[],
+        scopeKeys: <String>[],
+      );
+  final tracker = MultilineStringTracker(spec)..lineText = lineTextAt;
+
+  var carriedIndent = 0;
+  var continuationRun = false;
+
+  for (var i = 0; i < count; i++) {
+    final text = lineTextAt(firstLine + i);
+
+    if (text.trim().isEmpty) {
+      blanks[i] = true;
+      // A blank line says nothing about the statement it sits in. One with
+      // not a single character on it also carries no indent on screen, so
+      // no guide of any level belongs on it.
+      if (text.isEmpty || text == '\r') bare[i] = true;
+      continue;
+    }
+
+    // Blank out any prose so only structure is left to reason about.
+    final masked = _maskMultiline(
+      text,
+      tracker.rangesForLine(firstLine + i, lineTextAt),
+      spec,
+    );
+
+    // A line that is nothing but prose - the body of a docstring, a block
+    // comment - carries no code, so its indentation is prose layout rather
+    // than a nesting level. Counting it would hang a guide off a wrapped
+    // sentence. It keeps the indentation of the code line the prose belongs
+    // to, so a run neither invents a deeper level nor breaks where the
+    // sentence happens to be indented.
+    //
+    // The line is not dropped from the run scan the way a blank line is,
+    // though: it is remembered with its real leading whitespace and takes
+    // part in runs at the levels the code around it already uses. That is
+    // what keeps a guide in front of a docstring line instead of starting
+    // on the first code line below it.
+    if (masked.trim().isEmpty) {
+      indents[i] = carriedIndent;
+      blanks[i] = true;
+      proseIndents[i] = indentColumnsOf(text, tabSize);
+      continue;
+    }
+
+    final ownIndent = indentColumnsOf(text, tabSize);
+
+    // A line continues the statement above it when it sits further right than
+    // that statement does, in which case it belongs to that statement and
+    // contributes no level of its own. The flag is refreshed from the line
+    // that was just read, so a wrapped line hands it to the line after it
+    // instead of letting it stick for the rest of the file.
+    final int columns;
+    if (continuationRun && ownIndent > carriedIndent) {
+      columns = carriedIndent;
+    } else {
+      columns = ownIndent;
+      carriedIndent = ownIndent;
+    }
+    continuationRun = _continuesStatement(text, masked);
+
+    indents[i] = columns;
+  }
+  // Guides sit at every distinct indentation except the deepest one, which
+  // nothing is indented past. Using the levels actually present rather than
+  // stepping by [tabSize] keeps the result correct for files that mix tabs
+  // and spaces or indent by an unusual amount.
+  final levels = <int>{for (var i = 0; i < count; i++) indents[i]}.toList()
+    ..sort();
+  // The deepest indentation present is the one nothing is indented past, and
+  // that is exactly the level an editor never draws a guide for.
+  if (levels.isNotEmpty) levels.removeLast();
+
+  final segments = <IndentGuideSegment>[];
+  for (final level in levels) {
+    var runStart = -1;
+    for (var i = 0; i < count; i++) {
+      // A blank line contributes no level of its own. A whitespace-only one
+      // still shows its indent on screen, so an open run passes through it.
+      // A line with no characters at all shows nothing, so the open run is
+      // cut at it - no guide is painted over the line itself - and a fresh
+      // one starts at the next line indented past the level.
+      final proseIndent = proseIndents[i];
+      if (proseIndent == null && blanks[i]) {
+        if (bare[i] && runStart >= 0) {
+          segments.add(
+            IndentGuideSegment(
+              startLine: firstLine + runStart,
+              endLine: firstLine + i,
+              columns: level,
+            ),
+          );
+          runStart = -1;
+        }
+        continue;
+      }
+
+      final indentInRun = proseIndent ?? indents[i];
+      if (indentInRun > level) {
+        if (runStart < 0) runStart = i;
+        continue;
+      }
+      if (runStart >= 0) {
+        segments.add(
+          IndentGuideSegment(
+            startLine: firstLine + runStart,
+            endLine: firstLine + i,
+            columns: level,
+          ),
+        );
+        runStart = -1;
+      }
+    }
+
+    if (runStart >= 0) {
+      segments.add(
+        IndentGuideSegment(
+          startLine: firstLine + runStart,
+          endLine: lastLine,
+          columns: level,
+        ),
+      );
+    }
+  }
+
+  return segments;
+}
 
 /// Represents a foldable code region in the editor.
 ///

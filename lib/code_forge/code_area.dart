@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:ui' as ui;
@@ -28,15 +29,359 @@ const int kWrappedHeightSampleSize = 64;
 /// Deliberately smaller than `popupBottomGap`: the hover popup is anchored to
 /// the line being documented, so a wide gap reads as a detached popup.
 const double kHoverAnchorGap = 6.0;
-const double _overlayInnerRadius = 8.0;
-const double _overlayPadding = 8.0;
-const double _overlayOuterRadius = _overlayInnerRadius + _overlayPadding;
-const BorderRadius _overlayInnerBorderRadius = BorderRadius.all(
-  Radius.circular(_overlayInnerRadius),
+
+/// Padding applied inside `code_forge`'s floating overlays (hover, signature
+/// help, documentation, completion and code-action popups).
+///
+/// Overlays derive the radius of anything nested inside them as
+/// `outer - kOverlayPadding`, so the two corner arcs stay concentric:
+/// `outer == gap + inner`.
+const double kOverlayPadding = 8.0;
+
+/// Default outer corner radius for every floating overlay this editor shows.
+///
+/// A host app that defines its own corner scale should pass its own value via
+/// [CodeForge.overlayBorderRadius] (or supply a matching
+/// [HoverDetailsStyle]/[SuggestionStyle]) so editor popups agree with the rest
+/// of the app's surfaces.
+const double kDefaultOverlayOuterRadius = 12.0;
+
+/// Smallest corner a nested surface inside a popup is allowed to have.
+///
+/// The nested rule is `outer == gap + inner`, but that difference can go to
+/// zero for a deeply inset surface, and a square corner is the one shape that
+/// visibly breaks the app's scale. Clamping here keeps every popup corner
+/// rounded and still concentric with the surface that holds it.
+const double kMinNestedRadius = 4.0;
+
+/// Gap kept below a code block that has content on that side.
+///
+/// A side with nothing on it stays flush: the card's own padding already
+/// separates the block from the popup edge, so a second band there would only
+/// add dead space. Where content does follow, the gap is what separates two
+/// blocks of content, and it is twice the card's own padding so the rhythm
+/// still reads as part of the same scale. [codeBlockMargin] holds the full
+/// rule, including the case of a block a rule follows.
+const double kCodeBlockGap = 8.0;
+
+/// Gap kept above a code block that has content on that side.
+///
+/// The top side carries more room than [kCodeBlockGap]. Prose running straight
+/// into a filled, outlined block reads as one lump, and the band that is
+/// enough below the block is not enough to separate them, so the side the
+/// reader arrives from is the wider one.
+const double kCodeBlockTopGap = 12.0;
+
+/// Gap kept on each side of a gutter code-action lightbulb, inside the lane
+/// reserved for it.
+///
+/// VS Code gives the lightbulb its own column in front of the line numbers
+/// rather than drawing it on top of them, which is what keeps an unindented
+/// line from showing the bulb and its line number on top of each other.
+const double kActionBulbLaneGap = 2.0;
+
+/// Foreground for the LSP code-action lightbulb on dark editor backgrounds.
+const Color kDarkCodeActionBulbColor = Color(0xFFFFCC00);
+
+/// Foreground for the LSP code-action lightbulb on light editor backgrounds.
+///
+/// `Colors.yellowAccent` is #FFFF00, which is all but invisible on the white
+/// surface the light themes paint the editor with.
+const Color kLightCodeActionBulbColor = Color(0xFF9A6700);
+
+/// Picks the code-action lightbulb color that stays legible on [background].
+///
+/// Light surfaces get the darker amber and dark surfaces the brighter one, so
+/// the bulb keeps the VS Code look on a white editor instead of washing out.
+Color codeActionBulbColor(Color? background) {
+  final resolved = background ?? Colors.white;
+  return resolved.computeLuminance() > 0.5
+      ? kLightCodeActionBulbColor
+      : kDarkCodeActionBulbColor;
+}
+
+/// Builds the decoration for a fenced Markdown code block inside a popup.
+///
+/// A code block is a surface nested inside the popup that holds it, so its
+/// corner follows the same rule as every other nested surface here:
+/// outer == gap + inner, with [gap] being the real distance between the two
+/// surfaces. The fill and the hairline outline are what make the block read as
+/// code rather than as prose, and they come straight from the editor theme so
+/// the block always belongs to the theme it is shown in.
+///
+/// The radius is floored so a deeply nested block can never collapse into a
+/// right angle, which would be the one shape that visibly breaks the scale.
+BoxDecoration overlayCodeBlockDecoration(
+  BorderRadius outer, {
+  required double gap,
+  required Color background,
+  required Color outline,
+}) {
+  final double outerRadius = outer.topLeft.x;
+  final double nested = min(
+    outerRadius,
+    max(kMinNestedRadius, outerRadius - gap),
+  );
+  return BoxDecoration(
+    color: background,
+    borderRadius: BorderRadius.circular(nested),
+    border: Border.all(width: 0.2, color: outline),
+  );
+}
+
+/// A Markdown thematic break: the horizontal rule written as `---`, `***`, or
+/// `___`.
+///
+/// CommonMark also allows spaces between the repeated characters, so `* * *` is
+/// the same rule as `***`.
+final RegExp _thematicBreak = RegExp(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$');
+
+/// The source lines and fence lines of the code block holding [code].
+///
+/// [CodeBuilder] receives the block content but never its siblings or its
+/// position, so a block is located by matching [code] back to the fence it came
+/// from. When two blocks share the same text the first one wins, which keeps
+/// every answer derived from this stable across rebuilds.
+({List<String> lines, int open, int close})? _codeBlockFences(
+  String source,
+  String code,
+) {
+  final lines = const LineSplitter().convert(source);
+  final wanted = code.trim();
+  for (var i = 0; i < lines.length; i++) {
+    if (!_isCodeFence(lines[i])) {
+      continue;
+    }
+    final body = <String>[];
+    var j = i + 1;
+    while (j < lines.length && !_isCodeFence(lines[j])) {
+      body.add(lines[j]);
+      j++;
+    }
+    final matched = body.join('\n').trim() == wanted;
+    if (j >= lines.length) {
+      // An unterminated block runs to the end of the document, so nothing can
+      // follow it while content can still sit above it.
+      if (matched) {
+        return (lines: lines, open: i, close: lines.length - 1);
+      }
+      break;
+    }
+    if (matched) {
+      return (lines: lines, open: i, close: j);
+    }
+    i = j;
+  }
+  return null;
+}
+
+/// The first line after [from] that carries content, or null when the document
+/// ends in whitespace.
+String? _nextContentLine(List<String> lines, int from) {
+  for (var i = from + 1; i < lines.length; i++) {
+    if (lines[i].trim().isNotEmpty) {
+      return lines[i];
+    }
+  }
+  return null;
+}
+
+/// Whether the code block holding [code] is followed by renderable content.
+///
+/// A code block is a filled, outlined surface, so a bottom margin that no
+/// content ever fills reads as a stray empty band inside the popup. The gap
+/// below a block therefore exists only when something actually follows it.
+bool codeBlockHasContentBelow(String source, String code) {
+  final fences = _codeBlockFences(source, code);
+  if (fences == null) {
+    return false;
+  }
+  return _nextContentLine(fences.lines, fences.close) != null;
+}
+
+/// Whether the code block holding [code] is preceded by renderable content.
+///
+/// Prose running straight into the block reads as one lump without it, which is
+/// the same reason a block with nothing above it is left flush.
+bool codeBlockHasContentAbove(String source, String code) {
+  final fences = _codeBlockFences(source, code);
+  if (fences == null) {
+    return false;
+  }
+  for (var i = fences.open - 1; i >= 0; i--) {
+    if (fences.lines[i].trim().isNotEmpty) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Whether the first content below the code block holding [code] is a rule.
+///
+/// A rule is a line the author drew to divide the text, so a band between the
+/// block and that rule only breaks the line the rule is there to draw.
+bool codeBlockIsFollowedByRule(String source, String code) {
+  final fences = _codeBlockFences(source, code);
+  if (fences == null) {
+    return false;
+  }
+  final next = _nextContentLine(fences.lines, fences.close);
+  return next != null && _isThematicBreak(next);
+}
+
+/// The margin a popup code block keeps on each of its sides.
+///
+/// A code block is a filled, outlined surface, so a margin on a side that
+/// nothing fills reads as a stray empty band inside the popup. The gap
+/// therefore tracks the content on that side, with the two cases the markdown
+/// around the block decides: a block that opens the document has content only
+/// below, and a block a rule follows keeps that rule flush.
+EdgeInsets codeBlockMargin(String source, String code) => EdgeInsets.only(
+  top: codeBlockHasContentAbove(source, code) ? kCodeBlockTopGap : 0,
+  bottom:
+      codeBlockHasContentBelow(source, code) &&
+          !codeBlockIsFollowedByRule(source, code)
+      ? kCodeBlockGap
+      : 0,
 );
-const BorderRadius _overlayOuterBorderRadius = BorderRadius.all(
-  Radius.circular(_overlayOuterRadius),
+
+bool _isThematicBreak(String line) => _thematicBreak.hasMatch(line.trim());
+
+bool _isCodeFence(String line) {
+  final trimmed = line.trimLeft();
+  return trimmed.startsWith('```') || trimmed.startsWith('~~~');
+}
+
+/// Builds the [PreConfig] used by every popup that renders a fenced code
+/// block.
+///
+/// This deliberately goes through [PreConfig.builder] rather than [PreConfig]'s
+/// own `padding`, `margin`, and `decoration`, because those are fixed values
+/// and the code block needs two of them to depend on its surroundings:
+///
+///  * A code block is a surface nested inside the popup that holds it, so its
+///    corner is `outer - gap` for the real inset. Deriving it that way keeps
+///    the two arcs concentric instead of drawing an unrelated second radius.
+///  * The gaps on each side track the content on that side. A margin that
+///    nothing fills leaves a dead band inside the popup, and that is plainly
+///    visible on a filled, outlined surface.
+///
+/// The top gap is zero for a block that opens the document, because the card's
+/// own padding already separates it from the popup edge. [codeBlockMargin]
+/// holds the full rule, so a block that follows prose still gets its band.
+PreConfig overlayCodeBlockConfig({
+  required String source,
+  required BorderRadius outer,
+  required double gap,
+  required Map<String, TextStyle> theme,
+  required TextStyle textStyle,
+  required TextStyle styleNotMatched,
+  String language = 'dart',
+}) {
+  return PreConfig(
+    language: language,
+    theme: theme,
+    textStyle: textStyle,
+    styleNotMatched: styleNotMatched,
+    builder: (code, codeLanguage) => Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(8),
+      margin: codeBlockMargin(source, code),
+      decoration: overlayCodeBlockDecoration(
+        outer,
+        gap: gap,
+        background: theme['root']?.backgroundColor ?? Colors.grey[900]!,
+        outline: theme['root']?.color ?? Colors.grey,
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Text.rich(
+          TextSpan(
+            children: highLightSpans(
+              code,
+              language: codeLanguage,
+              theme: theme,
+              textStyle: textStyle,
+              styleNotMatched: styleNotMatched,
+            ),
+          ),
+          softWrap: true,
+        ),
+      ),
+    ),
+  );
+}
+
+/// Heading configs for a popup whose text color is [foreground].
+///
+/// `markdown_widget`'s dark config bakes `Colors.white` into every heading
+/// level, and that color always wins: a heading's own style is merged over the
+/// style it inherits from the paragraph above it, so the popup's foreground can
+/// never override the heading color. In a light editor theme that makes every
+/// `h1`..`h6` white on a light popup surface, which is unreadable.
+///
+/// These configs carry [foreground] instead, so titles follow the editor theme
+/// in both brightnesses. Sizes, weights, line heights, and the heading
+/// dividers are left exactly as the package defines them.
+List<HeadingConfig> overlayHeadingConfigs({required Color foreground}) => [
+  H1Config(style: _overlayHeadingStyle(32, 40 / 32, foreground)),
+  H2Config(style: _overlayHeadingStyle(24, 30 / 24, foreground)),
+  H3Config(style: _overlayHeadingStyle(20, 25 / 20, foreground)),
+  H4Config(style: _overlayHeadingStyle(16, 20 / 16, foreground)),
+  H5Config(style: _overlayHeadingStyle(16, 20 / 16, foreground)),
+  H6Config(style: _overlayHeadingStyle(16, 20 / 16, foreground)),
+];
+
+TextStyle _overlayHeadingStyle(double fontSize, double height, Color color) =>
+    TextStyle(
+      fontSize: fontSize,
+      height: height,
+      color: color,
+      fontWeight: FontWeight.bold,
+    );
+
+/// Border radius for a surface nested inside a floating overlay.
+BorderRadius nestedOverlayBorderRadius(double outerRadius) => BorderRadius.all(
+  Radius.circular(
+    min(outerRadius, max(kMinNestedRadius, outerRadius - kOverlayPadding)),
+  ),
 );
+
+/// Reads the corner radius out of a [ShapeBorder], if it exposes one.
+///
+/// Returns null for shapes without a rectangular radius (circles, stadium
+/// shapes, custom painters) so callers can fall back rather than silently
+/// inheriting a wrong value.
+double? _radiusOf(ShapeBorder shape) {
+  if (shape is RoundedRectangleBorder) {
+    return _uniform(shape.borderRadius as BorderRadius).topLeft.x;
+  }
+  if (shape is BeveledRectangleBorder) {
+    return _uniform(shape.borderRadius as BorderRadius).topLeft.x;
+  }
+  return null;
+}
+
+/// Collapses a [BorderRadius] to one uniform value.
+///
+/// Every surface this editor draws is rounded on all four corners, so a
+/// per-corner radius could only reintroduce the mismatched shapes this scale
+/// exists to prevent. The smallest corner wins, so a partially rounded shape
+/// can never exceed the shared outer radius.
+BorderRadius _uniform(BorderRadiusGeometry radius) {
+  if (radius is BorderRadius) {
+    final BorderRadius resolved = radius;
+    final double smallest = <double>[
+      resolved.topLeft.x,
+      resolved.topRight.x,
+      resolved.bottomLeft.x,
+      resolved.bottomRight.x,
+    ].reduce(min);
+    return BorderRadius.circular(smallest);
+  }
+  return BorderRadius.zero;
+}
+
 const String _wordCharPattern =
     r'[\w\u0600-\u06FF\u08A0-\u08FF\u0590-\u05FF'
     r'\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]';
@@ -154,17 +499,54 @@ class _CodeForgeContextMenuLayoutDelegate extends SingleChildLayoutDelegate {
 ///   ),
 /// )
 /// ```
+
+/// A highly customizable code editor widget for Flutter.
+///
+/// [CodeForge] provides a feature-rich code editing experience with support for:
+/// - Syntax highlighting for multiple languages
+/// - Code folding
+/// - Line numbers and gutter
+/// - Auto-indentation and bracket matching
+/// - LSP (Language Server Protocol) integration
+/// - AI code completion
+/// - Undo/redo functionality
+/// - Search highlighting
+///
+/// Example:
+/// ```dart
+/// final controller = CodeForgeController();
+///
+/// CodeForge(
+///   controller: controller,
+///   language: langDart,
+///   enableFolding: true,
+///   enableGutter: true,
+///   textStyle: TextStyle(
+///     fontFamily: 'JetBrains Mono',
+///     fontSize: 14,
+///   ),
+/// )
+/// ```
 class CodeForge extends StatefulWidget {
+  /// Default outer border radius for every floating overlay (hover, signature
+  /// help, documentation, completion and code-action popups).
+  ///
+  /// This is the single value that keeps all editor popups consistent with one
+  /// another. Anything nested inside a popup is derived from it as
+  /// `outer - kOverlayPadding`, so nested arcs stay concentric.
+  static BorderRadius get defaultOverlayBorderRadius =>
+      BorderRadius.circular(kDefaultOverlayOuterRadius);
+
   /// Default border radius for fenced Markdown code blocks in LSP popups.
-  static const BorderRadius defaultMarkdownCodeBlockBorderRadius =
-      _overlayInnerBorderRadius;
+  ///
+  /// Derived from [defaultOverlayBorderRadius] so a code block nested in a
+  /// popup always has a smaller radius than the popup holding it.
+  static BorderRadius get defaultMarkdownCodeBlockBorderRadius =>
+      nestedOverlayBorderRadius(kDefaultOverlayOuterRadius);
 
   /// Default outer border radius for LSP hover and documentation popups.
-  ///
-  /// The extra 8 pixels account for the popup padding around the default code
-  /// block, keeping the two rounded surfaces concentric.
-  static const BorderRadius defaultHoverDetailsBorderRadius =
-      _overlayOuterBorderRadius;
+  static BorderRadius get defaultHoverDetailsBorderRadius =>
+      defaultOverlayBorderRadius;
 
   /// The controller for managing the editor's text content and selection.
   ///
@@ -278,11 +660,25 @@ class CodeForge extends StatefulWidget {
   /// Styling options for hover documentation popup.
   final HoverDetailsStyle? hoverDetailsStyle;
 
+  /// Outer corner radius for every floating overlay this editor shows: hover,
+  /// signature help, documentation, completion and code-action popups.
+  ///
+  /// All of them share this one radius so the editor never mixes corner shapes.
+  /// Surfaces nested inside an overlay derive their radius as
+  /// `overlayBorderRadius.topLeft.x - kOverlayPadding`, keeping the two arcs
+  /// concentric.
+  ///
+  /// When null, [defaultOverlayBorderRadius] is used, or the radius of
+  /// [hoverDetailsStyle]/[suggestionStyle] when either of those is supplied
+  /// without this parameter.
+  final BorderRadius? overlayBorderRadius;
+
   /// Border radius for fenced Markdown code blocks in LSP tooltips.
   ///
-  /// Defaults to an 8 pixel radius. Use [BorderRadius.zero] for square
-  /// corners.
-  final BorderRadius markdownCodeBlockBorderRadius;
+  /// Defaults to the popup radius minus [kOverlayPadding], so a code block
+  /// nested in a popup always has a smaller radius than the popup itself. Use
+  /// [BorderRadius.zero] for square corners.
+  final BorderRadius? markdownCodeBlockBorderRadius;
 
   /// Styling options for search match highlighting.
   final MatchHighlightStyle? matchHighlightStyle;
@@ -443,7 +839,8 @@ class CodeForge extends StatefulWidget {
     this.ghostTextStyle,
     this.suggestionStyle,
     this.hoverDetailsStyle,
-    this.markdownCodeBlockBorderRadius = defaultMarkdownCodeBlockBorderRadius,
+    this.overlayBorderRadius,
+    this.markdownCodeBlockBorderRadius,
     this.matchHighlightStyle,
     this.extraLanguages = const [],
     this.finderBuilder,
@@ -454,9 +851,50 @@ class CodeForge extends StatefulWidget {
   State<CodeForge> createState() => _CodeForgeState();
 }
 
+/// Suppresses the platform scrollbar that Flutter injects into every vertical
+/// scrollable on desktop.
+///
+/// [ScrollBehavior.buildScrollbar] wraps each vertical [Scrollable] in a
+/// [Scrollbar] on Windows, macOS and Linux. That injected thumb only fades in
+/// while the view is scrolling and uses a rounded (stadium) shape, so a popup
+/// that draws its own always-on rectangular [RawScrollbar] ends up with two
+/// thumbs stacked on the same edge: the popup's own one at rest, plus the
+/// injected one on top of it for as long as scrolling lasts.
+///
+/// Every popup here that scrolls supplies its own [RawScrollbar] so the thumb
+/// is styled with the editor theme, which makes the automatic one only ever
+/// a duplicate. This widget turns it off for a subtree without disturbing
+/// the app-wide scroll behavior.
+class PopupScrollConfiguration extends StatelessWidget {
+  const PopupScrollConfiguration({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: child,
+    );
+  }
+}
+
 class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final ScrollController _hscrollController, _vscrollController;
   late final CodeForgeController _controller;
+
+  /// Text color shared by every Markdown popup (hover, signature help,
+  /// and completion details).
+  ///
+  /// The popup body already uses this, so headings take it too instead of
+  /// the white that `markdown_widget`'s dark config hardcodes. See
+  /// [overlayHeadingConfigs] for why that white cannot be overridden from
+  /// the paragraph style.
+  Color get _overlayForeground =>
+      _hoverDetailsStyle.textStyle.color ??
+      _editorTheme['root']?.color ??
+      Colors.grey[400]!;
+
   late final FocusNode _focusNode;
   late final AnimationController _caretBlinkController;
   late final AnimationController _lineHighlightController;
@@ -466,6 +904,17 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final GutterStyle _gutterStyle;
   late final SuggestionStyle _suggestionStyle;
   late final HoverDetailsStyle _hoverDetailsStyle;
+  late final BorderRadius _overlayBorderRadius;
+
+  /// Radius for a full-bleed row inside a popup list.
+
+  /// Zero by design: a row spans the popup card edge to edge, so the card
+  /// supplies the corner through its own clip (`Clip.antiAlias`). A radius on
+  /// the row itself can only ever disagree with the card border -- derived as
+  /// `outer - kOverlayPadding` it drew an arc visibly tighter than the card
+  /// corner, and reusing the full outer radius turned a 24 pixel row into a
+  /// stadium notched at its middle corners.
+  static const BorderRadius _overlayRowBorderRadius = BorderRadius.zero;
   late final ScrollbarDecoration _scrollbarDecoration;
   late final ValueNotifier<List<dynamic>?> _suggestionNotifier;
   late final ValueNotifier<(Offset, Map<String, int>)?> _hoverNotifier;
@@ -514,10 +963,14 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   Timer? _hoverTimer, _semanticTokenTimer, _hoverRequestTimer;
   String? _activeHoverKey;
   ({String key, Map<String, int> lineChar})? _queuedHoverRequest;
+  final _modifierKeysObserver = EditorModifierKeysObserver();
 
   @override
   void initState() {
     super.initState();
+    // Keep the engine-backed Alt state current so a lost key-up cannot make
+    // every later click in this surface look like an alt-click.
+    _modifierKeysObserver.attach();
     _controller = widget.controller ?? CodeForgeController();
 
     _controller.getFloatingCursorStartPosition = () =>
@@ -536,6 +989,21 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         widget.horizontalScrollController ?? ScrollController();
     _vscrollController = widget.verticalScrollController ?? ScrollController();
     _editorTheme = widget.editorTheme ?? lightfairTheme;
+    // One outer radius drives every floating overlay this editor shows, and
+    // anything nested inside one of them is derived from it. Resolution order:
+    // an explicit [CodeForge.overlayBorderRadius] wins, then the radius of a
+    // caller-supplied style, then the package default. Deriving the code block
+    // from the same value is what keeps a nested corner from ever growing
+    // larger than the popup that contains it. Full-bleed popup rows take their
+    // corner from the card's clip instead; see [_overlayRowBorderRadius].
+    final double resolvedOuter =
+        widget.overlayBorderRadius?.topLeft.x ??
+        _radiusOf(
+          (widget.hoverDetailsStyle ?? widget.suggestionStyle)?.shape ??
+              const RoundedRectangleBorder(),
+        ) ??
+        kDefaultOverlayOuterRadius;
+    _overlayBorderRadius = BorderRadius.circular(resolvedOuter);
     _language = widget.language ?? Mode();
     _suggestionNotifier = _controller.suggestionsNotifier;
     _prevSnippetTextLength = _controller.text.length;
@@ -658,7 +1126,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
             color: _editorTheme['root']!.color?.withAlpha(180),
           ),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: _overlayBorderRadius,
             side: BorderSide(
               color:
                   _editorTheme['root']!.color?.withAlpha(50) ??
@@ -672,7 +1140,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         widget.hoverDetailsStyle ??
         HoverDetailsStyle(
           shape: RoundedRectangleBorder(
-            borderRadius: CodeForge.defaultHoverDetailsBorderRadius,
+            borderRadius: _overlayBorderRadius,
             side: BorderSide(
               color: _editorTheme['root']!.color ?? Colors.grey[400]!,
               width: 0.2,
@@ -1241,6 +1709,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _modifierKeysObserver.detach();
     _controller.removeListener(_controllerListener);
     _controller.semanticTokens.removeListener(_semanticTokensListener);
     _vscrollController.removeListener(_scrollbarLineNumberListener);
@@ -1382,7 +1851,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
             toolbarBuilder: (BuildContext context, Widget child) {
               return Container(
                 decoration: BoxDecoration(
-                  borderRadius: _overlayOuterBorderRadius,
+                  borderRadius: _overlayBorderRadius,
                   color: _hoverDetailsStyle.backgroundColor,
                 ),
                 clipBehavior: Clip.antiAlias,
@@ -1534,6 +2003,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
               elevation: 8,
               color: _editorTheme['root']?.backgroundColor ?? Colors.grey[900],
               shape: _hoverDetailsStyle.shape,
+              clipBehavior: Clip.antiAlias,
               child: IntrinsicWidth(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -2223,8 +2693,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .instance,
                                                         )) {
                                                       final isAlt =
-                                                          HardwareKeyboard
-                                                              .instance
+                                                          editorModifierKeys
                                                               .isAltPressed;
                                                       _findController.isActive =
                                                           true;
@@ -2621,8 +3090,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                             HardwareKeyboard
                                                                 .instance
                                                                 .isMetaPressed) &&
-                                                        HardwareKeyboard
-                                                            .instance
+                                                        editorModifierKeys
                                                             .isAltPressed;
 
                                                     if (event is KeyDownEvent &&
@@ -2647,8 +3115,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               HardwareKeyboard
                                                                   .instance
                                                                   .isMetaPressed) &&
-                                                          HardwareKeyboard
-                                                              .instance
+                                                          editorModifierKeys
                                                               .isAltPressed;
                                                       if (!isStillCtrlAlt) {
                                                         _controller
@@ -2662,8 +3129,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                         event
                                                             is KeyRepeatEvent) {
                                                       final isAltPressed =
-                                                          HardwareKeyboard
-                                                              .instance
+                                                          editorModifierKeys
                                                               .isAltPressed;
                                                       final isShiftPressed =
                                                           HardwareKeyboard
@@ -3403,106 +3869,63 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                   child: Card(
                                     color: _hoverDetailsStyle.backgroundColor,
                                     shape: _hoverDetailsStyle.shape,
-                                    child: RawScrollbar(
-                                      interactive: true,
-                                      controller: sigScrollCtrl,
-                                      thumbVisibility: true,
-                                      thumbColor: _editorTheme['root']!.color!
-                                          .withAlpha(100),
-                                      child: SingleChildScrollView(
+                                    clipBehavior: Clip.antiAlias,
+                                    child: PopupScrollConfiguration(
+                                      child: RawScrollbar(
+                                        interactive: true,
                                         controller: sigScrollCtrl,
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Padding(
-                                              padding: const EdgeInsets.only(
-                                                top: 7,
-                                                left: 6.5,
-                                              ),
-                                              child: RichText(
-                                                text: (() {
-                                                  final label = signature.label;
-                                                  final activeParamIndex =
-                                                      signature.activeParameter;
+                                        thumbVisibility: true,
+                                        thumbColor: _editorTheme['root']!.color!
+                                            .withAlpha(100),
+                                        child: SingleChildScrollView(
+                                          controller: sigScrollCtrl,
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  top: 7,
+                                                  left: 6.5,
+                                                ),
+                                                child: RichText(
+                                                  text: (() {
+                                                    final label =
+                                                        signature.label;
+                                                    final activeParamIndex =
+                                                        signature
+                                                            .activeParameter;
 
-                                                  if (activeParamIndex < 0 ||
-                                                      activeParamIndex >=
-                                                          signature
-                                                              .parameters
-                                                              .length) {
-                                                    return TextSpan(
-                                                      text: label,
-                                                    );
-                                                  }
+                                                    if (activeParamIndex < 0 ||
+                                                        activeParamIndex >=
+                                                            signature
+                                                                .parameters
+                                                                .length) {
+                                                      return TextSpan(
+                                                        text: label,
+                                                      );
+                                                    }
 
-                                                  final paramLabel = signature
-                                                      .parameters[activeParamIndex]['label'];
+                                                    final paramLabel = signature
+                                                        .parameters[activeParamIndex]['label'];
 
-                                                  if (paramLabel is List &&
-                                                      paramLabel.length >= 2) {
-                                                    final range = paramLabel
-                                                        .cast<int>();
-                                                    final firstPart = label
-                                                        .substring(0, range[0]);
-                                                    final highlightPart = label
-                                                        .substring(
-                                                          range[0],
-                                                          range[1],
-                                                        );
-                                                    final finalPart = label
-                                                        .substring(range[1]);
-
-                                                    return TextSpan(
-                                                      style: TextStyle(
-                                                        fontSize:
-                                                            (widget
-                                                                    .textStyle
-                                                                    ?.fontSize ??
-                                                                15) +
-                                                            1.75,
-                                                        color:
-                                                            _editorTheme['root']
-                                                                ?.color,
-                                                      ),
-                                                      children: [
-                                                        TextSpan(
-                                                          text: firstPart,
-                                                        ),
-                                                        TextSpan(
-                                                          text: highlightPart,
-                                                          style: TextStyle(
-                                                            fontWeight:
-                                                                FontWeight.bold,
-                                                            color: Colors.blue,
-                                                          ),
-                                                        ),
-                                                        TextSpan(
-                                                          text: finalPart,
-                                                        ),
-                                                      ],
-                                                    );
-                                                  } else if (paramLabel
-                                                      is String) {
-                                                    final paramText =
-                                                        paramLabel;
-                                                    final paramIndex = label
-                                                        .indexOf(paramText);
-
-                                                    if (paramIndex >= 0) {
+                                                    if (paramLabel is List &&
+                                                        paramLabel.length >=
+                                                            2) {
+                                                      final range = paramLabel
+                                                          .cast<int>();
                                                       final firstPart = label
                                                           .substring(
                                                             0,
-                                                            paramIndex,
+                                                            range[0],
                                                           );
                                                       final highlightPart =
-                                                          paramText;
-                                                      final finalPart = label
-                                                          .substring(
-                                                            paramIndex +
-                                                                paramText
-                                                                    .length,
+                                                          label.substring(
+                                                            range[0],
+                                                            range[1],
                                                           );
+                                                      final finalPart = label
+                                                          .substring(range[1]);
 
                                                       return TextSpan(
                                                         style: TextStyle(
@@ -3535,87 +3958,135 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           ),
                                                         ],
                                                       );
-                                                    }
-                                                  }
+                                                    } else if (paramLabel
+                                                        is String) {
+                                                      final paramText =
+                                                          paramLabel;
+                                                      final paramIndex = label
+                                                          .indexOf(paramText);
 
-                                                  return TextSpan(
-                                                    text: label,
-                                                    style: TextStyle(
-                                                      fontSize:
-                                                          (widget
-                                                                  .textStyle
-                                                                  ?.fontSize ??
-                                                              15) +
-                                                          1.75,
-                                                      color:
-                                                          _editorTheme['root']
-                                                              ?.color,
-                                                    ),
-                                                  );
-                                                })(),
-                                              ),
-                                            ),
-                                            Divider(
-                                              color:
-                                                  signature
-                                                      .documentation
-                                                      .isNotEmpty
-                                                  ? _editorTheme['root']?.color
-                                                  : Colors.transparent,
-                                              thickness: 0.5,
-                                            ),
-                                            Padding(
-                                              padding: const EdgeInsets.only(
-                                                left: 6.5,
-                                              ),
-                                              child: MarkdownBlock(
-                                                data: signature.documentation,
-                                                config: MarkdownConfig.darkConfig.copy(
-                                                  configs: [
-                                                    PConfig(
-                                                      textStyle:
-                                                          _hoverDetailsStyle
-                                                              .textStyle,
-                                                    ),
-                                                    PreConfig(
-                                                      language:
-                                                          _controller
-                                                              .lspConfig
-                                                              ?.languageId
-                                                              .toLowerCase() ??
-                                                          'dart',
-                                                      theme: _editorTheme,
-                                                      textStyle: TextStyle(
+                                                      if (paramIndex >= 0) {
+                                                        final firstPart = label
+                                                            .substring(
+                                                              0,
+                                                              paramIndex,
+                                                            );
+                                                        final highlightPart =
+                                                            paramText;
+                                                        final finalPart = label
+                                                            .substring(
+                                                              paramIndex +
+                                                                  paramText
+                                                                      .length,
+                                                            );
+
+                                                        return TextSpan(
+                                                          style: TextStyle(
+                                                            fontSize:
+                                                                (widget
+                                                                        .textStyle
+                                                                        ?.fontSize ??
+                                                                    15) +
+                                                                1.75,
+                                                            color:
+                                                                _editorTheme['root']
+                                                                    ?.color,
+                                                          ),
+                                                          children: [
+                                                            TextSpan(
+                                                              text: firstPart,
+                                                            ),
+                                                            TextSpan(
+                                                              text:
+                                                                  highlightPart,
+                                                              style: TextStyle(
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                                color:
+                                                                    Colors.blue,
+                                                              ),
+                                                            ),
+                                                            TextSpan(
+                                                              text: finalPart,
+                                                            ),
+                                                          ],
+                                                        );
+                                                      }
+                                                    }
+
+                                                    return TextSpan(
+                                                      text: label,
+                                                      style: TextStyle(
                                                         fontSize:
-                                                            _hoverDetailsStyle
-                                                                .textStyle
-                                                                .fontSize,
-                                                      ),
-                                                      styleNotMatched: TextStyle(
+                                                            (widget
+                                                                    .textStyle
+                                                                    ?.fontSize ??
+                                                                15) +
+                                                            1.75,
                                                         color:
-                                                            _editorTheme['root']!
-                                                                .color,
+                                                            _editorTheme['root']
+                                                                ?.color,
                                                       ),
-                                                      decoration: BoxDecoration(
-                                                        color:
-                                                            _editorTheme['root']!
-                                                                .backgroundColor!,
-                                                        borderRadius: widget
-                                                            .markdownCodeBlockBorderRadius,
-                                                        border: Border.all(
-                                                          width: 0.2,
-                                                          color:
-                                                              _editorTheme['root']!
-                                                                  .color ??
-                                                              Colors.grey,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
+                                                    );
+                                                  })(),
                                                 ),
                                               ),
-                                            ),
-                                          ],
+                                              Divider(
+                                                color:
+                                                    signature
+                                                        .documentation
+                                                        .isNotEmpty
+                                                    ? _editorTheme['root']
+                                                          ?.color
+                                                    : Colors.transparent,
+                                                thickness: 0.5,
+                                              ),
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  left: 6.5,
+                                                ),
+                                                child: MarkdownBlock(
+                                                  data: signature.documentation,
+                                                  config: MarkdownConfig.darkConfig.copy(
+                                                    configs: [
+                                                      ...overlayHeadingConfigs(
+                                                        foreground:
+                                                            _overlayForeground,
+                                                      ),
+                                                      PConfig(
+                                                        textStyle:
+                                                            _hoverDetailsStyle
+                                                                .textStyle,
+                                                      ),
+                                                      overlayCodeBlockConfig(
+                                                        source: signature
+                                                            .documentation,
+                                                        outer:
+                                                            _overlayBorderRadius,
+                                                        gap: 6.5,
+                                                        theme: _editorTheme,
+                                                        textStyle:
+                                                            _hoverDetailsStyle
+                                                                .textStyle,
+                                                        styleNotMatched: TextStyle(
+                                                          color:
+                                                              _editorTheme['root']!
+                                                                  .color,
+                                                        ),
+                                                        language:
+                                                            _controller
+                                                                .lspConfig
+                                                                ?.languageId
+                                                                .toLowerCase() ??
+                                                            'dart',
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ),
                                     ),
@@ -3720,104 +4191,137 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                             color: _suggestionStyle
                                                 .backgroundColor,
                                             margin: EdgeInsets.zero,
-                                            child: RawScrollbar(
-                                              thumbVisibility: true,
-                                              thumbColor: _editorTheme['root']!
-                                                  .color!
-                                                  .withAlpha(80),
-                                              interactive: true,
-                                              controller: _suggScrollController,
-                                              child: ListView.builder(
-                                                itemExtent:
-                                                    _suggestionStyle
-                                                        .itemHeight ??
-                                                    24.0,
+                                            clipBehavior: Clip.antiAlias,
+                                            child: PopupScrollConfiguration(
+                                              child: RawScrollbar(
+                                                thumbVisibility: true,
+                                                thumbColor:
+                                                    _editorTheme['root']!.color!
+                                                        .withAlpha(80),
+                                                interactive: true,
                                                 controller:
                                                     _suggScrollController,
-                                                padding: EdgeInsets.zero,
-                                                shrinkWrap: true,
-                                                itemCount: sugg.length,
-                                                itemBuilder: (_, indx) {
-                                                  final item = sugg[indx];
-                                                  if ((item is LspCompletion) &&
-                                                      (indx == _sugSelIndex ||
-                                                          (_isMobile &&
-                                                              _isMobileSuggActive))) {
-                                                    final key =
-                                                        _getSuggestionCacheKey(
-                                                          item,
-                                                        );
-                                                    if (!_suggestionDetailsCache
-                                                            .containsKey(key) &&
-                                                        _controller.lspConfig !=
-                                                            null) {
-                                                      (() async {
-                                                        try {
-                                                          final data = await _controller
-                                                              .lspConfig!
-                                                              .resolveCompletionItem(
-                                                                item.completionItem,
-                                                              );
-                                                          final mdText =
-                                                              "${data['detail'] ?? ''}\n${(() {
-                                                                final doc = data['documentation'];
-                                                                if (doc == null) {
-                                                                  return '';
-                                                                }
-
-                                                                if (doc is Map<String, dynamic> && doc.containsKey('value')) {
-                                                                  return doc['value'];
-                                                                }
-
-                                                                return doc;
-                                                              })()}";
-                                                          if (!mounted) return;
-                                                          setState(() {
-                                                            final edits =
-                                                                data['additionalTextEdits'];
-                                                            if (edits is List) {
-                                                              try {
-                                                                _extraText = edits
-                                                                    .map(
-                                                                      (e) =>
-                                                                          Map<
-                                                                            String,
-                                                                            dynamic
-                                                                          >.from(
-                                                                            e
-                                                                                as Map,
-                                                                          ),
-                                                                    )
-                                                                    .toList();
-                                                              } catch (_) {
-                                                                _extraText = edits
-                                                                    .cast<
-                                                                      Map<
-                                                                        String,
-                                                                        dynamic
-                                                                      >
-                                                                    >();
-                                                              }
-                                                            } else {
-                                                              _extraText = [];
-                                                            }
-                                                            _suggestionDetailsCache[key] =
-                                                                mdText;
-                                                            _selectedSuggestionMd =
-                                                                mdText;
-                                                          });
-                                                        } catch (e) {
-                                                          debugPrint(
-                                                            "Completion Resolve failed: ${e.toString()}",
+                                                child: ListView.builder(
+                                                  itemExtent:
+                                                      _suggestionStyle
+                                                          .itemHeight ??
+                                                      24.0,
+                                                  controller:
+                                                      _suggScrollController,
+                                                  padding: EdgeInsets.zero,
+                                                  shrinkWrap: true,
+                                                  itemCount: sugg.length,
+                                                  itemBuilder: (_, indx) {
+                                                    final item = sugg[indx];
+                                                    if ((item
+                                                            is LspCompletion) &&
+                                                        (indx == _sugSelIndex ||
+                                                            (_isMobile &&
+                                                                _isMobileSuggActive))) {
+                                                      final key =
+                                                          _getSuggestionCacheKey(
+                                                            item,
                                                           );
+                                                      if (!_suggestionDetailsCache
+                                                              .containsKey(
+                                                                key,
+                                                              ) &&
+                                                          _controller
+                                                                  .lspConfig !=
+                                                              null) {
+                                                        (() async {
+                                                          try {
+                                                            final data =
+                                                                await _controller
+                                                                    .lspConfig!
+                                                                    .resolveCompletionItem(
+                                                                      item.completionItem,
+                                                                    );
+                                                            final mdText =
+                                                                "${data['detail'] ?? ''}\n${(() {
+                                                                  final doc = data['documentation'];
+                                                                  if (doc == null) {
+                                                                    return '';
+                                                                  }
+
+                                                                  if (doc is Map<String, dynamic> && doc.containsKey('value')) {
+                                                                    return doc['value'];
+                                                                  }
+
+                                                                  return doc;
+                                                                })()}";
+                                                            if (!mounted)
+                                                              return;
+                                                            setState(() {
+                                                              final edits =
+                                                                  data['additionalTextEdits'];
+                                                              if (edits
+                                                                  is List) {
+                                                                try {
+                                                                  _extraText = edits
+                                                                      .map(
+                                                                        (e) =>
+                                                                            Map<
+                                                                              String,
+                                                                              dynamic
+                                                                            >.from(
+                                                                              e
+                                                                                  as Map,
+                                                                            ),
+                                                                      )
+                                                                      .toList();
+                                                                } catch (_) {
+                                                                  _extraText = edits
+                                                                      .cast<
+                                                                        Map<
+                                                                          String,
+                                                                          dynamic
+                                                                        >
+                                                                      >();
+                                                                }
+                                                              } else {
+                                                                _extraText = [];
+                                                              }
+                                                              _suggestionDetailsCache[key] =
+                                                                  mdText;
+                                                              _selectedSuggestionMd =
+                                                                  mdText;
+                                                            });
+                                                          } catch (e) {
+                                                            debugPrint(
+                                                              "Completion Resolve failed: ${e.toString()}",
+                                                            );
+                                                          }
+                                                        })();
+                                                      } else if (_suggestionDetailsCache
+                                                          .containsKey(key)) {
+                                                        final cached =
+                                                            _suggestionDetailsCache[key];
+                                                        if (_selectedSuggestionMd !=
+                                                            cached) {
+                                                          WidgetsBinding
+                                                              .instance
+                                                              .addPostFrameCallback((
+                                                                _,
+                                                              ) {
+                                                                if (!mounted)
+                                                                  return;
+                                                                setState(() {
+                                                                  _selectedSuggestionMd =
+                                                                      cached;
+                                                                });
+                                                              });
                                                         }
-                                                      })();
-                                                    } else if (_suggestionDetailsCache
-                                                        .containsKey(key)) {
-                                                      final cached =
-                                                          _suggestionDetailsCache[key];
+                                                      }
+                                                    } else if ((item
+                                                                is! LspCompletion &&
+                                                            widget
+                                                                .enableLocalSuggestions) &&
+                                                        (indx == _sugSelIndex ||
+                                                            (_isMobile &&
+                                                                _isMobileSuggActive))) {
                                                       if (_selectedSuggestionMd !=
-                                                          cached) {
+                                                          null) {
                                                         WidgetsBinding.instance
                                                             .addPostFrameCallback((
                                                               _,
@@ -3826,225 +4330,128 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                 return;
                                                               setState(() {
                                                                 _selectedSuggestionMd =
-                                                                    cached;
+                                                                    null;
                                                               });
                                                             });
                                                       }
                                                     }
-                                                  } else if ((item
-                                                              is! LspCompletion &&
-                                                          widget
-                                                              .enableLocalSuggestions) &&
-                                                      (indx == _sugSelIndex ||
-                                                          (_isMobile &&
-                                                              _isMobileSuggActive))) {
-                                                    if (_selectedSuggestionMd !=
-                                                        null) {
-                                                      WidgetsBinding.instance
-                                                          .addPostFrameCallback((
-                                                            _,
-                                                          ) {
-                                                            if (!mounted)
-                                                              return;
-                                                            setState(() {
-                                                              _selectedSuggestionMd =
-                                                                  null;
-                                                            });
-                                                          });
-                                                    }
-                                                  }
 
-                                                  return Container(
-                                                    height: _suggestionStyle
-                                                        .itemHeight,
-                                                    padding:
-                                                        EdgeInsets.symmetric(
-                                                          horizontal: 8,
-                                                          vertical: 2,
-                                                        ),
-                                                    decoration: BoxDecoration(
-                                                      color:
-                                                          ((!_isMobile &&
-                                                                  (indx ==
-                                                                      _sugSelIndex)) ||
-                                                              _controller
-                                                                      .currentlySelectedSuggestion ==
-                                                                  indx)
-                                                          ? (_suggestionStyle
-                                                                    .selectedBackgroundColor ??
-                                                                _suggestionStyle
-                                                                    .focusColor)
-                                                          : Colors.transparent,
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            3,
-                                                          ),
-                                                    ),
-                                                    child: InkWell(
-                                                      canRequestFocus: false,
-                                                      hoverColor:
-                                                          _suggestionStyle
-                                                              .hoverColor,
-                                                      focusColor:
-                                                          _suggestionStyle
-                                                              .focusColor,
-                                                      splashColor:
-                                                          _suggestionStyle
-                                                              .splashColor,
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            3,
-                                                          ),
-                                                      onTap: () {
-                                                        if (mounted) {
-                                                          setState(() {
-                                                            if (_isMobileSuggActive) {
-                                                              _controller
-                                                                      .currentlySelectedSuggestion =
-                                                                  indx;
-                                                            } else {
-                                                              _sugSelIndex =
-                                                                  indx;
-                                                            }
-                                                            if (item
-                                                                is _SnippetSuggestion) {
-                                                              _insertSnippetWithCursors(
-                                                                item,
-                                                              );
-                                                              _isInjectingSnippets =
-                                                                  true;
-                                                              _suggestionNotifier
-                                                                      .value =
-                                                                  null;
-                                                              _isInjectingSnippets =
-                                                                  false;
-                                                            } else {
-                                                              final text =
-                                                                  item
-                                                                      is LspCompletion
-                                                                  ? item.label
-                                                                  : item
-                                                                        as String;
-                                                              _controller
-                                                                  .insertAtCurrentCursor(
-                                                                    text,
-                                                                    replaceTypedChar:
-                                                                        true,
-                                                                  );
-                                                              if (_extraText
-                                                                  .isNotEmpty) {
+                                                    return Container(
+                                                      height: _suggestionStyle
+                                                          .itemHeight,
+                                                      // No padding on this container on purpose: it paints the
+                                                      // selected background while the InkWell inside it paints the
+                                                      // hover fill, and padding here would inset the hover ink so it
+                                                      // reads narrower than the selected background on the same row.
+                                                      // The content keeps its inset from the Padding inside the
+                                                      // InkWell, so the ink stays full-bleed and the card clip rounds it.
+                                                      decoration: BoxDecoration(
+                                                        color:
+                                                            ((!_isMobile &&
+                                                                    (indx ==
+                                                                        _sugSelIndex)) ||
                                                                 _controller
-                                                                    .applyWorkspaceEdit(
-                                                                      _extraText,
-                                                                    );
-                                                              }
-                                                              _suggestionNotifier
-                                                                      .value =
-                                                                  null;
-                                                            }
-                                                            _isSignatureInvoked =
-                                                                true;
-                                                            _controller
-                                                                .callSignatureHelp();
-                                                          });
-                                                        }
-                                                      },
-                                                      child: Row(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .center,
-                                                        children: [
-                                                          if (item
-                                                              is LspCompletion) ...[
-                                                            item.icon,
-                                                            const SizedBox(
-                                                              width: 8,
-                                                            ),
-                                                            Expanded(
-                                                              flex: 3,
-                                                              child: Text(
-                                                                item.label,
-                                                                style:
-                                                                    _suggestionStyle.labelTextStyle?.copyWith(
-                                                                      color:
-                                                                          ((!_isMobile &&
-                                                                                  (indx ==
-                                                                                      _sugSelIndex)) ||
-                                                                              _controller.currentlySelectedSuggestion ==
-                                                                                  indx)
-                                                                          ? Colors.white
-                                                                          : _suggestionStyle.labelTextStyle?.color,
-                                                                    ) ??
-                                                                    _suggestionStyle.textStyle.copyWith(
-                                                                      color:
-                                                                          ((!_isMobile &&
-                                                                                  (indx ==
-                                                                                      _sugSelIndex)) ||
-                                                                              _controller.currentlySelectedSuggestion ==
-                                                                                  indx)
-                                                                          ? Colors.white
-                                                                          : _suggestionStyle.textStyle.color,
-                                                                    ),
-                                                                overflow:
-                                                                    TextOverflow
-                                                                        .ellipsis,
-                                                              ),
-                                                            ),
-                                                            if (item.importUri?[0] !=
-                                                                null) ...[
-                                                              const SizedBox(
-                                                                width: 8,
-                                                              ),
-                                                              Expanded(
-                                                                flex: 2,
-                                                                child: Text(
-                                                                  item.importUri![0],
-                                                                  style:
-                                                                      _suggestionStyle
-                                                                          .detailTextStyle ??
-                                                                      _suggestionStyle.textStyle.copyWith(
-                                                                        color: _suggestionStyle
-                                                                            .textStyle
-                                                                            .color
-                                                                            ?.withAlpha(
-                                                                              150,
-                                                                            ),
-                                                                      ),
-                                                                  overflow:
-                                                                      TextOverflow
-                                                                          .ellipsis,
-                                                                  textAlign:
-                                                                      TextAlign
-                                                                          .right,
-                                                                ),
-                                                              ),
-                                                            ],
-                                                          ],
-                                                          if (item
-                                                              is _SnippetSuggestion) ...[
-                                                            Icon(
-                                                              completionItemIcons[CompletionItemType
-                                                                      .snippet]!
-                                                                  .icon,
-                                                              color:
-                                                                  completionItemIcons[CompletionItemType
-                                                                          .snippet]!
-                                                                      .color,
-                                                              size:
+                                                                        .currentlySelectedSuggestion ==
+                                                                    indx)
+                                                            ? (_suggestionStyle
+                                                                      .selectedBackgroundColor ??
                                                                   _suggestionStyle
-                                                                      .iconSize ??
-                                                                  16.0,
-                                                            ),
-                                                            const SizedBox(
-                                                              width: 8,
-                                                            ),
-                                                            Expanded(
-                                                              child: Text(
-                                                                item.label,
-                                                                style:
-                                                                    (_suggestionStyle.labelTextStyle ??
-                                                                            _suggestionStyle.textStyle)
-                                                                        .copyWith(
+                                                                      .focusColor)
+                                                            : Colors
+                                                                  .transparent,
+                                                        borderRadius:
+                                                            _overlayRowBorderRadius,
+                                                      ),
+                                                      child: InkWell(
+                                                        canRequestFocus: false,
+                                                        hoverColor:
+                                                            _suggestionStyle
+                                                                .hoverColor,
+                                                        focusColor:
+                                                            _suggestionStyle
+                                                                .focusColor,
+                                                        splashColor:
+                                                            _suggestionStyle
+                                                                .splashColor,
+                                                        borderRadius:
+                                                            _overlayRowBorderRadius,
+                                                        onTap: () {
+                                                          if (mounted) {
+                                                            setState(() {
+                                                              if (_isMobileSuggActive) {
+                                                                _controller
+                                                                        .currentlySelectedSuggestion =
+                                                                    indx;
+                                                              } else {
+                                                                _sugSelIndex =
+                                                                    indx;
+                                                              }
+                                                              if (item
+                                                                  is _SnippetSuggestion) {
+                                                                _insertSnippetWithCursors(
+                                                                  item,
+                                                                );
+                                                                _isInjectingSnippets =
+                                                                    true;
+                                                                _suggestionNotifier
+                                                                        .value =
+                                                                    null;
+                                                                _isInjectingSnippets =
+                                                                    false;
+                                                              } else {
+                                                                final text =
+                                                                    item
+                                                                        is LspCompletion
+                                                                    ? item.label
+                                                                    : item
+                                                                          as String;
+                                                                _controller
+                                                                    .insertAtCurrentCursor(
+                                                                      text,
+                                                                      replaceTypedChar:
+                                                                          true,
+                                                                    );
+                                                                if (_extraText
+                                                                    .isNotEmpty) {
+                                                                  _controller
+                                                                      .applyWorkspaceEdit(
+                                                                        _extraText,
+                                                                      );
+                                                                }
+                                                                _suggestionNotifier
+                                                                        .value =
+                                                                    null;
+                                                              }
+                                                              _isSignatureInvoked =
+                                                                  true;
+                                                              _controller
+                                                                  .callSignatureHelp();
+                                                            });
+                                                          }
+                                                        },
+                                                        child: Padding(
+                                                          padding:
+                                                              const EdgeInsets.symmetric(
+                                                                horizontal: 8,
+                                                                vertical: 2,
+                                                              ),
+                                                          child: Row(
+                                                            crossAxisAlignment:
+                                                                CrossAxisAlignment
+                                                                    .center,
+                                                            children: [
+                                                              if (item
+                                                                  is LspCompletion) ...[
+                                                                item.icon,
+                                                                const SizedBox(
+                                                                  width: 8,
+                                                                ),
+                                                                Expanded(
+                                                                  flex: 3,
+                                                                  child: Text(
+                                                                    item.label,
+                                                                    style:
+                                                                        _suggestionStyle.labelTextStyle?.copyWith(
                                                                           color:
                                                                               ((!_isMobile &&
                                                                                       (indx ==
@@ -4052,35 +4459,114 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                                   _controller.currentlySelectedSuggestion ==
                                                                                       indx)
                                                                               ? Colors.white
-                                                                              : (_suggestionStyle.labelTextStyle ??
-                                                                                        _suggestionStyle.textStyle)
-                                                                                    .color,
+                                                                              : _suggestionStyle.labelTextStyle?.color,
+                                                                        ) ??
+                                                                        _suggestionStyle.textStyle.copyWith(
+                                                                          color:
+                                                                              ((!_isMobile &&
+                                                                                      (indx ==
+                                                                                          _sugSelIndex)) ||
+                                                                                  _controller.currentlySelectedSuggestion ==
+                                                                                      indx)
+                                                                              ? Colors.white
+                                                                              : _suggestionStyle.textStyle.color,
                                                                         ),
-                                                                overflow:
-                                                                    TextOverflow
-                                                                        .ellipsis,
-                                                              ),
-                                                            ),
-                                                          ],
-                                                          if (item is String)
-                                                            Expanded(
-                                                              child: Text(
-                                                                item,
-                                                                style:
-                                                                    _suggestionStyle
-                                                                        .labelTextStyle ??
-                                                                    _suggestionStyle
-                                                                        .textStyle,
-                                                                overflow:
-                                                                    TextOverflow
-                                                                        .ellipsis,
-                                                              ),
-                                                            ),
-                                                        ],
+                                                                    overflow:
+                                                                        TextOverflow
+                                                                            .ellipsis,
+                                                                  ),
+                                                                ),
+                                                                if (item.importUri?[0] !=
+                                                                    null) ...[
+                                                                  const SizedBox(
+                                                                    width: 8,
+                                                                  ),
+                                                                  Expanded(
+                                                                    flex: 2,
+                                                                    child: Text(
+                                                                      item.importUri![0],
+                                                                      style:
+                                                                          _suggestionStyle
+                                                                              .detailTextStyle ??
+                                                                          _suggestionStyle.textStyle.copyWith(
+                                                                            color: _suggestionStyle.textStyle.color?.withAlpha(
+                                                                              150,
+                                                                            ),
+                                                                          ),
+                                                                      overflow:
+                                                                          TextOverflow
+                                                                              .ellipsis,
+                                                                      textAlign:
+                                                                          TextAlign
+                                                                              .right,
+                                                                    ),
+                                                                  ),
+                                                                ],
+                                                              ],
+                                                              if (item
+                                                                  is _SnippetSuggestion) ...[
+                                                                Icon(
+                                                                  completionItemIcons[CompletionItemType
+                                                                          .snippet]!
+                                                                      .icon,
+                                                                  color:
+                                                                      completionItemIcons[CompletionItemType
+                                                                              .snippet]!
+                                                                          .color,
+                                                                  size:
+                                                                      _suggestionStyle
+                                                                          .iconSize ??
+                                                                      16.0,
+                                                                ),
+                                                                const SizedBox(
+                                                                  width: 8,
+                                                                ),
+                                                                Expanded(
+                                                                  child: Text(
+                                                                    item.label,
+                                                                    style:
+                                                                        (_suggestionStyle.labelTextStyle ??
+                                                                                _suggestionStyle.textStyle)
+                                                                            .copyWith(
+                                                                              color:
+                                                                                  ((!_isMobile &&
+                                                                                          (indx ==
+                                                                                              _sugSelIndex)) ||
+                                                                                      _controller.currentlySelectedSuggestion ==
+                                                                                          indx)
+                                                                                  ? Colors.white
+                                                                                  : (_suggestionStyle.labelTextStyle ??
+                                                                                            _suggestionStyle.textStyle)
+                                                                                        .color,
+                                                                            ),
+                                                                    overflow:
+                                                                        TextOverflow
+                                                                            .ellipsis,
+                                                                  ),
+                                                                ),
+                                                              ],
+                                                              if (item
+                                                                  is String)
+                                                                Expanded(
+                                                                  child: Text(
+                                                                    item,
+                                                                    style:
+                                                                        _suggestionStyle
+                                                                            .labelTextStyle ??
+                                                                        _suggestionStyle
+                                                                            .textStyle,
+                                                                    overflow:
+                                                                        TextOverflow
+                                                                            .ellipsis,
+                                                                  ),
+                                                                ),
+                                                            ],
+                                                          ),
+                                                        ),
                                                       ),
-                                                    ),
-                                                  );
-                                                },
+                                                    );
+                                                  },
+                                                ),
                                               ),
                                             ),
                                           ),
@@ -4163,72 +4649,68 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       .backgroundColor,
                                                   shape:
                                                       _hoverDetailsStyle.shape,
+                                                  clipBehavior: Clip.antiAlias,
                                                   child: Padding(
                                                     padding: EdgeInsets.all(
                                                       _selectedSuggestionMd!
                                                               .trim()
                                                               .isEmpty
                                                           ? 0
-                                                          : _overlayPadding,
+                                                          : kOverlayPadding,
                                                     ),
-                                                    child: RawScrollbar(
-                                                      interactive: true,
-                                                      controller:
-                                                          completionScrlCtrl,
-                                                      thumbVisibility: true,
-                                                      thumbColor:
-                                                          _editorTheme['root']!
-                                                              .color!
-                                                              .withAlpha(100),
-                                                      child: SingleChildScrollView(
+                                                    child: PopupScrollConfiguration(
+                                                      child: RawScrollbar(
+                                                        interactive: true,
                                                         controller:
                                                             completionScrlCtrl,
-                                                        child: MarkdownBlock(
-                                                          data:
-                                                              _selectedSuggestionMd!,
-                                                          config: MarkdownConfig.darkConfig.copy(
-                                                            configs: [
-                                                              PConfig(
-                                                                textStyle:
-                                                                    _hoverDetailsStyle
-                                                                        .textStyle,
-                                                              ),
-                                                              PreConfig(
-                                                                language:
-                                                                    _controller
-                                                                        .lspConfig
-                                                                        ?.languageId
-                                                                        .toLowerCase() ??
-                                                                    'dart',
-                                                                theme:
-                                                                    _editorTheme,
-                                                                textStyle: TextStyle(
-                                                                  fontSize: _hoverDetailsStyle
-                                                                      .textStyle
-                                                                      .fontSize,
+                                                        thumbVisibility: true,
+                                                        thumbColor:
+                                                            _editorTheme['root']!
+                                                                .color!
+                                                                .withAlpha(100),
+                                                        child: SingleChildScrollView(
+                                                          controller:
+                                                              completionScrlCtrl,
+                                                          child: MarkdownBlock(
+                                                            data:
+                                                                _selectedSuggestionMd!,
+                                                            config: MarkdownConfig.darkConfig.copy(
+                                                              configs: [
+                                                                ...overlayHeadingConfigs(
+                                                                  foreground:
+                                                                      _overlayForeground,
                                                                 ),
-                                                                styleNotMatched:
-                                                                    TextStyle(
-                                                                      color: _editorTheme['root']!
-                                                                          .color,
-                                                                    ),
-                                                                decoration: BoxDecoration(
-                                                                  color: _editorTheme['root']!
-                                                                      .backgroundColor!,
-                                                                  borderRadius:
-                                                                      widget
-                                                                          .markdownCodeBlockBorderRadius,
-                                                                  border: Border.all(
-                                                                    width: 0.2,
-                                                                    color:
-                                                                        _editorTheme['root']!
-                                                                            .color ??
-                                                                        Colors
-                                                                            .grey,
-                                                                  ),
+                                                                PConfig(
+                                                                  textStyle:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle,
                                                                 ),
-                                                              ),
-                                                            ],
+                                                                overlayCodeBlockConfig(
+                                                                  source:
+                                                                      _selectedSuggestionMd!,
+                                                                  outer:
+                                                                      _overlayBorderRadius,
+                                                                  gap:
+                                                                      kOverlayPadding,
+                                                                  theme:
+                                                                      _editorTheme,
+                                                                  textStyle:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle,
+                                                                  styleNotMatched:
+                                                                      TextStyle(
+                                                                        color: _editorTheme['root']!
+                                                                            .color,
+                                                                      ),
+                                                                  language:
+                                                                      _controller
+                                                                          .lspConfig
+                                                                          ?.languageId
+                                                                          .toLowerCase() ??
+                                                                      'dart',
+                                                                ),
+                                                              ],
+                                                            ),
                                                           ),
                                                         ),
                                                       ),
@@ -4344,9 +4826,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                           color: _hoverDetailsStyle
                                               .backgroundColor,
                                           shape: _hoverDetailsStyle.shape,
+                                          clipBehavior: Clip.antiAlias,
                                           child: Padding(
-                                            padding: const EdgeInsets.all(
-                                              _overlayPadding,
+                                            padding: EdgeInsets.all(
+                                              kOverlayPadding,
                                             ),
                                             child: Text(
                                               "Loading...",
@@ -4414,9 +4897,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                               color: _hoverDetailsStyle
                                                   .backgroundColor,
                                               shape: _hoverDetailsStyle.shape,
+                                              clipBehavior: Clip.antiAlias,
                                               child: Padding(
-                                                padding: const EdgeInsets.all(
-                                                  _overlayPadding,
+                                                padding: EdgeInsets.all(
+                                                  kOverlayPadding,
                                                 ),
                                                 child: Row(
                                                   crossAxisAlignment:
@@ -4448,121 +4932,107 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                 color: _hoverDetailsStyle
                                                     .backgroundColor,
                                                 shape: _hoverDetailsStyle.shape,
+                                                clipBehavior: Clip.antiAlias,
                                                 child: Padding(
-                                                  padding: const EdgeInsets.all(
-                                                    _overlayPadding,
+                                                  padding: EdgeInsets.all(
+                                                    kOverlayPadding,
                                                   ),
-                                                  child: RawScrollbar(
-                                                    controller:
-                                                        hoverScrollController,
-                                                    thumbVisibility: true,
-                                                    thumbColor:
-                                                        _editorTheme['root']!
-                                                            .color!
-                                                            .withAlpha(100),
-                                                    child: SingleChildScrollView(
+                                                  child: PopupScrollConfiguration(
+                                                    child: RawScrollbar(
                                                       controller:
                                                           hoverScrollController,
-                                                      child: MarkdownBlock(
-                                                        data: hoverMessage,
-                                                        selectable: false,
-                                                        generator: MarkdownGenerator(
-                                                          linesMargin:
-                                                              EdgeInsets.only(
-                                                                top: 1,
+                                                      thumbVisibility: true,
+                                                      thumbColor:
+                                                          _editorTheme['root']!
+                                                              .color!
+                                                              .withAlpha(100),
+                                                      child: SingleChildScrollView(
+                                                        controller:
+                                                            hoverScrollController,
+                                                        child: MarkdownBlock(
+                                                          data: hoverMessage,
+                                                          selectable: false,
+                                                          generator: MarkdownGenerator(
+                                                            linesMargin:
+                                                                EdgeInsets.only(
+                                                                  top: 1,
+                                                                ),
+                                                            generators: [
+                                                              SpanNodeGeneratorWithTag(
+                                                                tag: MarkdownTag
+                                                                    .hr
+                                                                    .name,
+                                                                generator:
+                                                                    (
+                                                                      _,
+                                                                      _,
+                                                                      _,
+                                                                    ) => _HoverDividerNode(
+                                                                      Theme.of(
+                                                                        context,
+                                                                      ).colorScheme.outline,
+                                                                    ),
                                                               ),
-                                                          generators: [
-                                                            SpanNodeGeneratorWithTag(
-                                                              tag: MarkdownTag
-                                                                  .hr
-                                                                  .name,
-                                                              generator: (_, _, _) =>
-                                                                  _HoverDividerNode(
-                                                                    Theme.of(
-                                                                          context,
-                                                                        )
-                                                                        .colorScheme
-                                                                        .outline,
-                                                                  ),
-                                                            ),
-                                                          ],
-                                                        ),
-                                                        config: MarkdownConfig.darkConfig.copy(
-                                                          configs: [
-                                                            PConfig(
-                                                              textStyle:
-                                                                  _hoverDetailsStyle
-                                                                      .textStyle,
-                                                            ),
-                                                            CodeConfig(
-                                                              style: TextStyle(
-                                                                fontFamily:
+                                                            ],
+                                                          ),
+                                                          config: MarkdownConfig.darkConfig.copy(
+                                                            configs: [
+                                                              ...overlayHeadingConfigs(
+                                                                foreground:
+                                                                    _overlayForeground,
+                                                              ),
+                                                              PConfig(
+                                                                textStyle:
                                                                     _hoverDetailsStyle
-                                                                        .textStyle
-                                                                        .fontFamily ??
-                                                                    'monospace',
+                                                                        .textStyle,
                                                               ),
-                                                            ),
-                                                            PreConfig(
-                                                              language:
-                                                                  _controller
-                                                                      .lspConfig
-                                                                      ?.languageId
-                                                                      .toLowerCase() ??
-                                                                  'dart',
-                                                              builder: (code, language) => Container(
-                                                                width: double
-                                                                    .infinity,
-                                                                padding:
-                                                                    const EdgeInsets.all(
-                                                                      16,
-                                                                    ),
-                                                                decoration: BoxDecoration(
-                                                                  color: _editorTheme['root']!
-                                                                      .backgroundColor!,
-                                                                  borderRadius:
-                                                                      widget
-                                                                          .markdownCodeBlockBorderRadius,
-                                                                  border: Border.all(
-                                                                    width: 0.2,
-                                                                    color:
-                                                                        _editorTheme['root']!
-                                                                            .color ??
-                                                                        Colors
-                                                                            .grey,
-                                                                  ),
-                                                                ),
-                                                                child: Text.rich(
-                                                                  TextSpan(
-                                                                    children: highLightSpans(
-                                                                      code,
-                                                                      language:
-                                                                          language,
-                                                                      theme:
-                                                                          _editorTheme,
-                                                                      textStyle: TextStyle(
-                                                                        fontSize: _hoverDetailsStyle
-                                                                            .textStyle
-                                                                            .fontSize,
-                                                                        fontFamily:
-                                                                            _hoverDetailsStyle.textStyle.fontFamily ??
-                                                                            'monospace',
-                                                                      ),
-                                                                      styleNotMatched: TextStyle(
-                                                                        color: _editorTheme['root']!
-                                                                            .color,
-                                                                        fontFamily:
-                                                                            _hoverDetailsStyle.textStyle.fontFamily ??
-                                                                            'monospace',
-                                                                      ),
-                                                                    ),
-                                                                  ),
-                                                                  softWrap:
-                                                                      true,
+                                                              CodeConfig(
+                                                                style: TextStyle(
+                                                                  fontFamily:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle
+                                                                          .fontFamily ??
+                                                                      'monospace',
                                                                 ),
                                                               ),
-                                                            ),
-                                                          ],
+                                                              overlayCodeBlockConfig(
+                                                                source:
+                                                                    hoverMessage,
+                                                                outer:
+                                                                    _overlayBorderRadius,
+                                                                gap:
+                                                                    kOverlayPadding,
+                                                                theme:
+                                                                    _editorTheme,
+                                                                textStyle: TextStyle(
+                                                                  fontSize: _hoverDetailsStyle
+                                                                      .textStyle
+                                                                      .fontSize,
+                                                                  fontFamily:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle
+                                                                          .fontFamily ??
+                                                                      'monospace',
+                                                                ),
+                                                                styleNotMatched: TextStyle(
+                                                                  color:
+                                                                      _editorTheme['root']!
+                                                                          .color,
+                                                                  fontFamily:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle
+                                                                          .fontFamily ??
+                                                                      'monospace',
+                                                                ),
+                                                                language:
+                                                                    _controller
+                                                                        .lspConfig
+                                                                        ?.languageId
+                                                                        .toLowerCase() ??
+                                                                    'dart',
+                                                              ),
+                                                            ],
+                                                          ),
                                                         ),
                                                       ),
                                                     ),
@@ -4717,122 +5187,145 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 elevation: _suggestionStyle.elevation,
                                 color: _suggestionStyle.backgroundColor,
                                 margin: EdgeInsets.zero,
-                                child: RawScrollbar(
-                                  controller: _actionScrollController,
-                                  thumbVisibility: true,
-                                  thumbColor: _editorTheme['root']!.color!
-                                      .withAlpha(80),
-                                  child: ListView.builder(
-                                    shrinkWrap: true,
+                                clipBehavior: Clip.antiAlias,
+                                child: PopupScrollConfiguration(
+                                  child: RawScrollbar(
                                     controller: _actionScrollController,
-                                    itemExtent:
-                                        _suggestionStyle.itemHeight ?? 24.0,
-                                    itemCount: _lspActionNotifier.value!.length,
-                                    itemBuilder: (_, indx) {
-                                      final actionData = _lspActionNotifier
-                                          .value!
-                                          .cast<Map<String, dynamic>>();
-                                      return Tooltip(
-                                        message: actionData[indx]['title'],
-                                        // `container: true` keeps this tooltip
-                                        // anchor as its own semantics node. A
-                                        // Tooltip links its overlay content to
-                                        // the anchor with a traversal-parent
-                                        // identifier; when the anchor is merged
-                                        // into a neighbour's node --
-                                        // IndexedSemantics does this per
-                                        // ListView row -- that identifier is
-                                        // dropped rather than merged, orphaning
-                                        // the tooltip node and making Windows
-                                        // reject the whole accessibility update
-                                        // ("will not be in the tree and is not
-                                        // the new root"). These rows are
-                                        // exactly that ListView case.
-                                        // See flutter/flutter#182444.
-                                        child: Semantics(
-                                          container: true,
-                                          child: Container(
-                                            decoration: BoxDecoration(
-                                              color: indx == _actionSelIndex
-                                                  ? (_suggestionStyle
-                                                            .selectedBackgroundColor ??
-                                                        _suggestionStyle
-                                                            .focusColor)
-                                                  : Colors.transparent,
-                                              borderRadius:
-                                                  BorderRadius.circular(3),
-                                            ),
-                                            height: _suggestionStyle.itemHeight,
-                                            padding: EdgeInsets.symmetric(
-                                              horizontal: 8,
-                                              vertical: 2,
-                                            ),
-                                            child: InkWell(
-                                              hoverColor:
-                                                  _suggestionStyle.hoverColor,
-                                              splashColor:
-                                                  _suggestionStyle.splashColor,
-                                              borderRadius:
-                                                  BorderRadius.circular(3),
-                                              onTap: () {
-                                                try {
-                                                  (() async {
-                                                    await _controller
-                                                        .applyWorkspaceEdit(
-                                                          actionData[indx],
-                                                        );
-                                                  })();
-                                                } catch (e, st) {
-                                                  debugPrint(
-                                                    'Code action failed: $e\n$st',
-                                                  );
-                                                } finally {
-                                                  _dismissCodeActions();
-                                                }
-                                              },
-                                              child: Row(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.center,
-                                                children: [
-                                                  SizedBox(
-                                                    width:
-                                                        _suggestionStyle
-                                                            .iconSize ??
-                                                        16,
-                                                    height:
-                                                        _suggestionStyle
-                                                            .iconSize ??
-                                                        16,
-                                                    child: Icon(
-                                                      Icons.lightbulb_outline,
-                                                      color:
-                                                          Colors.yellowAccent,
-                                                      size:
+                                    thumbVisibility: true,
+                                    thumbColor: _editorTheme['root']!.color!
+                                        .withAlpha(80),
+                                    child: ListView.builder(
+                                      shrinkWrap: true,
+                                      controller: _actionScrollController,
+                                      itemExtent:
+                                          _suggestionStyle.itemHeight ?? 24.0,
+                                      itemCount:
+                                          _lspActionNotifier.value!.length,
+                                      itemBuilder: (_, indx) {
+                                        final actionData = _lspActionNotifier
+                                            .value!
+                                            .cast<Map<String, dynamic>>();
+                                        return Tooltip(
+                                          message: actionData[indx]['title'],
+                                          // `container: true` keeps this tooltip
+                                          // anchor as its own semantics node. A
+                                          // Tooltip links its overlay content to
+                                          // the anchor with a traversal-parent
+                                          // identifier; when the anchor is merged
+                                          // into a neighbour's node --
+                                          // IndexedSemantics does this per
+                                          // ListView row -- that identifier is
+                                          // dropped rather than merged, orphaning
+                                          // the tooltip node and making Windows
+                                          // reject the whole accessibility update
+                                          // ("will not be in the tree and is not
+                                          // the new root"). These rows are
+                                          // exactly that ListView case.
+                                          // See flutter/flutter#182444.
+                                          child: Semantics(
+                                            container: true,
+                                            child: Container(
+                                              decoration: BoxDecoration(
+                                                color: indx == _actionSelIndex
+                                                    ? (_suggestionStyle
+                                                              .selectedBackgroundColor ??
                                                           _suggestionStyle
-                                                              .iconSize ??
-                                                          16,
-                                                    ),
-                                                  ),
-                                                  const SizedBox(width: 8),
-                                                  Expanded(
-                                                    child: Text(
-                                                      actionData[indx]['title'],
-                                                      style:
-                                                          _suggestionStyle
-                                                              .labelTextStyle
-                                                              ?.copyWith(
-                                                                color:
-                                                                    indx ==
-                                                                        _actionSelIndex
-                                                                    ? Colors
-                                                                          .white
-                                                                    : _suggestionStyle
-                                                                          .labelTextStyle
-                                                                          ?.color,
-                                                              ) ??
-                                                          _suggestionStyle
-                                                              .textStyle
-                                                              .copyWith(
+                                                              .focusColor)
+                                                    : Colors.transparent,
+                                                borderRadius:
+                                                    _overlayRowBorderRadius,
+                                              ),
+                                              height:
+                                                  _suggestionStyle.itemHeight,
+                                              // No padding on this container on purpose. It paints the
+                                              // selected background, and the InkWell inside it paints the
+                                              // hover fill; padding here would inset the hover ink and
+                                              // make it visibly narrower than the selected background on
+                                              // the very same row. The content keeps its inset from the
+                                              // Padding inside the InkWell instead, so the ink stays
+                                              // full-bleed and the card clip gives it the outer corner.
+                                              child: InkWell(
+                                                hoverColor:
+                                                    _suggestionStyle.hoverColor,
+                                                splashColor: _suggestionStyle
+                                                    .splashColor,
+                                                borderRadius:
+                                                    _overlayRowBorderRadius,
+                                                onTap: () {
+                                                  try {
+                                                    (() async {
+                                                      await _controller
+                                                          .applyWorkspaceEdit(
+                                                            actionData[indx],
+                                                          );
+                                                    })();
+                                                  } catch (e, st) {
+                                                    debugPrint(
+                                                      'Code action failed: $e\n$st',
+                                                    );
+                                                  } finally {
+                                                    _dismissCodeActions();
+                                                  }
+                                                },
+                                                child: Padding(
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 8,
+                                                        vertical: 2,
+                                                      ),
+                                                  child: Row(
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .center,
+                                                    children: [
+                                                      SizedBox(
+                                                        width:
+                                                            _suggestionStyle
+                                                                .iconSize ??
+                                                            16,
+                                                        height:
+                                                            _suggestionStyle
+                                                                .iconSize ??
+                                                            16,
+                                                        child: Icon(
+                                                          Icons
+                                                              .lightbulb_outline,
+                                                          // The popup can sit on a
+                                                          // light editor too, where a
+                                                          // fixed #FFFF00 icon is
+                                                          // invisible, so resolve the
+                                                          // same way the gutter bulb
+                                                          // does.
+                                                          color: codeActionBulbColor(
+                                                            _editorTheme['root']
+                                                                    ?.backgroundColor ??
+                                                                _suggestionStyle
+                                                                    .backgroundColor,
+                                                          ),
+                                                          size:
+                                                              _suggestionStyle
+                                                                  .iconSize ??
+                                                              16,
+                                                        ),
+                                                      ),
+                                                      const SizedBox(width: 8),
+                                                      Expanded(
+                                                        child: Text(
+                                                          actionData[indx]['title'],
+                                                          style:
+                                                              _suggestionStyle
+                                                                  .labelTextStyle
+                                                                  ?.copyWith(
+                                                                    color:
+                                                                        indx ==
+                                                                            _actionSelIndex
+                                                                        ? Colors
+                                                                              .white
+                                                                        : _suggestionStyle
+                                                                              .labelTextStyle
+                                                                              ?.color,
+                                                                  ) ??
+                                                              _suggestionStyle.textStyle.copyWith(
                                                                 color:
                                                                     indx ==
                                                                         _actionSelIndex
@@ -4842,17 +5335,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                           .textStyle
                                                                           .color,
                                                               ),
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
-                                                    ),
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                        ),
+                                                      ),
+                                                    ],
                                                   ),
-                                                ],
+                                                ),
                                               ),
                                             ),
                                           ),
-                                        ),
-                                      );
-                                    },
+                                        );
+                                      },
+                                    ),
                                   ),
                                 ),
                               ),
@@ -5605,13 +6100,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
     _lineHeight = fontSize * lineHeightMultiplier;
 
-    _syntaxHighlighter = SyntaxHighlighter(
-      language: _language,
-      extraLanguages: _extraLanguages,
-      editorTheme: _editorTheme,
-      baseTextStyle: _textStyle,
-      languageId: languageId,
-    );
+    _syntaxHighlighter = _createSyntaxHighlighter();
     _layoutMap = LayoutMap();
     _rebuildLayoutMap();
 
@@ -5620,10 +6109,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       if (_gutterStyle.gutterWidth != null) {
         _gutterWidth = gutterStyle.gutterWidth!;
       } else {
-        final digits = controller.lineCount.toString().length;
-        final digitWidth = digits * _gutterPadding * 0.6;
-        final foldIconSpace = enableFolding ? fontSize + 4 : 0;
-        _gutterWidth = digitWidth + foldIconSpace + _gutterPadding;
+        _gutterWidth = _autoGutterWidth(
+          controller.lineCount.toString().length,
+          fontSize,
+        );
       }
     } else {
       _gutterWidth = 0;
@@ -5792,6 +6281,25 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     });
   }
 
+  /// Builds a highlighter for the current grammar and theme, wired to this
+  /// controller.
+  ///
+  /// The line provider is what lets the highlighter see constructs that span
+  /// more than one line, such as a Python docstring whose body lines are
+  /// otherwise re-read as standalone code. Every entry point that rebuilds the
+  /// highlighter goes through here so that wiring cannot drift apart.
+  SyntaxHighlighter _createSyntaxHighlighter() {
+    final highlighter = SyntaxHighlighter(
+      language: _language,
+      extraLanguages: _extraLanguages,
+      editorTheme: _editorTheme,
+      baseTextStyle: _textStyle,
+      languageId: languageId,
+    );
+    highlighter.attachLineTextProvider(controller.getLineText);
+    return highlighter;
+  }
+
   Map<String, TextStyle> get editorTheme => _editorTheme;
   Mode get language => _language;
   TextStyle? get textStyle => _textStyle;
@@ -5802,6 +6310,34 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   bool get enableGuideLines => _enableGuideLines;
   bool get enableGutter => _enableGutter;
   bool get enableGutterDivider => _enableGutterDivider;
+
+  /// Width of the lane that holds this line's LSP code-action lightbulb.
+  ///
+  /// Zero when the editor has no LSP connection, no gutter, or a host-supplied
+  /// gutter width: in those cases the bulb keeps its previous placement and the
+  /// gutter width is left exactly as it was.
+  double get _actionBulbLaneWidth {
+    if (lspConfig == null || !_enableGutter) return 0;
+    if (_gutterStyle.gutterWidth != null) return 0;
+    return (_textStyle?.fontSize ?? 14.0) + kActionBulbLaneGap * 2;
+  }
+
+  /// Gutter width reserved for the line-folding icon.
+  ///
+  /// The icon is always painted on the right edge of the gutter, in both text
+  /// directions, so this is the trailing edge the line numbers align against.
+  double get _foldIconSpace =>
+      _enableFolding ? (_textStyle?.fontSize ?? 14.0) + 4 : 0;
+
+  /// Auto gutter width for a line number [digits] characters wide.
+  ///
+  /// The code-action lane is part of it, so reserving the lane also pushes the
+  /// line numbers clear of the lightbulb instead of letting the two overlap.
+  double _autoGutterWidth(int digits, double fontSize) {
+    final digitWidth = digits * _gutterPadding * 0.6;
+    return digitWidth + _foldIconSpace + _gutterPadding + _actionBulbLaneWidth;
+  }
+
   GutterStyle get gutterStyle => _gutterStyle;
   TextStyle? get ghostTextStyle => _ghostTextStyle;
   set ghostTextStyle(TextStyle? value) {
@@ -5826,6 +6362,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     );
     _paragraphCache.clear();
     _caretInfoCache.clear();
+    _indentGuideCache.clear();
     markNeedsLayout();
     markNeedsPaint();
   }
@@ -5848,15 +6385,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     } catch (e) {
       //
     }
-    _syntaxHighlighter = SyntaxHighlighter(
-      language: language,
-      extraLanguages: _extraLanguages,
-      editorTheme: theme,
-      baseTextStyle: textStyle,
-      languageId: languageId,
-    );
+    _syntaxHighlighter = _createSyntaxHighlighter();
     _paragraphCache.clear();
     _bracketCache.clear();
+    _indentGuideCache.clear();
     markNeedsLayout();
     markNeedsPaint();
   }
@@ -5867,15 +6399,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     try {
       _syntaxHighlighter.dispose();
     } catch (_) {}
-    _syntaxHighlighter = SyntaxHighlighter(
-      language: lang,
-      extraLanguages: _extraLanguages,
-      editorTheme: editorTheme,
-      baseTextStyle: textStyle,
-      languageId: languageId,
-    );
+    _syntaxHighlighter = _createSyntaxHighlighter();
     _paragraphCache.clear();
     _bracketCache.clear();
+    _indentGuideCache.clear();
     markNeedsLayout();
     markNeedsPaint();
   }
@@ -5908,10 +6435,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       if (_gutterStyle.gutterWidth != null) {
         _gutterWidth = _gutterStyle.gutterWidth!;
       } else {
-        final digits = controller.lineCount.toString().length;
-        final digitWidth = digits * _gutterPadding * 0.6;
-        final foldIconSpace = _enableFolding ? fontSize + 4 : 0;
-        _gutterWidth = digitWidth + foldIconSpace + _gutterPadding;
+        _gutterWidth = _autoGutterWidth(
+          controller.lineCount.toString().length,
+          fontSize,
+        );
       }
     } else {
       _gutterWidth = 0;
@@ -5925,13 +6452,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     try {
       _syntaxHighlighter.dispose();
     } catch (_) {}
-    _syntaxHighlighter = SyntaxHighlighter(
-      language: language,
-      extraLanguages: _extraLanguages,
-      editorTheme: editorTheme,
-      baseTextStyle: style,
-      languageId: languageId,
-    );
+    _syntaxHighlighter = _createSyntaxHighlighter();
 
     _paragraphCache.clear();
     _lineWidthCache.clear();
@@ -5970,15 +6491,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     try {
       _syntaxHighlighter.dispose();
     } catch (_) {}
-    _syntaxHighlighter = SyntaxHighlighter(
-      language: language,
-      extraLanguages: _extraLanguages,
-      editorTheme: editorTheme,
-      baseTextStyle: textStyle,
-      languageId: languageId,
-    );
     _paragraphCache.clear();
     _bracketCache.clear();
+    _indentGuideCache.clear();
     markNeedsLayout();
     markNeedsPaint();
   }
@@ -6429,10 +6944,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (enableGutter && gutterStyle.gutterWidth == null) {
         final fontSize = textStyle?.fontSize ?? 14.0;
-        final digits = newLineCount.toString().length;
-        final digitWidth = digits * _gutterPadding * 0.6;
-        final foldIconSpace = enableFolding ? fontSize + 4 : 0;
-        _gutterWidth = digitWidth + foldIconSpace + _gutterPadding;
+        _gutterWidth = _autoGutterWidth(
+          newLineCount.toString().length,
+          textStyle?.fontSize ?? 14.0,
+        );
       }
 
       if (enableFolding) {
@@ -7104,17 +7619,6 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
     }
     return null;
-  }
-
-  bool _shouldShortenGuideToPreviousLine(String lineText) {
-    final trimmed = lineText.trimRight();
-    if (trimmed.endsWith('{') ||
-        trimmed.endsWith('(') ||
-        trimmed.endsWith('[')) {
-      return true;
-    }
-
-    return _extractOpeningTagName(trimmed) != null;
   }
 
   int? _findMatchingClosingTagLine(String tagName, int startLine) {
@@ -9226,7 +9730,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
             _gutterWidth =
                 (enableFolding ? (_textStyle?.fontSize ?? 14.0) + 4 : 0) +
                 _gutterPadding +
-                builderWidth;
+                builderWidth +
+                _actionBulbLaneWidth;
           }
         }
 
@@ -9236,13 +9741,27 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         );
         final numWidth = lineNumPara.longestLine;
 
+        // Line numbers are right-aligned rather than centred, which keeps the
+        // digits of 9, 10 and 100 in a single column instead of letting them
+        // drift with their own width. The gutter reads as
+        // [lightbulb lane][numbers][fold icon] in LTR and mirrors wholesale in
+        // RTL, where the gutter itself sits on the right of the editor.
+        final numberAreaWidth =
+            _gutterWidth - _actionBulbLaneWidth - _foldIconSpace;
+        // The lane is the gutter's leading edge, and the digits are right
+        // aligned inside the numbers area that follows it. The folding icon
+        // always occupies the gutter edge nearest the text, so the numbers
+        // stop short of it by exactly its width.
+        final numX = isRTL
+            ? size.width - _gutterWidth + _foldIconSpace
+            : _actionBulbLaneWidth;
+        final numStart =
+            numX + (numberAreaWidth - numWidth).clamp(0.0, double.infinity);
         canvas.drawParagraph(
           lineNumPara,
           offset +
               Offset(
-                (isRTL ? size.width - _gutterWidth : 0) +
-                    (_gutterWidth - numWidth) / 2 -
-                    (enableFolding ? (lineNumberStyle.fontSize ?? 14) / 2 : 0),
+                numStart,
                 (innerPadding?.top ?? 0) +
                     contentTop +
                     visualYOffset -
@@ -9256,12 +9775,15 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
             final lineText = controller.getLineText(i);
             final hasLeadingIndent = _measureLeadingIndentColumns(lineText) > 0;
             final icon = Icons.lightbulb_outline;
+            // The bulb used to be drawn in a fixed #FFFF00, which all but
+            // disappears against the white surface a light theme paints.
+            // Resolve it from the editor background so it stays legible on both.
             final actionBulbPainter = TextPainter(
               text: TextSpan(
                 text: String.fromCharCode(icon.codePoint),
                 style: TextStyle(
                   fontSize: textStyle?.fontSize ?? 14,
-                  color: Colors.yellowAccent,
+                  color: codeActionBulbColor(bgColor),
                   fontFamily: icon.fontFamily,
                   package: icon.fontPackage,
                 ),
@@ -9281,24 +9803,39 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
                       (innerPadding?.left ?? 0) -
                       (lineWrap ? 0 : _effectiveHScroll);
 
+            // An unindented line has no whitespace to borrow for the bulb, so
+            // it is drawn in the lane the gutter reserves in front of the line
+            // numbers. Before, it was pinned to the editor's left edge while
+            // the numbers were centred in the very same few pixels, which is
+            // exactly the overlap this fixes. The lane is absent when the host
+            // pins its own gutter width or turns the gutter off, and the old
+            // placement is kept for those hosts.
+            // The lane sits on the editor's left edge in LTR and mirrors to
+            // the right edge in RTL, since the gutter itself moves there. The
+            // folding icon takes the opposite edge of the gutter, so the two
+            // never share pixels in either direction.
+            final laneX = isRTL
+                ? offset.dx + size.width - _actionBulbLaneWidth
+                : offset.dx;
+            final laneBulbX = laneX + kActionBulbLaneGap;
+
+            final fallbackBulbX = isRTL
+                ? (isMobile
+                      ? offset.dx + size.width - actionBulbPainter.width - 4
+                      : offset.dx + size.width - _gutterWidth + 4)
+                : (isMobile
+                      ? offset.dx +
+                            _gutterWidth -
+                            actionBulbPainter.width -
+                            (baseLineNumberStyle.fontSize ?? 14) +
+                            4
+                      : offset.dx + 4);
+
             final bulbX = hasLeadingIndent
                 ? (isRTL
                       ? contentStartX - actionBulbPainter.width - 4
                       : contentStartX + 4)
-                : (isRTL
-                      ? (isMobile
-                            ? offset.dx +
-                                  size.width -
-                                  actionBulbPainter.width -
-                                  4
-                            : offset.dx + size.width - _gutterWidth + 4)
-                      : (isMobile
-                            ? offset.dx +
-                                  _gutterWidth -
-                                  actionBulbPainter.width -
-                                  (baseLineNumberStyle.fontSize ?? 14) +
-                                  4
-                            : offset.dx + 4));
+                : (_actionBulbLaneWidth > 0 ? laneBulbX : fallbackBulbX);
             final bulbY =
                 offset.dy +
                 (innerPadding?.top ?? 0) +
@@ -9476,8 +10013,11 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       textDirection: _textDirection,
     );
     iconPainter.layout();
+    // The icon hugs the gutter's right edge in LTR and mirrors to the gutter's
+    // left edge in RTL. It used to sit at the editor's far right in RTL, which
+    // is off the gutter and now collides with the lightbulb lane.
     final iconX = isRTL
-        ? offset.dx + size.width - iconPainter.width - 2
+        ? offset.dx + size.width - _gutterWidth + 2
         : offset.dx + _gutterWidth - iconPainter.width - 2;
     iconPainter.paint(
       canvas,
@@ -9507,14 +10047,15 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final tabSize = controller.tabSize;
     final cursorOffset = controller.selection.extentOffset;
     final currentLine = controller.getLineAtOffset(cursorOffset);
-    List<({int startLine, int endLine, int indentLevel, double guideX})>
-    blocks = [];
 
+    // Guides are derived from the indentation of the lines themselves rather
+    // than from folded regions. See [indentGuideSegments]. The scan reaches back
+    // well past the viewport so that a run which starts above the first visible
+    // line still gets drawn from the correct offset, and stops at the bottom of
+    // the viewport because nothing below it can contribute.
     final scanStart = (firstVisibleLine - 500).clamp(0, firstVisibleLine);
-    final visibleLineTexts = controller.getLinesRange(
-      scanStart,
-      lastVisibleLine + 1,
-    );
+    final scanEnd = min(lastVisibleLine + 1, controller.lineCount);
+    final visibleLineTexts = controller.getLinesRange(scanStart, scanEnd);
 
     String lineTextAt(int lineIndex) {
       final visibleIndex = lineIndex - scanStart;
@@ -9524,13 +10065,23 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       return visibleLineTexts[visibleIndex];
     }
 
-    double measureLeadingIndentWidth(String lineText, int leadingColumns) {
-      if (leadingColumns <= 0 || lineText.isEmpty) return 0;
+    // Width of the leading-whitespace prefix of [lineText] in on-screen pixels.
+    //
+    // The guide has to land exactly on the indent column that the painter
+    // renders, so the prefix is measured inside a paragraph laid out with the
+    // same style as the real line, and the right edge of the box holding the
+    // last indent character is read back. Measuring a standalone paragraph made
+    // of the indent string alone is not equivalent: tab stops are resolved
+    // against the paragraph start, and the standalone intrinsic width does not
+    // reliably agree with the painted advance. That mismatch is what pushed
+    // guides away from the text they belong to.
+    double measureIndentWidth(int lineIndex, int columns) {
+      final lineText = lineTextAt(lineIndex);
+      if (columns <= 0 || lineText.isEmpty) return 0;
 
       int consumedColumns = 0;
       int endIndex = 0;
-
-      while (endIndex < lineText.length && consumedColumns < leadingColumns) {
+      while (endIndex < lineText.length && consumedColumns < columns) {
         final ch = lineText[endIndex];
         if (ch == ' ') {
           consumedColumns += 1;
@@ -9546,155 +10097,80 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (endIndex == 0) return 0;
 
-      final indentString = lineText.substring(0, endIndex);
-      final builder = ui.ParagraphBuilder(_paragraphStyle)
-        ..pushStyle(_uiTextStyle)
-        ..addText(indentString);
-      final spacePara = builder.build();
-      spacePara.layout(const ui.ParagraphConstraints(width: double.infinity));
-      return spacePara.maxIntrinsicWidth;
-    }
+      final contentWidth =
+          size.width - _gutterWidth - (innerPadding?.horizontal ?? 0);
+      final paragraphWidth = lineWrap
+          ? _wrapWidth
+          : (isRTL ? max(contentWidth * 3, 10000.0) : null);
 
-    void addBlock({
-      required int startLine,
-      required int endLine,
-      required int leadingColumns,
-      required int indentLevel,
-      required String lineText,
-    }) {
-      if (endLine <= startLine) return;
-
-      final cachedBlocks = _indentGuideCache[startLine];
-      if (cachedBlocks != null && cachedBlocks.isNotEmpty) {
-        blocks.addAll(cachedBlocks);
-        return;
-      }
-
-      final renderEndLine = max(
-        _shouldShortenGuideToPreviousLine(lineText)
-            ? (endLine - 1).clamp(startLine + 1, endLine)
-            : endLine,
-        startLine + 2,
+      // The paragraph is rebuilt from [lineText] rather than taken from the
+      // shared per-line paragraph cache. That cache is keyed by line index
+      // alone, so a stale entry makes the guide measure a different line and
+      // land in the wrong place. Results are memoised in [_indentWidthCache],
+      // so the extra build is not paid on every frame.
+      final ui.Paragraph para = _buildHighlightedParagraph(
+        lineIndex,
+        lineText,
+        width: paragraphWidth,
       );
 
-      double guideX = 0;
-      if (leadingColumns > 0) {
-        guideX = measureLeadingIndentWidth(lineText, leadingColumns);
-      }
-
-      final block = (
-        startLine: startLine,
-        endLine: renderEndLine,
-        indentLevel: indentLevel,
-        guideX: guideX,
-      );
-
-      _indentGuideCache[startLine] = [block];
-      if (renderEndLine >= firstVisibleLine) {
-        blocks.add(block);
-      }
+      final boxes = para.getBoxesForRange(0, endIndex);
+      if (boxes.isEmpty) return 0;
+      return boxes.last.right;
     }
 
-    final foldedGuideCandidates = <int, FoldRange>{};
-    for (
-      int i = scanStart;
-      i <= lastVisibleLine && i < controller.lineCount;
-      i++
-    ) {
-      final fold = _foldRanges[i];
-      if (fold != null) {
-        foldedGuideCandidates[i] = fold;
-      }
+    // A guide is one screen-wide, one-run-tall line. Its column is cached per
+    // line because measuring it means laying out a paragraph.
+    final widthCache = <int, double>{};
+    double guideXFor(int lineIndex, int columns) {
+      if (columns <= 0) return 0;
+      final cached = widthCache[lineIndex];
+      if (cached != null) return cached;
+      final width = measureIndentWidth(lineIndex, columns);
+      widthCache[lineIndex] = width;
+      return width;
     }
 
-    final rustBlocks = guidesComputeViewport(
-      rope: controller.rope.core,
-      firstVisible: BigInt.from(firstVisibleLine),
-      lastVisible: BigInt.from(lastVisibleLine),
-      tabSize: BigInt.from(tabSize),
+    final segments = indentGuideSegments(
+      firstLine: scanStart,
+      lastLine: scanEnd,
+      tabSize: tabSize,
+      lineTextAt: lineTextAt,
+      languageId: controller.lspConfig?.languageId,
     );
 
-    for (final b in rustBlocks) {
-      final lineText = _lineTextCache[b.startLine] ?? lineTextAt(b.startLine);
-      _lineTextCache[b.startLine] = lineText;
+    // The guide enclosing the caret is drawn at full strength; the rest are
+    // dimmed. The innermost run containing the caret wins, so nested blocks
+    // highlight the level the caret actually sits in.
+    final caretSegment = _activeIndentGuideSegment(segments, currentLine);
 
-      addBlock(
-        startLine: b.startLine,
-        endLine: b.endLine,
-        leadingColumns: b.leadingSpaces,
-        indentLevel: b.indentLevel,
-        lineText: lineText,
-      );
-    }
+    for (final segment in segments) {
+      if (segment.endLine <= firstVisibleLine) continue;
+      if (segment.startLine > lastVisibleLine) continue;
 
-    if (foldedGuideCandidates.isNotEmpty) {
-      for (final entry in foldedGuideCandidates.entries) {
-        final lineIndex = entry.key;
-        final fold = entry.value;
-
-        final lineText = _lineTextCache[lineIndex] ?? lineTextAt(lineIndex);
-        _lineTextCache[lineIndex] = lineText;
-
-        final alreadyAdded = blocks.any(
-          (block) => block.startLine == lineIndex,
-        );
-        if (alreadyAdded) {
-          continue;
-        }
-
-        final leadingColumns = _measureLeadingIndentColumns(lineText);
-        final indentLevel = _lineIndentCache.containsKey(lineIndex)
-            ? _lineIndentCache[lineIndex]!
-            : (tabSize > 0 ? leadingColumns ~/ tabSize : leadingColumns);
-        if (!_lineIndentCache.containsKey(lineIndex)) {
-          _lineIndentCache[lineIndex] = indentLevel;
-        }
-
-        addBlock(
-          startLine: lineIndex,
-          endLine: fold.endIndex + 1,
-          leadingColumns: leadingColumns,
-          indentLevel: indentLevel,
-          lineText: lineText,
-        );
-      }
-    }
-
-    int? selectedBlockIndex;
-    int minBlockSize = 999999;
-
-    for (int idx = 0; idx < blocks.length; idx++) {
-      final block = blocks[idx];
-      if (currentLine >= block.startLine && currentLine < block.endLine) {
-        final blockSize = block.endLine - block.startLine;
-        if (blockSize < minBlockSize) {
-          minBlockSize = blockSize;
-          selectedBlockIndex = idx;
-        }
-      }
-    }
-
-    for (int idx = 0; idx < blocks.length; idx++) {
-      final block = blocks[idx];
-      final isSelected = selectedBlockIndex == idx;
-
+      final isActive = caretSegment != null && identical(segment, caretSegment);
       final guidePaint = Paint()
-        ..color = isSelected ? textColor : textColor.withAlpha(100)
-        ..strokeWidth = isSelected ? 1.0 : 0.5
+        ..color = isActive ? textColor : textColor.withAlpha(100)
+        ..strokeWidth = isActive ? 1.0 : 0.5
         ..style = PaintingStyle.stroke;
 
+      // A run covers [startLine, endLine), so its top is the top of
+      // startLine and its bottom is the top of the line just past the run.
+      // _getLineYOffset(L) is the top of line L, which is also the y the
+      // painter draws line L's text at. Adding one to startLine would drop
+      // the whole guide a line below the block it belongs to.
       double yTop;
       if (!lineWrap && !hasActiveFolds) {
-        yTop = (block.startLine + 1) * _lineHeight;
+        yTop = segment.startLine * _lineHeight;
       } else {
-        yTop = _getLineYOffset(block.startLine + 1, hasActiveFolds);
+        yTop = _getLineYOffset(segment.startLine, hasActiveFolds);
       }
 
       double yBottom;
       if (!lineWrap && !hasActiveFolds) {
-        yBottom = (block.endLine - 1) * _lineHeight + _lineHeight;
+        yBottom = segment.endLine * _lineHeight;
       } else {
-        yBottom = _getLineYOffset(block.endLine, hasActiveFolds);
+        yBottom = _getLineYOffset(segment.endLine, hasActiveFolds);
       }
 
       final screenYTop =
@@ -9710,17 +10186,23 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (screenYBottom < 0 || screenYTop > viewBottom - viewTop) continue;
 
+      // Measure on a line the run actually covers, so the column resolves to
+      // the same tab stops the painter used for that line.
+      final measureLine = segment.startLine.clamp(scanStart, scanEnd - 1);
+      final guideX = guideXFor(measureLine, segment.columns);
+      if (guideX <= 0 && segment.columns > 0) continue;
+
       final screenGuideX = isRTL
           ? offset.dx +
                 size.width -
                 _gutterWidth -
                 (innerPadding?.right ?? 0) -
-                block.guideX -
+                guideX -
                 (lineWrap ? 0 : _effectiveHScroll)
           : offset.dx +
                 _gutterWidth +
                 (innerPadding?.left ?? 0) +
-                block.guideX -
+                guideX -
                 (lineWrap ? 0 : _effectiveHScroll);
 
       if (isRTL) {
@@ -9744,6 +10226,22 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         guidePaint,
       );
     }
+  }
+
+  /// The innermost guide run containing [line], or `null` when the caret is
+  /// outside every run.
+  IndentGuideSegment? _activeIndentGuideSegment(
+    List<IndentGuideSegment> segments,
+    int line,
+  ) {
+    IndentGuideSegment? best;
+    for (final segment in segments) {
+      if (line < segment.startLine || line >= segment.endLine) continue;
+      if (best == null || segment.columns > best.columns) {
+        best = segment;
+      }
+    }
+    return best;
   }
 
   void _pruneViewportCaches(int firstVisibleLine, int lastVisibleLine) {
@@ -12543,7 +13041,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         };
 
         _dragStartOffset = textOffset;
-        final isAltClick = HardwareKeyboard.instance.isAltPressed;
+        // Read the engine-confirmed Alt state rather than the framework's key
+        // cache, which can claim Alt is still held after a lost key-up and
+        // would otherwise turn every later click into an alt-click.
+        final isAltClick = editorModifierKeys.isAltPressed;
         _onetap.onTap = () {
           if (_openedLspActionFromBulbTap) {
             _openedLspActionFromBulbTap = false;
