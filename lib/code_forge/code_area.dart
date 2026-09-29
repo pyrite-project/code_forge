@@ -726,6 +726,13 @@ class CodeForge extends StatefulWidget {
   /// Whether to show a divider line between gutter and content.
   final bool enableGutterDivider;
 
+  /// Whether the caret glides to its new position instead of teleporting.
+  ///
+  /// Mirrors VS Code's smooth caret animation: every caret move (navigation,
+  /// typing, multi-cursor changes) eases toward the target over a short
+  /// duration, and the caret stays visible while gliding. Off by default.
+  final bool smoothCursor;
+
   /// Whether to enable local and non LSP autocomplete suggestions.
   /// To control LSP suggestions, use the [capabilities] field of the [LspConfig].
   /// [false] by default because, this may cause delay or jitter in large files.
@@ -831,6 +838,7 @@ class CodeForge extends StatefulWidget {
     this.useSpaceAsTab = false,
     this.enableGutter = true,
     this.enableGutterDivider = false,
+    this.smoothCursor = false,
     this.deleteFoldRangeOnDeletingFirstLine = false,
     this.selectionStyle,
     this.gutterStyle,
@@ -897,6 +905,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
   late final FocusNode _focusNode;
   late final AnimationController _caretBlinkController;
+  late final AnimationController _caretSmoothController;
   late final AnimationController _lineHighlightController;
   late final Map<String, TextStyle> _editorTheme;
   late final Mode _language;
@@ -1172,6 +1181,11 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 500),
     )..repeat(reverse: true);
+
+    _caretSmoothController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 100),
+    );
 
     _lineHighlightController = AnimationController(
       vsync: this,
@@ -1725,6 +1739,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     _connection?.close();
     _lspResponsesSubscription?.cancel();
     _caretBlinkController.dispose();
+    _caretSmoothController.dispose();
     _lineHighlightController.dispose();
     _hoverNotifier.dispose();
     _hoverContentNotifier.dispose();
@@ -3702,6 +3717,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                     readOnly: _readOnly,
                                                     caretBlinkController:
                                                         _caretBlinkController,
+                                                    caretSmoothController:
+                                                        _caretSmoothController,
+                                                    smoothCursor:
+                                                        widget.smoothCursor,
                                                     lineHighlightController:
                                                         _lineHighlightController,
                                                     textStyle: widget.textStyle,
@@ -5486,6 +5505,8 @@ class _CodeField extends LeafRenderObjectWidget {
   final FocusNode focusNode;
   final bool readOnly, isMobile, lineWrap;
   final AnimationController caretBlinkController;
+  final AnimationController caretSmoothController;
+  final bool smoothCursor;
   final AnimationController lineHighlightController;
   final TextStyle? textStyle;
   final bool enableFolding, enableGuideLines, enableGutter, enableGutterDivider;
@@ -5523,6 +5544,8 @@ class _CodeField extends LeafRenderObjectWidget {
     required this.focusNode,
     required this.readOnly,
     required this.caretBlinkController,
+    required this.caretSmoothController,
+    required this.smoothCursor,
     required this.lineHighlightController,
     required this.enableFolding,
     required this.enableGuideLines,
@@ -5580,6 +5603,8 @@ class _CodeField extends LeafRenderObjectWidget {
       focusNode: focusNode,
       readOnly: readOnly,
       caretBlinkController: caretBlinkController,
+      caretSmoothController: caretSmoothController,
+      smoothCursor: smoothCursor,
       lineHighlightController: lineHighlightController,
       textStyle: textStyle,
       matchHighlightStyle: matchHighlightStyle,
@@ -5647,6 +5672,7 @@ class _CodeField extends LeafRenderObjectWidget {
       ..gutterStyle = gutterStyle
       ..selectionStyle = selectionStyle
       ..ghostTextStyle = ghostTextStyle
+      ..smoothCursor = smoothCursor
       ..textDirection = textDirection;
   }
 }
@@ -5657,8 +5683,21 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final ScrollController vscrollController, hscrollController;
   final FocusNode focusNode;
   final AnimationController caretBlinkController;
+  final AnimationController caretSmoothController;
   final AnimationController lineHighlightController;
   final bool isMobile;
+
+  /// Whether the caret glides toward its target position ([smoothCursor]).
+  ///
+  /// The animation state below holds the per-caret content coordinates being
+  /// interpolated; the primary caret is index 0, secondary multi-cursors
+  /// follow. All lists keep the same length, so multi-cursor count changes
+  /// snap instead of gliding.
+  bool _smoothCursor;
+  List<Offset>? _smoothCaretFrom;
+  List<Offset>? _smoothCaretTarget;
+  List<Offset>? _smoothCaretCurrent;
+  Size? _smoothCaretLastSize;
   final ValueNotifier<bool> selectionActiveNotifier, isHoveringPopup;
   final ValueNotifier<Offset> contextMenuOffsetNotifier, offsetNotifier;
 
@@ -6047,6 +6086,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     required this.hscrollController,
     required this.focusNode,
     required this.caretBlinkController,
+    required this.caretSmoothController,
+    required this._smoothCursor,
     required this.lineHighlightController,
     required this.isMobile,
     required this.selectionActiveNotifier,
@@ -6228,6 +6269,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     });
 
     caretBlinkController.addListener(markNeedsPaint);
+    caretSmoothController.addListener(markNeedsPaint);
     controller.addListener(_onControllerChange);
 
     // Code actions arrive asynchronously (debounced diagnostics or Ctrl+.), so
@@ -6548,6 +6590,83 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     if (_enableGutterDivider == value) return;
     _enableGutterDivider = value;
     markNeedsPaint();
+  }
+
+  bool get smoothCursor => _smoothCursor;
+
+  set smoothCursor(bool value) {
+    if (_smoothCursor == value) return;
+    _smoothCursor = value;
+    _discardSmoothCaret();
+    markNeedsPaint();
+  }
+
+  void _discardSmoothCaret() {
+    caretSmoothController.stop();
+    _smoothCaretFrom = null;
+    _smoothCaretTarget = null;
+    _smoothCaretCurrent = null;
+  }
+
+  /// True while the caret is gliding toward its target, which keeps the caret
+  /// visible even when the blink phase would hide it.
+  bool get _isSmoothCaretAnimating =>
+      _smoothCursor && caretSmoothController.isAnimating;
+
+  /// Returns the caret positions to paint for [targets] (primary caret first,
+  /// then secondary multi-cursors, all in content coordinates), easing from
+  /// the previously painted positions when smooth cursor is enabled.
+  ///
+  /// Resizing or a multi-cursor count change snaps to the targets instead of
+  /// gliding, and scroll offsets never participate because the animation runs
+  /// in content coordinates.
+  List<Offset> _resolveSmoothCaretOffsets(List<Offset> targets) {
+    if (!_smoothCursor) return targets;
+
+    final resized = _smoothCaretLastSize != size;
+    _smoothCaretLastSize = size;
+
+    final current = _smoothCaretCurrent;
+    if (resized || current == null || current.length != targets.length) {
+      _smoothCaretFrom = targets;
+      _smoothCaretTarget = targets;
+      _smoothCaretCurrent = targets;
+      return targets;
+    }
+
+    if (!_sameCaretTargets(_smoothCaretTarget!, targets)) {
+      _smoothCaretFrom = current;
+      _smoothCaretTarget = targets;
+      if (!_sameCaretTargets(current, targets)) {
+        caretSmoothController.forward(from: 0.0);
+      }
+    }
+
+    if (!caretSmoothController.isAnimating) {
+      final settled = _smoothCaretTarget!;
+      _smoothCaretCurrent = settled;
+      return settled;
+    }
+
+    final t = Curves.easeOutCubic.transform(caretSmoothController.value);
+    final from = _smoothCaretFrom!;
+    final target = _smoothCaretTarget!;
+    final next = List<Offset>.generate(targets.length, (i) {
+      return from[i] == target[i]
+          ? target[i]
+          : Offset.lerp(from[i], target[i], t)!;
+    });
+    _smoothCaretCurrent = next;
+    return next;
+  }
+
+  static bool _sameCaretTargets(List<Offset> a, List<Offset> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   set gutterStyle(GutterStyle style) {
@@ -9182,7 +9301,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     _drawImeComposition(canvas, offset, hasActiveFolds);
 
     if (focusNode.hasFocus &&
-        caretBlinkController.value > 0.5 &&
+        (caretBlinkController.value > 0.5 || _isSmoothCaretAnimating) &&
         controller.imeComposition == null) {
       final caretInfo = _getCaretInfo();
 
@@ -9190,18 +9309,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       final textX = isRTL
           ? (innerPadding?.left ?? 0) - scroll
           : _gutterWidth + (innerPadding?.left ?? 0) - scroll;
-      final caretScreenX = offset.dx + textX + caretInfo.offset.dx;
-      final caretScreenY =
-          offset.dy +
-          (innerPadding?.top ?? 0) +
-          caretInfo.offset.dy -
-          vscrollController.offset;
 
-      canvas.drawRect(
-        Rect.fromLTWH(caretScreenX, caretScreenY, 1.5, caretInfo.height),
-        _caretPainter,
-      );
-
+      final caretTargets = <Offset>[caretInfo.offset];
       if (controller.hasMultiCursors) {
         for (final cursor in controller.multiCursors) {
           final cursorOffset =
@@ -9210,18 +9319,29 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
               ) +
               cursor.character;
           final safeOffset = cursorOffset.clamp(0, controller.text.length);
-          final info = _getCaretInfoAtOffset(safeOffset);
-          final cx = offset.dx + textX + info.offset.dx;
-          final cy =
-              offset.dy +
-              (innerPadding?.top ?? 0) +
-              info.offset.dy -
-              vscrollController.offset;
-          canvas.drawRect(
-            Rect.fromLTWH(cx, cy, 1.5, info.height),
-            _caretPainter,
-          );
+          caretTargets.add(_getCaretInfoAtOffset(safeOffset).offset);
         }
+      }
+      final caretPositions = _resolveSmoothCaretOffsets(caretTargets);
+
+      void drawCaret(Offset position, double height) {
+        canvas.drawRect(
+          Rect.fromLTWH(
+            offset.dx + textX + position.dx,
+            offset.dy +
+                (innerPadding?.top ?? 0) +
+                position.dy -
+                vscrollController.offset,
+            1.5,
+            height,
+          ),
+          _caretPainter,
+        );
+      }
+
+      drawCaret(caretPositions.first, caretInfo.height);
+      for (var i = 1; i < caretPositions.length; i++) {
+        drawCaret(caretPositions[i], _lineHeight);
       }
     }
 
