@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:markdown_widget/markdown_widget.dart';
@@ -6269,7 +6270,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     });
 
     caretBlinkController.addListener(markNeedsPaint);
-    caretSmoothController.addListener(markNeedsPaint);
+    caretSmoothController.addListener(_onSmoothCaretTick);
     controller.addListener(_onControllerChange);
 
     // Code actions arrive asynchronously (debounced diagnostics or Ctrl+.), so
@@ -6612,6 +6613,23 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   /// visible even when the blink phase would hide it.
   bool get _isSmoothCaretAnimating =>
       _smoothCursor && caretSmoothController.isAnimating;
+
+  /// Repaints the caret while it glides.
+  ///
+  /// The glide is started from [paint] — it is the only place the resolved
+  /// caret targets are known — and `forward(from: 0.0)` notifies its listeners
+  /// synchronously, so this first notification arrives mid-paint. Marking
+  /// paint during the paint phase is what the framework asserts on, and it is
+  /// also redundant there: this frame already painted the glide's start
+  /// position, and every later tick fires from the transient-callback phase,
+  /// where marking is legal.
+  void _onSmoothCaretTick() {
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      return;
+    }
+    markNeedsPaint();
+  }
 
   /// Returns the caret positions to paint for [targets] (primary caret first,
   /// then secondary multi-cursors, all in content coordinates), easing from
