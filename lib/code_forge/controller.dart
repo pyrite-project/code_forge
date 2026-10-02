@@ -1945,6 +1945,17 @@ class CodeForgeController implements DeltaTextInputClient {
     return '\t' * tabSize;
   }
 
+  /// Line comment markers of the current language (e.g. `#`, `//`, `--`).
+  ///
+  /// Auto-pairing is suppressed when the caret sits after a marker, so
+  /// bracket and quote pairing stays out of the user's way inside comments.
+  /// An empty list disables the comment check.
+  List<String> lineCommentMarkers = const [];
+
+  /// Whether pressing Enter after a Python block-ending statement
+  /// (`return`, `pass`, `break`, …) dedents the new line one level.
+  bool autoDedentAfterBlockEnd = false;
+
   /// Whether the line structure has changed (lines added or removed).
   bool lineStructureChanged = false;
 
@@ -5397,6 +5408,84 @@ class CodeForgeController implements DeltaTextInputClient {
     searchHighlightsChanged = false;
   }
 
+  /// The document character at [offset], or null when out of bounds.
+  ///
+  /// Reads through [text] so a pending line-buffer edit is visible; the raw
+  /// rope lags behind the buffer until its next flush.
+  String? _documentCharAt(int offset) {
+    if (offset < 0 || offset >= length) return null;
+    final document = text;
+    if (offset >= document.length) return null;
+    return document[offset];
+  }
+
+  /// Whether typing the opening character [char] at [offset] should insert
+  /// its closing pair.
+  ///
+  /// Pairing is suppressed where it is almost always unwanted: after a
+  /// backslash escape, directly after or before the same quote (the
+  /// apostrophe the user is reaching for in `don't`, the third `"` of a
+  /// Python docstring), right before an identifier character, or inside a
+  /// line comment or an unterminated string on the current line.
+  bool _shouldAutoClosePair(String char, int offset) {
+    final isQuote = char == '"' || char == "'";
+    final prev = _documentCharAt(offset - 1);
+    if (prev != null) {
+      if (prev.codeUnitAt(0) == 0x5C) return false;
+      if (isQuote && prev == char) return false;
+    }
+    final next = _documentCharAt(offset);
+    if (next != null) {
+      if (isQuote && next == char) return false;
+      if (_isIdentChar(next.codeUnitAt(0))) return false;
+    }
+    if (_isInsideLineCommentOrString(offset)) return false;
+    return true;
+  }
+
+  /// Whether the text between the line start and [offset] sits inside a line
+  /// comment or an unterminated single-line string.
+  ///
+  /// Judged from [lineCommentMarkers] and quote scanning of the current line
+  /// only; a string opened on an earlier line (a triple-quoted docstring
+  /// body) is not detected here.
+  bool _isInsideLineCommentOrString(int offset) {
+    if (lineCommentMarkers.isEmpty) return false;
+    final document = text;
+    if (offset <= 0 || offset > document.length) return false;
+    final lineStart = document.lastIndexOf('\n', offset - 1) + 1;
+    final prefix = document.substring(lineStart, offset);
+    String? quote;
+    var escaped = false;
+    for (var i = 0; i < prefix.length; i++) {
+      final ch = prefix[i];
+      if (quote != null) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch == r'\') {
+          escaped = true;
+        } else if (ch == quote) {
+          quote = null;
+        }
+        continue;
+      }
+      for (final marker in lineCommentMarkers) {
+        if (prefix.startsWith(marker, i)) return true;
+      }
+      if (ch == '"' || ch == "'") quote = ch;
+    }
+    return quote != null;
+  }
+
+  /// Removes one indentation level from leading whitespace [indent].
+  String _dedentOneLevel(String indent) {
+    if (indent.isEmpty) return indent;
+    if (indent.startsWith(tabSpace)) return indent.substring(tabSpace.length);
+    if (indent.startsWith('\t')) return indent.substring(1);
+    final spaces = RegExp('^ {1,$tabSize}').firstMatch(indent)?.group(0);
+    return spaces == null ? indent : indent.substring(spaces.length);
+  }
+
   void _handleInsertion(
     int offset,
     String insertedText,
@@ -5426,13 +5515,13 @@ class CodeForgeController implements DeltaTextInputClient {
       final openers = pairs.keys.toSet();
       final closers = pairs.values.toSet();
 
-      if (openers.contains(char)) {
+      if (openers.contains(char) && _shouldAutoClosePair(char, offset)) {
         final closing = pairs[char]!;
         actualInsertedText = '$char$closing';
         actualSelection = TextSelection.collapsed(offset: offset + 1);
       } else if (closers.contains(char)) {
-        if (offset < _rope.length &&
-            _rope.substring(offset, offset + 1) == char) {
+        final next = _documentCharAt(offset);
+        if (next == char) {
           _selection = TextSelection.collapsed(offset: offset + 1);
           notifyListeners();
           return;
@@ -5453,9 +5542,18 @@ class CodeForgeController implements DeltaTextInputClient {
           final prevLine = lines[lines.length - 1];
           final indentMatch = RegExp(r'^\s*').firstMatch(prevLine);
           final prevIndent = indentMatch?.group(0) ?? '';
-          final shouldIndent = RegExp(r'[:{[(]\s*$').hasMatch(prevLine);
-          final extraIndent = shouldIndent ? tabSpace : '';
-          final indent = prevIndent + extraIndent;
+          final trimmedPrevLine = prevLine.trim();
+          var indent =
+              prevIndent +
+              (RegExp(r'[:{[(]\s*$').hasMatch(prevLine) ? tabSpace : '');
+          // `return`/`pass`/… end a Python block: the next line comes back
+          // one level out instead of continuing at the statement's depth.
+          if (autoDedentAfterBlockEnd &&
+              RegExp(
+                r'^(return|pass|break|continue|raise)\b',
+              ).hasMatch(trimmedPrevLine)) {
+            indent = _dedentOneLevel(indent);
+          }
           final openToClose = {'{': '}', '(': ')', '[': ']'};
           final trimmedPrev = prevLine.trimRight();
           final lastChar = trimmedPrev.isNotEmpty
@@ -5800,6 +5898,39 @@ class CodeForgeController implements DeltaTextInputClient {
     final deletedText = range.start < range.end
         ? _rope.substring(range.start, range.end)
         : '';
+
+    // Typing an opening bracket or quote over a selection wraps the selection
+    // in the pair instead of discarding it.
+    if (deletedText.isNotEmpty && text.length == 1) {
+      const pairs = {'(': ')', '{': '}', '[': ']', '"': '"', "'": "'"};
+      final closing = pairs[text];
+      if (closing != null) {
+        final inserted = '$text$deletedText$closing';
+        _rope.delete(range.start, range.end);
+        _rope.insert(range.start, inserted);
+        _currentVersion++;
+        final wrappedSelection = TextSelection(
+          baseOffset: range.start + 1,
+          extentOffset: range.start + 1 + deletedText.length,
+        );
+        _selection = wrappedSelection;
+        dirtyLine = _rope.getLineAtOffset(range.start);
+        dirtyRegion = TextRange(
+          start: range.start,
+          end: range.start + inserted.length,
+        );
+        _recordReplacement(
+          range.start,
+          deletedText,
+          inserted,
+          selectionBefore,
+          wrappedSelection,
+        );
+        _imeSelectionNeedsResync = true;
+        _invalidateImeSnapshotAndScheduleSync();
+        return;
+      }
+    }
 
     _rope.delete(range.start, range.end);
     _rope.insert(range.start, text);

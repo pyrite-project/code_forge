@@ -47,3 +47,5 @@ macos/Flutter/ephemeral/Flutter-Generated.xcconfig
 
 # FVM Version Cache
 .fvm/
+# Local test-support native runtime (copy from the host app build)
+code_forge.dll
