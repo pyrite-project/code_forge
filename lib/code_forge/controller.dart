@@ -805,6 +805,59 @@ class CodeForgeController implements DeltaTextInputClient {
     _rebuildFoldSortedCache();
   }
 
+  /// Snapshot of every currently folded range, ordered by start line.
+  ///
+  /// Nested ranges that were folded before their parent collapsed travel in
+  /// the parent's [FoldRangeSnapshot.children], so a save/restore round trip
+  /// can re-collapse them when the parent is unfolded.
+  List<FoldRangeSnapshot> get foldedRanges {
+    final lines = _foldings.keys.toList()..sort();
+    return [
+      for (final line in lines)
+        if (_foldings[line] != null && _foldings[line]!.isFolded)
+          _snapshotFoldRange(_foldings[line]!),
+    ];
+  }
+
+  FoldRangeSnapshot _snapshotFoldRange(FoldRange fold) {
+    return FoldRangeSnapshot(
+      startLine: fold.startIndex,
+      endLine: fold.endIndex,
+      children: [
+        for (final child in fold.originallyFoldedChildren)
+          _snapshotFoldRange(child),
+      ],
+    );
+  }
+
+  /// Seeds the folded ranges of a restored session.
+  ///
+  /// Call before the editor mounts. The ranges are honored from the first
+  /// layout — the fold cache and layout map are built from [foldings] — and
+  /// when the editor recomputes fold ranges for a line it transfers the folded
+  /// flag from a seeded range at the same start line, so the state survives
+  /// the recomputation. Ranges that no longer match the document (the file
+  /// changed while the app was closed) are restored best-effort.
+  void restoreFoldedRanges(List<FoldRangeSnapshot> ranges) {
+    final map = <int, FoldRange?>{};
+
+    FoldRange buildFold(FoldRangeSnapshot range, {required bool folded}) {
+      final fold = FoldRange(range.startLine, range.endLine)..isFolded = folded;
+      for (final child in range.children) {
+        final childFold = buildFold(child, folded: false);
+        fold.addOriginallyFoldedChild(childFold);
+        map[childFold.startIndex] = childFold;
+      }
+      return fold;
+    }
+
+    for (final range in ranges) {
+      final fold = buildFold(range, folded: true);
+      map[fold.startIndex] = fold;
+    }
+    foldings = map;
+  }
+
   /// List of search highlights to display in the editor.
   ///
   /// Add [SearchHighlight] objects to this list to highlight
@@ -4614,6 +4667,64 @@ class CodeForgeController implements DeltaTextInputClient {
   void setScrollCallback(void Function(int line)? scrollToLine) {
     _scrollToLineCallback = scrollToLine;
   }
+
+  /// Clears the scroll callback only if [callback] is still the registered
+  /// one.
+  ///
+  /// Two render objects can briefly exist for one controller while a keyed
+  /// widget swap inflates the replacement before the outgoing renderer
+  /// unmounts; the outgoing renderer must not wipe the replacement's
+  /// registration, or every later [scrollToLine] finds nothing to drive.
+  void detachScrollCallback(void Function(int line) callback) {
+    if (identical(_scrollToLineCallback, callback)) {
+      _scrollToLineCallback = null;
+    }
+  }
+
+  int? Function()? _firstVisibleLineProvider;
+  void Function(int line)? _jumpToLineCallback;
+
+  /// Sets the viewport callbacks - called by the render object.
+  ///
+  /// [firstVisibleLine] reports the zero-based index of the topmost visible
+  /// line (null while the editor has no scroll position yet); [jumpToLine]
+  /// scrolls instantly so the given line is the topmost visible one, without
+  /// animating, unfolding or highlighting.
+  void setViewportCallbacks({
+    int? Function()? firstVisibleLine,
+    void Function(int line)? jumpToLine,
+  }) {
+    _firstVisibleLineProvider = firstVisibleLine;
+    _jumpToLineCallback = jumpToLine;
+  }
+
+  /// The zero-based index of the topmost visible line, or null when the
+  /// editor has not been laid out (no mounted viewport reported a line yet).
+  int? get firstVisibleLine => _firstVisibleLineProvider?.call();
+
+  /// Scrolls instantly so [line] is the topmost visible line.
+  ///
+  /// Unlike [scrollToLine] this neither centers the line, unfolds covering
+  /// regions, animates nor highlights — it is meant for restoring a saved
+  /// viewport.
+  void jumpToLine(int line) {
+    if (_jumpToLineCallback == null) {
+      throw StateError('Editor is not initialized');
+    }
+    if (line < 0 || line >= lineCount) {
+      throw RangeError.range(line, 0, lineCount - 1, 'line');
+    }
+    _jumpToLineCallback!(line);
+  }
+
+  /// The topmost line to restore the viewport to, consumed by the editor on
+  /// mount.
+  ///
+  /// Session restore sets this on a controller whose editor may not be mounted
+  /// yet (a background tab); when the editor's render object is created it
+  /// jumps to this line once and clears it. Null leaves the mount scroll
+  /// behavior untouched.
+  int? pendingViewportLine;
 
   /// Scrolls the editor view to make the specified line visible.
   ///

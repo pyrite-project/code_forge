@@ -411,6 +411,48 @@ class FoldRange {
   int get hashCode => startIndex.hashCode ^ endIndex.hashCode;
 }
 
+/// Immutable copy of a folded region, safe to hold outside the editor.
+///
+/// The controller hands these out so callers can persist the folded state of a
+/// session and seed it back into a fresh controller with
+/// `CodeForgeController.restoreFoldedRanges`. [children] are nested ranges
+/// that were folded before their parent collapsed; seeding them lets the
+/// editor re-collapse them when the parent is unfolded again.
+class FoldRangeSnapshot {
+  final int startLine;
+  final int endLine;
+  final List<FoldRangeSnapshot> children;
+
+  const FoldRangeSnapshot({
+    required this.startLine,
+    required this.endLine,
+    this.children = const [],
+  });
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is FoldRangeSnapshot &&
+        other.startLine == startLine &&
+        other.endLine == endLine &&
+        _childrenEqual(other.children, children);
+  }
+
+  static bool _childrenEqual(
+    List<FoldRangeSnapshot> a,
+    List<FoldRangeSnapshot> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hash(startLine, endLine, Object.hashAll(children));
+}
+
 /// Custom scroll physics that reverses horizontal drag direction for RTL mode on mobile.
 class RTLAwareScrollPhysics extends ClampingScrollPhysics {
   final bool isRTL;

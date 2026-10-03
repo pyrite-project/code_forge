@@ -5716,6 +5716,11 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final LspConfig? lspConfig;
   final VoidCallback? onHoverSetByTap;
   final ValueChanged<int>? onModifierTap;
+
+  /// The scroll callback this renderer registered on the controller, kept so
+  /// [dispose] can detach exactly it — see [CodeForgeController
+  /// .detachScrollCallback].
+  void Function(int line)? _scrollCallback;
   final Map<int, double> _lineWidthCache = {};
   final Map<int, String> _lineTextCache = {};
   final Map<int, Rect> _actionBulbRects = {};
@@ -6144,6 +6149,20 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
     _syntaxHighlighter = _createSyntaxHighlighter();
     _layoutMap = LayoutMap();
+
+    // A restored session seeds `controller.foldings` before this render object
+    // exists. Hydrate the fold cache from it so collapsed regions are honored
+    // from the first layout — the folded-line cache and the gutter read
+    // `_foldRanges`, while the layout map reads `controller.foldings` — and so
+    // the seeded ranges survive fold recomputation (which keeps whatever is
+    // already cached). The layout map below reads the same map, so this must
+    // run before it.
+    for (final entry in controller.foldings.entries) {
+      final fold = entry.value;
+      if (fold != null) {
+        _foldRanges[entry.key] = fold;
+      }
+    }
     _rebuildLayoutMap();
 
     _gutterPadding = fontSize;
@@ -6293,7 +6312,13 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
     }
 
-    controller.setScrollCallback(_scrollToLine);
+    _scrollCallback = _scrollToLine;
+    controller.setScrollCallback(_scrollCallback);
+    controller.setViewportCallbacks(
+      firstVisibleLine: firstVisibleLineIndex,
+      jumpToLine: _jumpToLine,
+    );
+    _restorePendingViewportLine();
 
     isHoveringPopup.addListener(_handleHoveringPopupChanged);
 
@@ -7645,6 +7670,46 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     }
   }
 
+  /// Consumes [CodeForgeController.pendingViewportLine], if a session restore
+  /// left one, and jumps to that line once the first layout has run.
+  ///
+  /// The jump is deferred to after the mount frame so the scroll position has
+  /// clients and content dimensions. It must win over any caret-centering
+  /// scroll that happens during that layout: the saved top line is what the
+  /// user actually saw, so it is applied last.
+  void _restorePendingViewportLine() {
+    final line = controller.pendingViewportLine;
+    if (line == null) return;
+    controller.pendingViewportLine = null;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _jumpToLine(line);
+    });
+  }
+
+  /// The zero-based index of the topmost visible line, or null when the
+  /// viewport has no scroll position yet.
+  int? firstVisibleLineIndex() {
+    if (!vscrollController.hasClients || controller.lineCount == 0) {
+      return null;
+    }
+    return _findVisibleLineByYPosition(
+      vscrollController.offset,
+    ).clamp(0, controller.lineCount - 1);
+  }
+
+  /// Jumps instantly so [line] is the topmost visible line.
+  ///
+  /// Unlike [_scrollToLine] this neither unfolds covering regions, animates,
+  /// nor highlights — restoring a saved viewport must not change the fold
+  /// state it is restoring.
+  void _jumpToLine(int line) {
+    if (!vscrollController.hasClients) return;
+    if (line < 0 || line >= controller.lineCount) return;
+    final targetY = _getLineYOffset(line, _hasActiveFolds);
+    final maxScroll = vscrollController.position.maxScrollExtent;
+    vscrollController.jumpTo(targetY.clamp(0.0, maxScroll));
+  }
+
   void _scrollToLine(int line) {
     if (line < 0 || line >= controller.lineCount) return;
 
@@ -7686,6 +7751,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           curve: Curves.easeInOut,
         )
         .then((_) {
+          // The scroll can outlive the renderer: closing the tab (or swapping
+          // the widget) mid-animation disposes the highlight controller before
+          // this callback runs.
+          if (!attached) return;
           _highlightedLine = line;
           lineHighlightController.forward(from: 0.0);
         });
@@ -12848,7 +12917,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   void dispose() {
     controller.removeListener(_onControllerChange);
     lspActionNotifier.removeListener(markNeedsPaint);
-    controller.setScrollCallback(null);
+    // Identity-guarded: a keyed widget swap can dispose this renderer after
+    // its replacement already registered; nulling unconditionally would wipe
+    // the replacement's callback and permanently break scrollToLine.
+    if (_scrollCallback != null) {
+      controller.detachScrollCallback(_scrollCallback!);
+    }
     isHoveringPopup.removeListener(_handleHoveringPopupChanged);
     _hoverDismissTimer?.cancel();
     _syntaxHighlighter.dispose();
