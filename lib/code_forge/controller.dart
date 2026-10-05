@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -605,9 +606,7 @@ class CodeForgeController implements DeltaTextInputClient {
       codeActionsNotifier.value = null;
     }
     _openedFile = file;
-    if (openedFile != null) {
-      text = File(_openedFile!).readAsStringSync();
-    }
+    _readOpenedFile();
 
     if (previousFile != openedFile &&
         lspConfig != null &&
@@ -4599,9 +4598,19 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Refetch the current file to delflect text changes
   /// Only works if a valid file is provided via `filePath`.
   void refetchFile() {
-    if (_openedFile != null) {
-      text = File(_openedFile!).readAsStringSync();
-    }
+    _readOpenedFile();
+  }
+
+  /// Loads [_openedFile] into [text].
+  ///
+  /// dart:io exposes no synchronous filesystem access in the browser, so on the
+  /// web the text already assigned by the caller is kept. PyriteIDE reads files
+  /// through its own asynchronous filesystem layer and assigns `text` before the
+  /// editor widget is built, so the buffer still matches the file on disk.
+  void _readOpenedFile() {
+    final file = _openedFile;
+    if (file == null || kIsWeb) return;
+    text = File(file).readAsStringSync();
   }
 
   /// Disposes of the controller and releases resources.

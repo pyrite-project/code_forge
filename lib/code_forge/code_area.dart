@@ -915,7 +915,13 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       _controller,
       TextInputConfiguration(
         readOnly: widget.readOnly,
-        enableDeltaModel: true,
+        // The browser engine has no incremental-input model: it infers a delta
+        // from the DOM element and the selection it last cached. Because this
+        // editor mirrors the selection into the element itself, that inference
+        // can produce a delta whose old selection is past the end of its old
+        // text, which the framework rejects. The whole-text path is always
+        // available and the controller diffs it against its own buffer.
+        enableDeltaModel: !kIsWeb,
         enableSuggestions: widget.enableKeyboardSuggestions,
         inputType: widget.keyboardType,
         inputAction: TextInputAction.newline,
@@ -7010,7 +7016,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final match = foldsFindMatchingBracket(
       rope: controller.rope.core,
       targetOffset: pos,
-    );
+    ).toInt();
 
     final result = match == -1 ? null : match;
 
