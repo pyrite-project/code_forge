@@ -25,11 +25,17 @@ const int kSemanticTokenViewportPaddingLines = 1500;
 const int kExactWrappedHeightThreshold = 512;
 const int kWrappedHeightSampleSize = 64;
 
-/// Gap kept between the hovered line and the LSP hover popup.
+/// Clearance kept between the hovered line and the LSP hover popup, on
+/// whichever side the popup opens.
 ///
-/// Deliberately smaller than `popupBottomGap`: the hover popup is anchored to
-/// the line being documented, so a wide gap reads as a detached popup.
-const double kHoverAnchorGap = 6.0;
+/// The anchor is the *top* of the line being documented, so the popup hugs
+/// that line: [kHoverAnchorGap] above its top edge, or one line height plus
+/// [kHoverAnchorGap] below its bottom edge. It never covers the word, and it
+/// lands in the same place every time.
+///
+/// Currently 0 - the popup sits flush against the hovered line. Raise it to
+/// pull the popup away from the text without touching any call site.
+const double kHoverAnchorGap = 0.0;
 
 /// Padding applied inside `code_forge`'s floating overlays (hover, signature
 /// help, documentation, completion and code-action popups).
@@ -646,6 +652,27 @@ class CodeForge extends StatefulWidget {
   /// Using the same shortcut on multiple operations may causes undefined behaviour.**
   final CodeForgeKeyboardShortcuts keyboardShotcuts;
 
+  /// Invoked by `Ctrl+Shift+/`.
+  ///
+  /// Block comment delimiters belong to the language, and this engine has no
+  /// grammar of its own — it only knows how to insert and remove a pair it is
+  /// given. The host resolves the pair for the current file and calls
+  /// [CodeForgeController.toggleBlockComment], or does nothing for a language
+  /// that has none.
+  final VoidCallback? onToggleBlockComment;
+
+  /// Invoked by `Shift+Alt+F`.
+  ///
+  /// Formatting is a language-server operation; a host without one simply
+  /// leaves this null and the key falls through untouched.
+  final VoidCallback? onFormatDocument;
+
+  /// Invoked by `Shift+F12`.
+  final VoidCallback? onFindReferences;
+
+  /// Invoked by `Ctrl+F12`.
+  final VoidCallback? onGoToImplementation;
+
   /// Styling options for text selection and cursor.
   final CodeSelectionStyle? selectionStyle;
 
@@ -683,6 +710,13 @@ class CodeForge extends StatefulWidget {
 
   /// Styling options for search match highlighting.
   final MatchHighlightStyle? matchHighlightStyle;
+
+  /// Underline colors for LSP diagnostics, one per severity.
+  ///
+  /// When null the renderer keeps its fixed fallback palette; hosts that want
+  /// the squiggles to follow the active theme pass an instance derived from
+  /// their color scheme.
+  final DiagnosticColorsStyle? diagnosticColors;
 
   /// The file path for LSP features.
   ///
@@ -822,6 +856,10 @@ class CodeForge extends StatefulWidget {
     this.textStyle,
     this.innerPadding,
     this.keyboardShotcuts = const CodeForgeKeyboardShortcuts(),
+    this.onToggleBlockComment,
+    this.onFormatDocument,
+    this.onFindReferences,
+    this.onGoToImplementation,
     this.customCodeSnippets,
     this.customContextMenuItems,
     this.contextMenuBuilder,
@@ -851,6 +889,7 @@ class CodeForge extends StatefulWidget {
     this.overlayBorderRadius,
     this.markdownCodeBlockBorderRadius,
     this.matchHighlightStyle,
+    this.diagnosticColors,
     this.extraLanguages = const [],
     this.finderBuilder,
     this.findController,
@@ -942,7 +981,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final FindController _findController;
   late final VoidCallback _semanticTokensListener;
   late final VoidCallback _controllerListener;
-  late final VoidCallback _scrollbarLineNumberListener;
   late final bool _deleteFoldRangeOnDeletingFirstLine;
   late final VoidCallback _signatureListener, _hoverListener;
   late final VoidCallback _isHoveringPopupListener, _selectedSuggestionListener;
@@ -951,7 +989,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late bool _readOnly;
   final ValueNotifier<Offset> _offsetNotifier = ValueNotifier(Offset(0, 0));
   final ValueNotifier<Offset?> _lspActionOffsetNotifier = ValueNotifier(null);
-  final ValueNotifier<int> _scrollbarLineNumberIndicator = ValueNotifier(1);
   final _isMobile = Platform.isAndroid || Platform.isIOS;
   final _suggScrollController = ScrollController();
   final _actionScrollController = ScrollController();
@@ -963,6 +1000,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   TextInputConnection? _connection;
   StreamSubscription? _lspResponsesSubscription;
   bool _isHovering = false, _isSignatureInvoked = false;
+
+  /// Mirrors [CodeForgeController.scrollbarForcedVisible] so the build can
+  /// widen the scrollbar's visibility condition without watching the
+  /// notifier directly.
+  bool _scrollbarForcedVisible = false;
+
+  void _onScrollbarForcedVisibleChanged() {
+    if (!mounted) return;
+    setState(
+      () => _scrollbarForcedVisible = _controller.scrollbarForcedVisible.value,
+    );
+  }
+
   bool _isMobileSuggActive = false, _isInjectingSnippets = false;
   bool _snippetsActive = false, _hoverSetByTap = false;
   int _prevSnippetTextLength = 0, _semanticTokensVersion = 0;
@@ -1069,12 +1119,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         ScrollbarDecoration(
           thumbColor: _editorTheme['root']?.color?.withAlpha(150),
           thickness: 8,
-          lineNumberStyle: TextStyle(
-            color: _editorTheme['root']?.backgroundColor ?? Colors.black,
-            fontSize: widget.textStyle?.fontSize ?? 14,
-            fontFamily: widget.textStyle?.fontFamily,
-            fontWeight: widget.textStyle?.fontWeight ?? FontWeight.bold,
-          ),
         );
 
     _gutterStyle =
@@ -1248,7 +1292,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
     _controllerListener = () {
       _resetCursorBlink();
-      _updateScrollbarLineNumberIndicator();
 
       _isMobileSuggActive = _controller.currentlySelectedSuggestion != null;
 
@@ -1286,8 +1329,14 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
     _controller.addListener(_controllerListener);
 
-    _scrollbarLineNumberListener = _updateScrollbarLineNumberIndicator;
-    _vscrollController.addListener(_scrollbarLineNumberListener);
+    // Hosts that overlay the scrollbar area (the minimap) absorb the pointer
+    // events that would normally hover the editor; they announce hover
+    // through this flag instead, and the scrollbar shows with its own
+    // decoration either way.
+    _scrollbarForcedVisible = _controller.scrollbarForcedVisible.value;
+    _controller.scrollbarForcedVisible.addListener(
+      _onScrollbarForcedVisibleChanged,
+    );
 
     _hoverListener = () {
       final hov = _hoverNotifier.value;
@@ -1391,7 +1440,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     _suggestionNotifier.addListener(_snippetNotifierListener);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _updateScrollbarLineNumberIndicator();
       if (widget.autoFocus) {
         _focusNode.requestFocus();
       } else {
@@ -1444,18 +1492,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
             selection: _controller.selection,
           ),
     );
-  }
-
-  void _updateScrollbarLineNumberIndicator() {
-    final renderObject = _codeFieldRenderer;
-    if (renderObject == null) return;
-
-    final lineNumber = renderObject.getScrollbarLineNumberAtScrollOffset(
-      _vscrollController.hasClients ? _vscrollController.offset : 0.0,
-    );
-    if (_scrollbarLineNumberIndicator.value != lineNumber) {
-      _scrollbarLineNumberIndicator.value = lineNumber;
-    }
   }
 
   void _scrollToSelectedSuggestion() {
@@ -1726,8 +1762,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   void dispose() {
     _modifierKeysObserver.detach();
     _controller.removeListener(_controllerListener);
+    _controller.scrollbarForcedVisible.removeListener(
+      _onScrollbarForcedVisibleChanged,
+    );
     _controller.semanticTokens.removeListener(_semanticTokensListener);
-    _vscrollController.removeListener(_scrollbarLineNumberListener);
     _lspSignatureNotifier.removeListener(_signatureListener);
     _hoverNotifier.removeListener(_hoverListener);
     _isHoveringPopup.removeListener(_isHoveringPopupListener);
@@ -2236,6 +2274,54 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     _isInjectingSnippets = false;
   }
 
+  /// Scrolls by one viewport and moves the caret with it.
+  ///
+  /// The old behaviour was a hard-coded 650 pixels, which meant "a page" was
+  /// about a third of a short window and three short windows on a tall one.
+  /// The distance now comes from the actual viewport, and the caret moves
+  /// with it by the same number of lines — without that the page scrolls out
+  /// from under a caret that stayed put, and the next keystroke lands in the
+  /// part of the file the user just scrolled away from.
+  void _pageScroll({required bool downwards}) {
+    if (!_vscrollController.hasClients) return;
+    final viewport = _vscrollController.position.viewportDimension;
+    if (viewport <= 0) return;
+
+    // Leave a tenth of the viewport showing so consecutive presses overlap and
+    // no line is ever skipped entirely between them.
+    final step = viewport * 0.9 * (downwards ? 1 : -1);
+    final target = (_vscrollController.offset + step).clamp(
+      _vscrollController.position.minScrollExtent,
+      _vscrollController.position.maxScrollExtent,
+    );
+    _vscrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.ease,
+    );
+
+    // The line height is published by the render object rather than held here,
+    // so a page is measured in lines against the same metric the renderer used
+    // to lay the text out.
+    final lineHeight = _controller.editorLineHeight;
+    if (lineHeight == null || lineHeight <= 0) return;
+    final linesPerPage = (viewport / lineHeight).floor().clamp(1, 100000);
+    final caret = _controller.selection.extentOffset;
+    final currentLine = _controller.getLineAtOffset(caret);
+    final column = caret - _controller.getLineStartOffset(currentLine);
+    final targetLine = (currentLine + (downwards ? linesPerPage : -linesPerPage))
+        .clamp(0, _controller.lineCount - 1);
+    final targetColumn = column.clamp(
+      0,
+      _controller.getLineText(targetLine).length,
+    );
+    _controller.setSelectionImmediately(
+      TextSelection.collapsed(
+        offset: _controller.getLineStartOffset(targetLine) + targetColumn,
+      ),
+    );
+  }
+
   void _commonKeyFunctions() {
     if (_aiNotifier.value != null) {
       _aiNotifier.value = null;
@@ -2413,11 +2499,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                         textDirection: widget.textDirection,
                         child: CustomScrollbar(
                           controller: _vscrollController,
-                          lineNumberNotifier: _scrollbarLineNumberIndicator,
-                          textDirection: widget.textDirection,
                           borderRadius: _scrollbarDecoration.borderRadius,
-                          showLineNumberIndicator:
-                              _scrollbarDecoration.showLineNumberIndicator,
                           thickness: _scrollbarDecoration.thickness,
                           thumbColor: _scrollbarDecoration.thumbColor,
                           interactive: _scrollbarDecoration.interactive ?? true,
@@ -2439,16 +2521,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           trackColor: _scrollbarDecoration.trackColor,
                           notificationPredicate:
                               _scrollbarDecoration.notificationPredicate,
-                          thumbVisibility: _isHovering,
-                          lineNumberStyle:
-                              _scrollbarDecoration.lineNumberStyle ??
-                              TextStyle(
-                                color:
-                                    _editorTheme['root']?.backgroundColor ??
-                                    Colors.black,
-                                fontSize: widget.textStyle?.fontSize ?? 14,
-                                fontFamily: widget.textStyle?.fontFamily,
-                              ),
+                          thumbVisibility:
+                              _isHovering || _scrollbarForcedVisible,
                           child: Transform(
                             alignment: Alignment.center,
                             transform: widget.textDirection == TextDirection.rtl
@@ -2549,6 +2623,226 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                             .duplicateLine();
                                                         _commonKeyFunctions();
                                                       }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                        .selectNextOccurrence
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _controller
+                                                            .selectNextOccurrence();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.deleteLine
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _controller.deleteLine();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.shiftLineUp
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _controller.moveLineUp();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.shiftLineDown
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      if (!_readOnly) {
+                                                        _controller
+                                                            .moveLineDown();
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.columnSelectDown
+                                                            .accepts(
+                                                              event,
+                                                              HardwareKeyboard
+                                                                  .instance,
+                                                            ) ||
+                                                        shrtCt.columnSelectUp
+                                                            .accepts(
+                                                              event,
+                                                              HardwareKeyboard
+                                                                  .instance,
+                                                            )) {
+                                                      final downwards = shrtCt
+                                                          .columnSelectDown
+                                                          .accepts(
+                                                            event,
+                                                            HardwareKeyboard
+                                                                .instance,
+                                                          );
+                                                      if (!_readOnly) {
+                                                        if (_controller
+                                                                .hasColumnSelection) {
+                                                          _controller
+                                                              .extendColumnSelection(
+                                                                downwards:
+                                                                    downwards,
+                                                              );
+                                                        } else {
+                                                          _controller
+                                                              .startColumnSelection();
+                                                        }
+                                                        _commonKeyFunctions();
+                                                      }
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.toggleBlockComment
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      // The delimiters are the
+                                                      // host's business: this
+                                                      // engine has no grammar
+                                                      // and refuses to guess
+                                                      // one, so the key is
+                                                      // declared here and the
+                                                      // host that has a real
+                                                      // block comment
+                                                      // implements it.
+                                                      widget.onToggleBlockComment
+                                                          ?.call();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.formatDocument
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      widget.onFormatDocument
+                                                          ?.call();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.findReferences
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      widget.onFindReferences
+                                                          ?.call();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt
+                                                            .goToImplementation
+                                                            .accepts(
+                                                              event,
+                                                              HardwareKeyboard
+                                                                  .instance,
+                                                            )) {
+                                                      widget.onGoToImplementation
+                                                          ?.call();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.foldRegion
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      _controller.toggleFold(
+                                                        _controller.getLineAtOffset(
+                                                          _controller
+                                                              .selection
+                                                              .extentOffset,
+                                                        ),
+                                                      );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.unfoldRegion
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      // Toggling a fold that is
+                                                      // already open closes it, so
+                                                      // the unbind key has to go
+                                                      // through the same path.
+                                                      _controller.toggleFold(
+                                                        _controller.getLineAtOffset(
+                                                          _controller
+                                                              .selection
+                                                              .extentOffset,
+                                                        ),
+                                                      );
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.foldAll.accepts(
+                                                      event,
+                                                      HardwareKeyboard
+                                                          .instance,
+                                                    )) {
+                                                      _controller.foldAll();
+                                                      _commonKeyFunctions();
+                                                      return KeyEventResult
+                                                          .handled;
+                                                    }
+
+                                                    if (shrtCt.unfoldAll.accepts(
+                                                      event,
+                                                      HardwareKeyboard
+                                                          .instance,
+                                                    )) {
+                                                      _controller.unfoldAll();
+                                                      _commonKeyFunctions();
                                                       return KeyEventResult
                                                           .handled;
                                                     }
@@ -3203,14 +3497,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .enter:
                                                           case LogicalKeyboardKey
                                                               .tab:
-                                                            _acceptSuggestion();
-                                                            if (_extraText
-                                                                .isNotEmpty) {
-                                                              _controller
-                                                                  .applyWorkspaceEdit(
-                                                                    _extraText,
-                                                                  );
-                                                            }
+                                                            _controller
+                                                                .runAsSingleUndo(
+                                                                  () async {
+                                                                    _acceptSuggestion();
+                                                                    if (_extraText
+                                                                        .isNotEmpty) {
+                                                                      await _controller
+                                                                          .applyWorkspaceEdit(
+                                                                            _extraText,
+                                                                          );
+                                                                    }
+                                                                  },
+                                                                );
                                                             setState(() {
                                                               _isSignatureInvoked =
                                                                   true;
@@ -3641,35 +3940,17 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
                                                         case LogicalKeyboardKey
                                                             .pageUp:
-                                                          _vscrollController
-                                                              .animateTo(
-                                                                _vscrollController
-                                                                        .offset -
-                                                                    650,
-                                                                duration: Duration(
-                                                                  milliseconds:
-                                                                      300,
-                                                                ),
-                                                                curve:
-                                                                    Curves.ease,
-                                                              );
+                                                          _pageScroll(
+                                                            downwards: false,
+                                                          );
                                                           return KeyEventResult
                                                               .handled;
 
                                                         case LogicalKeyboardKey
                                                             .pageDown:
-                                                          _vscrollController
-                                                              .animateTo(
-                                                                _vscrollController
-                                                                        .offset +
-                                                                    650,
-                                                                duration: Duration(
-                                                                  milliseconds:
-                                                                      300,
-                                                                ),
-                                                                curve:
-                                                                    Curves.ease,
-                                                              );
+                                                          _pageScroll(
+                                                            downwards: true,
+                                                          );
                                                           return KeyEventResult
                                                               .handled;
 
@@ -3766,6 +4047,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                         widget.ghostTextStyle,
                                                     matchHighlightStyle: widget
                                                         .matchHighlightStyle,
+                                                    diagnosticColors:
+                                                        widget.diagnosticColors,
                                                     lspActionNotifier:
                                                         _lspActionNotifier,
                                                     lspActionOffsetNotifier:
@@ -4426,18 +4709,23 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                     : item
                                                                           as String;
                                                                 _controller
-                                                                    .insertAtCurrentCursor(
-                                                                      text,
-                                                                      replaceTypedChar:
-                                                                          true,
+                                                                    .runAsSingleUndo(
+                                                                      () async {
+                                                                        _controller
+                                                                            .insertAtCurrentCursor(
+                                                                              text,
+                                                                              replaceTypedChar:
+                                                                                  true,
+                                                                            );
+                                                                        if (_extraText
+                                                                            .isNotEmpty) {
+                                                                          await _controller
+                                                                              .applyWorkspaceEdit(
+                                                                                _extraText,
+                                                                              );
+                                                                        }
+                                                                      },
                                                                     );
-                                                                if (_extraText
-                                                                    .isNotEmpty) {
-                                                                  _controller
-                                                                      .applyWorkspaceEdit(
-                                                                        _extraText,
-                                                                      );
-                                                                }
                                                                 _suggestionNotifier
                                                                         .value =
                                                                     null;
@@ -4788,12 +5076,21 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                     .clamp(minimumLeft, maximumLeft)
                                     .toDouble();
 
+                          // The anchor is the top of the hovered line, so the
+                          // popup hugs that line: [kHoverAnchorGap] above its
+                          // top edge, or one line height plus
+                          // [kHoverAnchorGap] below its bottom edge.
+                          final lineHeight =
+                              _controller.editorLineHeight ??
+                              (widget.textStyle?.fontSize ?? 14) *
+                                  (widget.textStyle?.height ?? 1.2);
+                          final gapAbove = kHoverAnchorGap;
+                          final gapBelow = lineHeight + kHoverAnchorGap;
+
                           final spaceBelow =
-                              overlayBounds.bottom -
-                              position.dy -
-                              kHoverAnchorGap;
+                              overlayBounds.bottom - position.dy - gapBelow;
                           final spaceAbove =
-                              position.dy - overlayBounds.top - kHoverAnchorGap;
+                              position.dy - overlayBounds.top - gapAbove;
                           final shouldPositionAbove =
                               maxHeight > spaceBelow &&
                               spaceAbove >= spaceBelow;
@@ -4824,8 +5121,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                             child: CustomSingleChildLayout(
                               delegate: _AnchoredPopupLayoutDelegate(
                                 anchorY: position.dy,
-                                gapAbove: kHoverAnchorGap,
-                                gapBelow: kHoverAnchorGap,
+                                gapAbove: gapAbove,
+                                gapBelow: gapBelow,
                                 positionAbove: shouldPositionAbove,
                                 left: adjustedLeft,
                                 maxHeight: availableHeight,
@@ -5527,6 +5824,7 @@ class _CodeField extends LeafRenderObjectWidget {
   final TextStyle? ghostTextStyle;
   final String? filePath;
   final MatchHighlightStyle? matchHighlightStyle;
+  final DiagnosticColorsStyle? diagnosticColors;
   final VoidCallback? onHoverSetByTap;
   final VoidCallback? onCodeActionPopupOpened;
   final ValueChanged<int>? onModifierTap;
@@ -5583,6 +5881,7 @@ class _CodeField extends LeafRenderObjectWidget {
     this.innerPadding,
     this.ghostTextStyle,
     this.matchHighlightStyle,
+    this.diagnosticColors,
     this.onHoverSetByTap,
     this.onCodeActionPopupOpened,
     this.onModifierTap,
@@ -5609,6 +5908,7 @@ class _CodeField extends LeafRenderObjectWidget {
       lineHighlightController: lineHighlightController,
       textStyle: textStyle,
       matchHighlightStyle: matchHighlightStyle,
+      diagnosticColors: diagnosticColors,
       enableFolding: enableFolding,
       enableGuideLines: enableGuideLines,
       enableGutter: enableGutter,
@@ -5674,7 +5974,8 @@ class _CodeField extends LeafRenderObjectWidget {
       ..selectionStyle = selectionStyle
       ..ghostTextStyle = ghostTextStyle
       ..smoothCursor = smoothCursor
-      ..textDirection = textDirection;
+      ..textDirection = textDirection
+      ..diagnosticColors = diagnosticColors;
   }
 }
 
@@ -5746,8 +6047,38 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final Map<int, int> _lineIndentCache = {};
   final MatchHighlightStyle? _matchHighlightStyle;
   final MatchHighlightStyle? matchHighlightStyle;
+  DiagnosticColorsStyle? _diagnosticColors;
   final _dtap = DoubleTapGestureRecognizer();
   final _onetap = TapGestureRecognizer();
+
+  /// When the previous pointer-down happened, and on which line.
+  ///
+  /// Flutter ships no triple-tap recognizer, so the third click is detected
+  /// here from the timing of consecutive pointer-downs. Double-tap is left to
+  /// [_dtap] because it already owns the word-selection gesture; this only
+  /// adds the step after it.
+  DateTime? _lastTapDownAt;
+  int? _lastTapDownLine;
+
+  static const Duration _tripleTapWindow = Duration(milliseconds: 450);
+
+  /// Records this pointer-down and reports whether it completes a triple click.
+  ///
+  /// The line, not the exact position, is what has to repeat: clicking the
+  /// three words of one line at slightly different columns is still a
+  /// triple-click on that line, and demanding the same column would make the
+  /// gesture feel broken.
+  bool _isTripleTapOnSameLine(int textOffset) {
+    final now = DateTime.now();
+    final line = controller.getLineAtOffset(textOffset);
+    final previousAt = _lastTapDownAt;
+    final previousLine = _lastTapDownLine;
+    _lastTapDownAt = now;
+    _lastTapDownLine = line;
+    if (previousAt == null || previousLine != line) return false;
+    return now.difference(previousAt) < _tripleTapWindow;
+  }
+
   final GutterBuilder? gutterBuilder;
   late double _gutterPadding;
   late final Paint _caretPainter;
@@ -6128,6 +6459,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     this.lspConfig,
     this.filePath,
     this.matchHighlightStyle,
+    DiagnosticColorsStyle? diagnosticColors,
     this.onHoverSetByTap,
     this.onModifierTap,
     EdgeInsets? innerPadding,
@@ -6138,7 +6470,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
        _gutterStyle = gutterStyle,
        _lineWrap = lineWrap,
        _innerPadding = innerPadding,
-       _matchHighlightStyle = matchHighlightStyle {
+       _matchHighlightStyle = matchHighlightStyle,
+       _diagnosticColors = diagnosticColors {
     final fontSize = _textStyle?.fontSize ?? 14.0;
     final fontFamily = _textStyle?.fontFamily;
     final color =
@@ -6146,6 +6479,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final lineHeightMultiplier = _textStyle?.height ?? 1.2;
 
     _lineHeight = fontSize * lineHeightMultiplier;
+    // Published for hosts that need pixel-accurate line metrics outside the
+    // renderer (the minimap uses it to map lines to scroll offsets).
+    controller.editorLineHeight = _lineHeight;
 
     _syntaxHighlighter = _createSyntaxHighlighter();
     _layoutMap = LayoutMap();
@@ -6176,7 +6512,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         );
       }
     } else {
-      _gutterWidth = 0;
+      _gutterWidth = _foldLaneOnlyWidth;
     }
     _cachedLineCount = controller.lineCount;
 
@@ -6219,15 +6555,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (hoverNotifier.value != null) {
         final lineChar = hoverNotifier.value!.$2;
-        final line = lineChar['line']!;
-        final hasActiveFolds = _hasActiveFolds;
-        final hoveredY = _getLineYOffset(line, hasActiveFolds);
-        final screenY =
-            hoveredY + (innerPadding?.top ?? 0) - vscrollController.offset;
-
         hoverNotifier.value = (
-          Offset(hoverNotifier.value!.$1.dx, screenY),
-          hoverNotifier.value!.$2,
+          Offset(hoverNotifier.value!.$1.dx, _hoverAnchorOf(lineChar).dy),
+          lineChar,
         );
       }
 
@@ -6251,37 +6581,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (hoverNotifier.value != null) {
         final lineChar = hoverNotifier.value!.$2;
-        final line = lineChar['line']!;
-        final char = lineChar['character']!;
-        final lineText = controller.getLineText(line);
-        final para =
-            _paragraphCache.containsKey(line) &&
-                _lineTextCache[line] == lineText
-            ? _paragraphCache[line]!
-            : _buildParagraph(lineText, width: lineWrap ? _wrapWidth : null);
-
-        double hoveredX = 0.0;
-        if (char > 0 && char <= lineText.length) {
-          final boxes = para.getBoxesForRange(0, char);
-          if (boxes.isNotEmpty) {
-            hoveredX = boxes.last.right;
-          }
-        }
-
-        final screenX = isRTL
-            ? size.width -
-                  _gutterWidth -
-                  (innerPadding?.right ?? 0) -
-                  hoveredX +
-                  (lineWrap ? 0 : _effectiveHScroll)
-            : hoveredX +
-                  _gutterWidth +
-                  (innerPadding?.left ?? 0) -
-                  (lineWrap ? 0 : _effectiveHScroll);
-
         hoverNotifier.value = (
-          Offset(screenX, hoverNotifier.value!.$1.dy),
-          hoverNotifier.value!.$2,
+          Offset(_hoverAnchorOf(lineChar).dx, hoverNotifier.value!.$1.dy),
+          lineChar,
         );
       }
 
@@ -6316,6 +6618,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     controller.setScrollCallback(_scrollCallback);
     controller.setViewportCallbacks(
       firstVisibleLine: firstVisibleLineIndex,
+      visibleLineCount: visibleLineCount,
       jumpToLine: _jumpToLine,
     );
     _restorePendingViewportLine();
@@ -6397,6 +6700,16 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   double get _foldIconSpace =>
       _enableFolding ? (_textStyle?.fontSize ?? 14.0) + 4 : 0;
 
+  /// Width of the fold lane kept when the gutter is off but folding is on.
+  ///
+  /// Folding used to require the gutter, because the fold chevron was painted
+  /// inside it and its hit area was the gutter's. Turning line numbers off
+  /// therefore silently turned off folding too, which is not what either switch
+  /// says. With the gutter off this reserves just the chevron's lane so the
+  /// icon is still visible and still clickable; zero when folding is off, so a
+  /// host that wants neither pays nothing.
+  double get _foldLaneOnlyWidth => _enableGutter ? 0 : _foldIconSpace;
+
   /// Auto gutter width for a line number [digits] characters wide.
   ///
   /// The code-action lane is part of it, so reserving the lane also pushes the
@@ -6445,6 +6758,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
   CodeSelectionStyle get selectionStyle => _selectionStyle;
 
+  set diagnosticColors(DiagnosticColorsStyle? style) {
+    if (identical(style, _diagnosticColors)) return;
+    _diagnosticColors = style;
+    markNeedsPaint();
+  }
+
   set editorTheme(Map<String, TextStyle> theme) {
     if (identical(theme, _editorTheme)) return;
     _editorTheme = theme;
@@ -6485,6 +6804,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final lineHeightMultiplier = style?.height ?? 1.2;
 
     _lineHeight = fontSize * lineHeightMultiplier;
+    controller.editorLineHeight = _lineHeight;
     _paragraphStyle = ui.ParagraphStyle(
       fontFamily: fontFamily,
       fontSize: fontSize,
@@ -6509,7 +6829,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         );
       }
     } else {
-      _gutterWidth = 0;
+      _gutterWidth = _foldLaneOnlyWidth;
     }
 
     if (_selectionStyle.cursorColor == null) {
@@ -6925,6 +7245,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       return;
     }
 
+    if (controller.columnSelectionChanged) {
+      controller.columnSelectionChanged = false;
+      markNeedsPaint();
+      return;
+    }
+
     if (controller.inlayHintsChanged) {
       controller.inlayHintsChanged = false;
       markNeedsPaint();
@@ -7105,7 +7431,6 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       _syntaxHighlighter.invalidateAll();
 
       if (enableGutter && gutterStyle.gutterWidth == null) {
-        final fontSize = textStyle?.fontSize ?? 14.0;
         _gutterWidth = _autoGutterWidth(
           newLineCount.toString().length,
           textStyle?.fontSize ?? 14.0,
@@ -7695,6 +8020,24 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     return _findVisibleLineByYPosition(
       vscrollController.offset,
     ).clamp(0, controller.lineCount - 1);
+  }
+
+  /// How many lines the viewport spans, counted from the topmost visible one
+  /// down to the line at the bottom edge.
+  ///
+  /// Reported instead of letting callers divide the scroll offset by the line
+  /// height: with wrapping on, a long line occupies several screen lines, so
+  /// that division returns a position that is not a line index.
+  int? visibleLineCount() {
+    if (!vscrollController.hasClients || controller.lineCount == 0) {
+      return null;
+    }
+    final top = vscrollController.offset;
+    final bottom =
+        top + vscrollController.position.viewportDimension;
+    final first = _findVisibleLineByYPosition(top);
+    final last = _findVisibleLineByYPosition(bottom);
+    return (last - first).clamp(1, controller.lineCount);
   }
 
   /// Jumps instantly so [line] is the topmost visible line.
@@ -8619,17 +8962,6 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     }
   }
 
-  int getScrollbarLineNumberAtScrollOffset(double scrollOffset) {
-    if (!vscrollController.hasClients || controller.lineCount == 0) {
-      return 1;
-    }
-
-    final lineIndex = _findVisibleLineByYPosition(
-      scrollOffset,
-    ).clamp(0, controller.lineCount - 1);
-    return lineIndex + 1;
-  }
-
   int getTextOffsetForPosition(Offset position) {
     return _getTextOffsetFromPosition(position);
   }
@@ -9146,6 +9478,14 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       hasActiveFolds,
     );
 
+    _drawColumnSelection(
+      canvas,
+      offset,
+      firstVisibleLine,
+      lastVisibleLine,
+      hasActiveFolds,
+    );
+
     if (enableGuideLines && (lastVisibleLine - firstVisibleLine) < 200) {
       _drawIndentGuides(
         canvas,
@@ -9335,7 +9675,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       );
     }
 
-    if (enableGutter) {
+    // The fold lane is painted by the gutter pass, so that pass runs when
+    // either switch is on. Without the gutter the pass draws no line numbers:
+    // it exists only to host the chevron.
+    if (enableGutter || enableFolding) {
       _drawGutter(
         canvas,
         offset,
@@ -9916,10 +10259,16 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
         String gutterText;
 
-        final builderText = gutterBuilder?.builder.call(
-          i + 1,
-          controller.getLineText(i),
-        );
+        if (!enableGutter) {
+          // Gutter off but folding on: this pass runs only to host the
+          // chevron, so there is no number to draw or measure. Skipping the
+          // whole block also keeps the indexTracker arithmetic that follows
+          // from running, which would otherwise shift every line number.
+          gutterText = '';
+        }
+        final builderText = enableGutter
+            ? gutterBuilder?.builder.call(i + 1, controller.getLineText(i))
+            : null;
         final builderWidth = (builderText?.length ?? 0) * 0.6 * _gutterPadding;
 
         if (builderText == null) {
@@ -9933,7 +10282,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
             gutterText = builderText;
           }
 
-          if (builderWidth >= _gutterWidth) {
+          if (enableGutter && builderWidth >= _gutterWidth) {
             _gutterWidth =
                 (enableFolding ? (_textStyle?.fontSize ?? 14.0) + 4 : 0) +
                 _gutterPadding +
@@ -9942,39 +10291,41 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           }
         }
 
-        final lineNumPara = _buildLineNumberParagraph(
-          gutterText,
-          lineNumberStyle,
-        );
-        final numWidth = lineNumPara.longestLine;
+        if (enableGutter) {
+          final lineNumPara = _buildLineNumberParagraph(
+            gutterText,
+            lineNumberStyle,
+          );
+          final numWidth = lineNumPara.longestLine;
 
-        // Line numbers are right-aligned rather than centred, which keeps the
-        // digits of 9, 10 and 100 in a single column instead of letting them
-        // drift with their own width. The gutter reads as
-        // [lightbulb lane][numbers][fold icon] in LTR and mirrors wholesale in
-        // RTL, where the gutter itself sits on the right of the editor.
-        final numberAreaWidth =
-            _gutterWidth - _actionBulbLaneWidth - _foldIconSpace;
-        // The lane is the gutter's leading edge, and the digits are right
-        // aligned inside the numbers area that follows it. The folding icon
-        // always occupies the gutter edge nearest the text, so the numbers
-        // stop short of it by exactly its width.
-        final numX = isRTL
-            ? size.width - _gutterWidth + _foldIconSpace
-            : _actionBulbLaneWidth;
-        final numStart =
-            numX + (numberAreaWidth - numWidth).clamp(0.0, double.infinity);
-        canvas.drawParagraph(
-          lineNumPara,
-          offset +
-              Offset(
-                numStart,
-                (innerPadding?.top ?? 0) +
-                    contentTop +
-                    visualYOffset -
-                    vscrollController.offset,
-              ),
-        );
+          // Line numbers are right-aligned rather than centred, which keeps the
+          // digits of 9, 10 and 100 in a single column instead of letting them
+          // drift with their own width. The gutter reads as
+          // [lightbulb lane][numbers][fold icon] in LTR and mirrors wholesale in
+          // RTL, where the gutter itself sits on the right of the editor.
+          final numberAreaWidth =
+              _gutterWidth - _actionBulbLaneWidth - _foldIconSpace;
+          // The lane is the gutter's leading edge, and the digits are right
+          // aligned inside the numbers area that follows it. The folding icon
+          // always occupies the gutter edge nearest the text, so the numbers
+          // stop short of it by exactly its width.
+          final numX = isRTL
+              ? size.width - _gutterWidth + _foldIconSpace
+              : _actionBulbLaneWidth;
+          final numStart =
+              numX + (numberAreaWidth - numWidth).clamp(0.0, double.infinity);
+          canvas.drawParagraph(
+            lineNumPara,
+            offset +
+                Offset(
+                  numStart,
+                  (innerPadding?.top ?? 0) +
+                      contentTop +
+                      visualYOffset -
+                      vscrollController.offset,
+                ),
+          );
+        }
 
         if (lspConfig != null && lspActionNotifier.value != null) {
           final actions = lspActionNotifier.value!.cast<Map<String, dynamic>>();
@@ -10636,23 +10987,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       if (endLine < firstVisibleLine || startLine > lastVisibleLine) continue;
 
-      final Color underlineColor;
-      switch (diagnostic.severity) {
-        case 1:
-          underlineColor = Colors.red;
-          break;
-        case 2:
-          underlineColor = Colors.yellow.shade700;
-          break;
-        case 3:
-          underlineColor = Colors.blue;
-          break;
-        case 4:
-          underlineColor = Colors.grey;
-          break;
-        default:
-          underlineColor = Colors.red;
-      }
+      // Hosts that care pass a theme-derived palette; anything else keeps the
+      // historical fixed colors.
+      final palette = _diagnosticColors ?? DiagnosticColorsStyle.fallback;
+      final underlineColor = palette.forSeverity(diagnostic.severity);
 
       final paint = Paint()
         ..color = underlineColor
@@ -11167,6 +11505,80 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       endLine,
       hasActiveFolds,
     );
+  }
+
+  /// Paints the rectangular selection the column-select keys are holding down.
+  ///
+  /// Drawn from the same paragraph boxes as the ordinary selection so the two
+  /// agree on where a column boundary sits — proportional glyphs and tabs
+  /// included. Each row is painted independently rather than as one range,
+  /// which is the whole point: the rows are disjoint.
+  void _drawColumnSelection(
+    Canvas canvas,
+    Offset offset,
+    int firstVisibleLine,
+    int lastVisibleLine,
+    bool hasActiveFolds,
+  ) {
+    final ranges = controller.columnSelection;
+    if (ranges.isEmpty) return;
+
+    final paint = Paint()
+      ..color = selectionStyle.selectionColor
+      ..style = PaintingStyle.fill;
+
+    final scroll = lineWrap ? 0.0 : _effectiveHScroll;
+    final textX = isRTL
+        ? (innerPadding?.left ?? 0) - scroll
+        : _gutterWidth + (innerPadding?.left ?? 0) - scroll;
+
+    for (final range in ranges) {
+      final lineIndex = controller.getLineAtOffset(range.start);
+      if (lineIndex < firstVisibleLine || lineIndex > lastVisibleLine) continue;
+      if (hasActiveFolds && _isLineFolded(lineIndex)) continue;
+
+      final lineStartOffset = controller.getLineStartOffset(lineIndex);
+      final lineText =
+          _lineTextCache[lineIndex] ?? controller.getLineText(lineIndex);
+      final lineLength = lineText.length;
+      final from = (range.start - lineStartOffset).clamp(0, lineLength);
+      final to = (range.end - lineStartOffset).clamp(0, lineLength);
+      if (from >= to) continue;
+
+      final contentWidth =
+          size.width - _gutterWidth - (innerPadding?.horizontal ?? 0);
+      final para = _paragraphCache[lineIndex] ??
+          _buildHighlightedParagraph(
+            lineIndex,
+            lineText,
+            width: lineWrap ? _wrapWidth : (isRTL ? contentWidth : null),
+          );
+      _paragraphCache[lineIndex] = para;
+
+      final lineY = _getLineYOffset(lineIndex, hasActiveFolds);
+      final visualYOffset = _getTotalVirtualOffset(lineIndex);
+      final boxes = para.getBoxesForRange(
+        CodeForgeController.scalarToUtf16Offset(lineText, from),
+        CodeForgeController.scalarToUtf16Offset(lineText, to),
+      );
+
+      for (final box in boxes) {
+        canvas.drawRect(
+          Rect.fromLTWH(
+            offset.dx + textX + box.left,
+            offset.dy +
+                (innerPadding?.top ?? 0) +
+                lineY +
+                visualYOffset +
+                box.top -
+                vscrollController.offset,
+            box.right - box.left,
+            _lineHeight,
+          ),
+          paint,
+        );
+      }
+    }
   }
 
   void _drawDocumentHighlights(
@@ -13027,15 +13439,19 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       final isOverWord = _isOffsetOverWord(textOffset);
       if (isOverWord) {
         final lineChar = _offsetToLineChar(textOffset);
+        lineChar['anchor'] =
+            _wordStartOffset(textOffset) -
+            controller.getLineStartOffset(lineChar['line']!);
         final currentHover = hoverNotifier.value;
         final isSameHover =
             currentHover != null &&
             currentHover.$2['line'] == lineChar['line'] &&
-            currentHover.$2['character'] == lineChar['character'];
+            (currentHover.$2['anchor'] ?? currentHover.$2['character']) ==
+                lineChar['anchor'];
         if (isSameHover || isHoveringPopup.value) return;
         _hoverTimer?.cancel();
         _hoverTimer = Timer(Duration(milliseconds: 600), () {
-          hoverNotifier.value = (event.localPosition, lineChar);
+          hoverNotifier.value = (_hoverAnchorOf(lineChar), lineChar);
         });
       } else if (hoverNotifier.value != null && !isHoveringPopup.value) {
         _hoverTimer?.cancel();
@@ -13141,7 +13557,9 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           ? localPosition.dx > size.width - _gutterWidth
           : localPosition.dx < _gutterWidth;
 
-      if (enableFolding && enableGutter && gutterClickArea) {
+      // No `enableGutter` term: with the gutter off, _gutterWidth is still the
+      // fold lane, so this keeps the chevron clickable in that configuration.
+      if (enableFolding && gutterClickArea) {
         if (clickY < 0) return;
         final clickedLine = _findVisibleLineByYPosition(clickY);
 
@@ -13178,7 +13596,10 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
             hoverContentNotifier.value = null;
           } else if (_isOffsetOverWord(textOffset)) {
             final lineChar = _offsetToLineChar(textOffset);
-            hoverNotifier.value = (localPosition, lineChar);
+            lineChar['anchor'] =
+                _wordStartOffset(textOffset) -
+                controller.getLineStartOffset(lineChar['line']!);
+            hoverNotifier.value = (_hoverAnchorOf(lineChar), lineChar);
             onHoverSetByTap?.call();
           }
 
@@ -13247,6 +13668,14 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         });
       } else {
         controller.focusNode?.requestFocus();
+        if (_isTripleTapOnSameLine(textOffset)) {
+          controller.selectLine();
+          // Reset so a fourth click starts a fresh triple rather than
+          // counting as one.
+          _lastTapDownAt = null;
+          _lastTapDownLine = null;
+          return;
+        }
         _dtap.addPointer(event);
         _dtap.onDoubleTap = () {
           _selectWordAtOffset(textOffset);
@@ -13511,6 +13940,74 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     if (offset < 0 || offset >= text.length) return false;
     return RegExp(_wordCharPattern).hasMatch(text[offset]);
   }
+
+  /// Absolute offset of the first character of the word containing [offset].
+  int _wordStartOffset(int offset) {
+    final text = controller.text;
+    if (text.isEmpty) return 0;
+    var start = offset.clamp(0, text.length - 1);
+    while (start > 0 && !_isWordBoundary(text[start - 1])) {
+      start -= 1;
+    }
+    return start;
+  }
+
+  /// Render-box position of [scalarColumn] on [line], in the same space as
+  /// [PointerEvent.localPosition] (gutter and scroll included).
+  ///
+  /// This is the inverse of [_getTextOffsetFromPosition].
+  Offset _columnPosition(int line, int scalarColumn) {
+    final lineText = controller.getLineText(line);
+    final utf16Column = CodeForgeController.scalarToUtf16Offset(
+      lineText,
+      scalarColumn,
+    ).clamp(0, lineText.length);
+
+    final para =
+        _paragraphCache.containsKey(line) && _lineTextCache[line] == lineText
+        ? _paragraphCache[line]!
+        : _buildParagraph(lineText, width: lineWrap ? _wrapWidth : null);
+
+    var x = 0.0;
+    if (utf16Column > 0) {
+      final boxes = para.getBoxesForRange(0, utf16Column);
+      if (boxes.isNotEmpty) x = boxes.last.right;
+    }
+
+    // A wrapped line can put the column on a visual row below the line top.
+    var rowTop = 0.0;
+    if (lineWrap && utf16Column > 0) {
+      final boundary = para.getLineBoundary(TextPosition(offset: utf16Column));
+      if (boundary.end > boundary.start) {
+        final boxes = para.getBoxesForRange(boundary.start, boundary.end);
+        if (boxes.isNotEmpty) rowTop = boxes.first.top;
+      }
+    }
+
+    final hScroll = lineWrap ? 0.0 : _effectiveHScroll;
+    final screenX = isRTL
+        ? size.width - _gutterWidth - (innerPadding?.right ?? 0) - x + hScroll
+        : x + _gutterWidth + (innerPadding?.left ?? 0) - hScroll;
+    final screenY =
+        _getLineYOffset(line, _hasActiveFolds) +
+        rowTop +
+        (innerPadding?.top ?? 0) -
+        vscrollController.offset;
+
+    return Offset(screenX, screenY);
+  }
+
+  /// Render-box anchor of a hover entry: the first character of the hovered
+  /// word, so the popup opens in the same spot no matter which part of the
+  /// word the pointer is on.
+  ///
+  /// [lineChar] carries that column under `anchor`; the `character` key stays
+  /// the pointer's own column because diagnostics and `textDocument/hover`
+  /// are resolved against it.
+  Offset _hoverAnchorOf(Map<String, int> lineChar) => _columnPosition(
+    lineChar['line']!,
+    lineChar['anchor'] ?? lineChar['character']!,
+  );
 
   Map<String, int> _offsetToLineChar(int offset) {
     if (offset < 0) return {'line': 0, 'character': 0};

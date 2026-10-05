@@ -901,12 +901,21 @@ sealed class LspConfig {
   /// Formats the entire document according to server rules.
   ///
   /// Returns a list of text edits to apply to the document.
-  Future<List<dynamic>> formatDocument(String filePath) async {
+  ///
+  /// [tabSize] and [insertSpaces] come from the user's editor settings rather
+  /// than being fixed here. A formatter that is told "2 spaces" on a file the
+  /// user indented with 4 will reindent the whole document, which is a far
+  /// more destructive result than the format-on-save the user asked for.
+  Future<List<dynamic>> formatDocument(
+    String filePath, {
+    int tabSize = 4,
+    bool insertSpaces = true,
+  }) async {
     final response = await sendRequest(
       method: 'textDocument/formatting',
       params: {
         'textDocument': {'uri': Uri.file(filePath).toString()},
-        'options': {'tabSize': 2, 'insertSpaces': true},
+        'options': {'tabSize': tabSize, 'insertSpaces': insertSpaces},
       },
     );
 
@@ -924,6 +933,8 @@ sealed class LspConfig {
     required int startCharacter,
     required int endLine,
     required int endCharacter,
+    int tabSize = 4,
+    bool insertSpaces = true,
   }) async {
     final response = await sendRequest(
       method: 'textDocument/rangeFormatting',
@@ -933,7 +944,7 @@ sealed class LspConfig {
           'start': {'line': startLine, 'character': startCharacter},
           'end': {'line': endLine, 'character': endCharacter},
         },
-        'options': {'tabSize': 2, 'insertSpaces': true},
+        'options': {'tabSize': tabSize, 'insertSpaces': insertSpaces},
       },
     );
 

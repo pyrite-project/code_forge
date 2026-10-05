@@ -8,5 +8,7 @@ export 'code_forge/scroll.dart';
 export 'code_forge/undo_redo.dart';
 export 'code_forge/find_controller.dart';
 export 'code_forge/utils.dart';
+export 'code_forge/block_comment.dart';
+export 'code_forge/paste_indent.dart';
 export 'LSP/lsp.dart';
 export 'src/rust/frb_generated.dart' show RustLib;

@@ -220,7 +220,7 @@ class FindController extends ChangeNotifier {
   void next() {
     if (_matches.isEmpty) return;
     _currentMatchIndex = (_currentMatchIndex + 1) % _matches.length;
-    _scrollToCurrentMatch();
+    _scrollToCurrentMatch(moveCaret: true);
     _updateHighlights();
   }
 
@@ -229,7 +229,7 @@ class FindController extends ChangeNotifier {
     if (_matches.isEmpty) return;
     _currentMatchIndex =
         (_currentMatchIndex - 1 + _matches.length) % _matches.length;
-    _scrollToCurrentMatch();
+    _scrollToCurrentMatch(moveCaret: true);
     _updateHighlights();
   }
 
@@ -315,13 +315,15 @@ class FindController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _scrollToCurrentMatch() {
+  void _scrollToCurrentMatch({bool moveCaret = false}) {
     if (_currentMatchIndex >= 0 && _currentMatchIndex < _matches.length) {
       final match = _matches[_currentMatchIndex];
       final matchLine = _codeController.getLineAtOffset(match.start);
-      _codeController.setSelectionSilently(
-        TextSelection.collapsed(offset: match.start),
-      );
+      if (moveCaret) {
+        _codeController.setSelectionSilently(
+          TextSelection.collapsed(offset: match.start),
+        );
+      }
 
       try {
         _codeController.scrollToLine(matchLine);

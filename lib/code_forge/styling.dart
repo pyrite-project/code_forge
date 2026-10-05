@@ -6,14 +6,6 @@ import 'package:re_highlight/re_highlight.dart';
 /// This class provides both styling and functionality configuration for the scrollbar used in the [CodeForge].
 /// Only vertical scrollbar can be tweaked using this class.
 class ScrollbarDecoration {
-  /// Whether to show the current line number near the scrollbar.
-  /// Defaults to true
-  final bool showLineNumberIndicator;
-
-  /// The [TextStyle] style apllied on the line number indicator.
-  /// Dosen't have any effect if [showLineNumberIndicator] set to false;
-  final TextStyle? lineNumberStyle;
-
   /// {@template flutter.widgets.Scrollbar.thumbVisibility}
   /// Indicates that the scrollbar thumb should be visible, even when a scroll
   /// is not underway.
@@ -248,8 +240,6 @@ class ScrollbarDecoration {
   final BorderRadius borderRadius;
 
   const ScrollbarDecoration({
-    this.showLineNumberIndicator = true,
-    this.lineNumberStyle,
     this.thumbColor,
     this.thickness,
     this.thumbVisibility,
@@ -583,6 +573,56 @@ class MatchHighlightStyle {
     required this.currentMatchStyle,
     required this.otherMatchStyle,
   });
+}
+
+/// Colors used to underline LSP diagnostics in the editor.
+///
+/// When [CodeForge.diagnosticColors] is omitted the renderer falls back to
+/// [fallback], the historical fixed palette. Hosts that want the squiggles to
+/// follow the active theme build one instance from their color scheme, the way
+/// PyriteIDE does in its shared editor builder.
+class DiagnosticColorsStyle {
+  /// Underline color for `DiagnosticSeverity.error` (1).
+  final Color error;
+
+  /// Underline color for `DiagnosticSeverity.warning` (2).
+  final Color warning;
+
+  /// Underline color for `DiagnosticSeverity.information` (3).
+  final Color information;
+
+  /// Underline color for `DiagnosticSeverity.hint` (4).
+  final Color hint;
+
+  const DiagnosticColorsStyle({
+    required this.error,
+    required this.warning,
+    required this.information,
+    required this.hint,
+  });
+
+  /// The historical fixed palette used when the host provides no style.
+  static const DiagnosticColorsStyle fallback = DiagnosticColorsStyle(
+    error: Color(0xFFF44336), // Colors.red
+    warning: Color(0xFFC6A700), // Colors.yellow.shade700
+    information: Color(0xFF2196F3), // Colors.blue
+    hint: Color(0xFF9E9E9E), // Colors.grey
+  );
+
+  /// Resolves the underline color for an LSP severity value; unknown
+  /// severities fall back to the error color like the renderer always has.
+  Color forSeverity(int severity) {
+    switch (severity) {
+      case 2:
+        return warning;
+      case 3:
+        return information;
+      case 4:
+        return hint;
+      default:
+        return error;
+    }
+  }
 }
 
 /// Defines decoration types for line decorations in the editor.

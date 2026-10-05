@@ -607,15 +607,63 @@ class CodeForgeKeyboardShortcuts {
   final ShortcutActivator jumpToDocumentEndAndSelectText;
 
   /// Duplicate the selection, if no active selectio, current line gets duplicated.
-  /// Defaults to `Ctrl + D`
+  /// Defaults to `Shift + Alt + down`
   final ShortcutActivator duplicate;
 
+  /// Grows the selection to the next occurrence of the word under the caret.
+  /// Defaults to `Ctrl + D`
+  final ShortcutActivator selectNextOccurrence;
+
+  /// Deletes the line(s) the selection touches.
+  /// Defaults to `Ctrl + Shift + K`
+  final ShortcutActivator deleteLine;
+
+  /// Extends a rectangular (column) selection one line down.
+  /// Defaults to `Ctrl + Shift + Alt + down`
+  final ShortcutActivator columnSelectDown;
+
+  /// Extends a rectangular (column) selection one line up.
+  /// Defaults to `Ctrl + Shift + Alt + up`
+  final ShortcutActivator columnSelectUp;
+
+  /// Toggles a block comment around the selection.
+  /// Defaults to `Ctrl + Shift + /`
+  final ShortcutActivator toggleBlockComment;
+
+  /// Requests formatting from the language server.
+  /// Defaults to `Shift + Alt + F`
+  final ShortcutActivator formatDocument;
+
+  /// Requests the references of the symbol under the caret.
+  /// Defaults to `Shift + F12`
+  final ShortcutActivator findReferences;
+
+  /// Jumps to an implementation of the symbol under the caret.
+  /// Defaults to `Ctrl + F12`
+  final ShortcutActivator goToImplementation;
+
+  /// Folds the region containing the caret.
+  /// Defaults to `Ctrl + Shift + [`
+  final ShortcutActivator foldRegion;
+
+  /// Unfolds the region containing the caret.
+  /// Defaults to `Ctrl + Shift + ]`
+  final ShortcutActivator unfoldRegion;
+
+  /// Folds every region in the document.
+  /// Defaults to `Ctrl + K` then `Ctrl + 0`
+  final ShortcutActivator foldAll;
+
+  /// Unfolds every region in the document.
+  /// Defaults to `Ctrl + K` then `Ctrl + J`
+  final ShortcutActivator unfoldAll;
+
   /// Moves the current line upwards.
-  /// Defaults to `Ctrl + Shift + arrowUp`
+  /// Defaults to `Alt + up`
   final ShortcutActivator shiftLineUp;
 
   /// Moves the current line downwards.
-  /// Defaults to `Ctrl + Shift + arrowUp`
+  /// Defaults to `Alt + down`
   final ShortcutActivator shiftLineDown;
 
   /// Delete an entire word and moves the cursor backward.
@@ -683,25 +731,88 @@ class CodeForgeKeyboardShortcuts {
   final ShortcutActivator selectToLineEnd;
 
   /// Creates mutlicursor to the same column and downward rows/lines.
+  /// Defaults to `Ctrl + Alt + down`
   final ShortcutActivator extendMutliCursorDownward;
 
   /// Creates mutlicursor to the same column and upward rows/lines.
+  /// Defaults to `Ctrl + Alt + up`
   final ShortcutActivator extendMutliCursorUpward;
 
   const CodeForgeKeyboardShortcuts({
     this.duplicate = const SingleActivator(
+      LogicalKeyboardKey.arrowDown,
+      alt: true,
+      shift: true,
+    ),
+    this.selectNextOccurrence = const SingleActivator(
       LogicalKeyboardKey.keyD,
+      control: true,
+    ),
+    this.deleteLine = const SingleActivator(
+      LogicalKeyboardKey.keyK,
+      control: true,
+      shift: true,
+    ),
+    this.columnSelectDown = const SingleActivator(
+      LogicalKeyboardKey.arrowDown,
+      control: true,
+      shift: true,
+      alt: true,
+    ),
+    this.columnSelectUp = const SingleActivator(
+      LogicalKeyboardKey.arrowUp,
+      control: true,
+      shift: true,
+      alt: true,
+    ),
+    this.toggleBlockComment = const SingleActivator(
+      LogicalKeyboardKey.slash,
+      control: true,
+      shift: true,
+    ),
+    this.formatDocument = const SingleActivator(
+      LogicalKeyboardKey.keyF,
+      alt: true,
+      shift: true,
+    ),
+    this.findReferences = const SingleActivator(
+      LogicalKeyboardKey.f12,
+      shift: true,
+    ),
+    this.goToImplementation = const SingleActivator(
+      LogicalKeyboardKey.f12,
+      control: true,
+    ),
+    this.foldRegion = const SingleActivator(
+      LogicalKeyboardKey.bracketLeft,
+      control: true,
+      shift: true,
+    ),
+    this.unfoldRegion = const SingleActivator(
+      LogicalKeyboardKey.bracketRight,
+      control: true,
+      shift: true,
+    ),
+    // The VSCode spelling is a two-key chord (`Ctrl+K` then `Ctrl+0`).
+    // A chord needs a stateful handler, which the flat activator table this
+    // class describes cannot express, so the single-key variant is used
+    // instead: `Ctrl+Shift+[` folds, `Ctrl+Shift+]` unfolds, and these two
+    // take the unshifted brackets that would otherwise be dead.
+    this.foldAll = const SingleActivator(
+      LogicalKeyboardKey.bracketLeft,
+      control: true,
+    ),
+    this.unfoldAll = const SingleActivator(
+      LogicalKeyboardKey.bracketRight,
       control: true,
     ),
     this.shiftLineUp = const SingleActivator(
       LogicalKeyboardKey.arrowUp,
-      control: true,
-      shift: true,
+      alt: true,
     ),
     this.shiftLineDown = const SingleActivator(
       LogicalKeyboardKey.arrowDown,
-      control: true,
-      shift: true,
+      alt: true,
     ),
     this.deletWordBackward = const SingleActivator(
       LogicalKeyboardKey.backspace,
@@ -790,13 +901,13 @@ class CodeForgeKeyboardShortcuts {
     ),
     this.extendMutliCursorDownward = const SingleActivator(
       LogicalKeyboardKey.arrowDown,
+      control: true,
       alt: true,
-      shift: true,
     ),
     this.extendMutliCursorUpward = const SingleActivator(
       LogicalKeyboardKey.arrowUp,
+      control: true,
       alt: true,
-      shift: true,
     ),
   });
 }

@@ -6,6 +6,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../code_forge.dart';
+import 'block_comment.dart' as block;
 import '../src/rust/api/editor.dart';
 import 'rope.dart';
 
@@ -76,6 +77,14 @@ class _FrameSafeNotifier implements Listenable {
 /// controller.unfoldAll();
 /// ```
 class CodeForgeController implements DeltaTextInputClient {
+  /// Line height in pixels the attached editor renders with, published by the
+  /// render object once it computes its text layout.
+  ///
+  /// Null until an editor is mounted. Hosts that map between line numbers and
+  /// scroll offsets outside the editor (a minimap, for example) read this
+  /// instead of guessing from the font size.
+  double? editorLineHeight;
+
   static const _flushDelay = Duration(milliseconds: 100);
   static const _documentColorDebounce = Duration(milliseconds: 50);
   static const _documentHighlightDebounce = Duration(milliseconds: 300);
@@ -876,6 +885,159 @@ class CodeForgeController implements DeltaTextInputClient {
 
   /// Whether there are active secondary cursors.
   bool get hasMultiCursors => _multiCursors.isNotEmpty;
+
+  /// The active rectangular selection, one entry per covered line.
+  ///
+  /// Empty unless a column selection is in progress. Column selection cannot
+  /// be expressed as a [TextSelection] — its per-line ranges are disjoint and
+  /// non-contiguous, which is exactly what the single-range type denies — so
+  /// the ranges live here and the editor paints them alongside the ordinary
+  /// selection.
+  List<TextSelection> get columnSelection =>
+      List.unmodifiable(_columnSelection);
+
+  /// Whether a rectangular selection is in progress.
+  bool get hasColumnSelection => _columnSelection.isNotEmpty;
+
+  /// Whether the column selection changed and the editor needs repaint.
+  bool columnSelectionChanged = false;
+
+  final List<TextSelection> _columnSelection = [];
+
+  /// Starts a rectangular selection covering one line of the caret's line.
+  ///
+  /// A column selection is anchored at the caret and grows a line at a time,
+  /// so the first press on an empty document still produces a visible sliver
+  /// rather than nothing.
+  void startColumnSelection() {
+    final line = getLineAtOffset(selection.extentOffset);
+    final column = selection.extentOffset - getLineStartOffset(line);
+    _columnSelectionAnchor = (line: line, column: column);
+    _rebuildColumnSelection((line: line, column: column));
+  }
+
+  /// Extends the rectangular selection by one line down or up.
+  ///
+  /// A column selection that has not started yet starts here, so the first
+  /// press of `Ctrl+Shift+Alt+Down` on a bare caret produces the same result
+  /// as pressing it twice would have.
+  void extendColumnSelection({required bool downwards}) {
+    final anchor = _columnSelectionAnchor;
+    final bounds = _columnSelectionBounds;
+    if (anchor == null || bounds == null) {
+      startColumnSelection();
+      return;
+    }
+    final targetLine = bounds.line + (downwards ? 1 : -1);
+    _rebuildColumnSelection(
+      anchor,
+      otherLine: targetLine.clamp(0, lineCount - 1),
+    );
+  }
+
+  /// Drops the rectangular selection and leaves the caret where it is.
+  void clearColumnSelection() {
+    if (_columnSelection.isEmpty && _columnSelectionAnchor == null) return;
+    _columnSelection.clear();
+    _columnSelectionAnchor = null;
+    _columnSelectionBounds = null;
+    columnSelectionChanged = true;
+    notifyListeners();
+  }
+
+  ({int line, int column})? _columnSelectionAnchor;
+  ({int line, int column})? _columnSelectionBounds;
+
+  void _rebuildColumnSelection(
+    ({int line, int column}) anchor, {
+    int? otherLine,
+    int? otherColumn,
+  }) {
+    final anchorLine = anchor.line.clamp(0, lineCount - 1);
+    final anchorColumn = anchor.column;
+    final targetLine = (otherLine ?? anchorLine).clamp(0, lineCount - 1);
+    final targetColumn = (otherColumn ?? anchorColumn).clamp(
+      0,
+      _maxColumn(targetLine),
+    );
+
+    _columnSelectionBounds = (line: targetLine, column: targetColumn);
+    _columnSelectionAnchor = anchor;
+
+    final firstLine = anchorLine <= targetLine ? anchorLine : targetLine;
+    final lastLine = anchorLine <= targetLine ? targetLine : anchorLine;
+    final left = anchorColumn <= targetColumn ? anchorColumn : targetColumn;
+    final right = anchorColumn <= targetColumn ? targetColumn : anchorColumn;
+
+    _columnSelection
+      ..clear()
+      ..addAll([
+        for (var line = firstLine; line <= lastLine; line++)
+          TextSelection(
+            baseOffset:
+                getLineStartOffset(line) + left.clamp(0, _maxColumn(line)),
+            extentOffset:
+                getLineStartOffset(line) + right.clamp(0, _maxColumn(line)),
+          ),
+      ]);
+    columnSelectionChanged = true;
+    notifyListeners();
+  }
+
+  int _maxColumn(int line) => getLineText(line).length;
+
+  /// The text a column selection covers, one line per row.
+  ///
+  /// Rows are joined with newlines. Lines too short to reach the rectangle's
+  /// right edge contribute an empty row rather than being skipped, so the copy
+  /// keeps the shape of the block the user drew.
+  String get columnSelectionText {
+    if (_columnSelection.isEmpty) return '';
+    final buffer = StringBuffer();
+    for (final range in _columnSelection) {
+      final line = getLineAtOffset(range.start);
+      final lineStart = getLineStartOffset(line);
+      final from = range.start - lineStart;
+      final to = (range.end - lineStart).clamp(0, _maxColumn(line));
+      if (from >= to) {
+        buffer.write('\n');
+        continue;
+      }
+      buffer
+        ..write(getLineText(line).substring(from, to))
+        ..write('\n');
+    }
+    final result = buffer.toString();
+    return result.endsWith('\n')
+        ? result.substring(0, result.length - 1)
+        : result;
+  }
+
+  /// Deletes the rectangle a column selection covers.
+  ///
+  /// Each row's slice is removed on its own line so the remaining code stays on
+  /// the line it was written on; only a selection spanning the end of a line
+  /// joins it to the next.
+  void deleteColumnSelection() {
+    if (readOnly || _columnSelection.isEmpty) return;
+    final ranges = List<TextSelection>.from(_columnSelection)
+      ..sort((a, b) => b.start.compareTo(a.start));
+    for (final range in ranges) {
+      final line = getLineAtOffset(range.start);
+      final lineStart = getLineStartOffset(line);
+      final from = (range.start - lineStart).clamp(0, _maxColumn(line));
+      final to = (range.end - lineStart).clamp(0, _maxColumn(line));
+      if (from >= to) continue;
+      final start = lineStart + from;
+      final end = lineStart + to;
+      // Re-derive against the current buffer: earlier (lower-offset) rows have
+      // already shifted everything after them, but `ranges` runs
+      // high-to-low, so nothing below has moved yet and these offsets are
+      // still valid.
+      replaceRange(start, end, '');
+    }
+    clearColumnSelection();
+  }
 
   /// Whether inlay hints have changed and need repaint
   bool inlayHintsChanged = false;
@@ -2252,9 +2414,18 @@ class CodeForgeController implements DeltaTextInputClient {
     }
   }
 
-  /// Moves the cursor to the beginning of the current line.
+  /// Moves the cursor to the smart position at the start of the current line.
   ///
-  /// If [isShiftPressed] is true, extends the selection to the line start.
+  /// "Smart" means first non-whitespace, not column zero: on a line like
+  /// `    return x` the caret belongs at column 4, and having to press Home
+  /// once to reach the indent and again to reach column 0 is the two-press
+  /// dance every other editor avoids. Pressing it again from the indent falls
+  /// back to column 0, so the escape hatch is still one key away.
+  ///
+  /// On a blank or whitespace-only line there is no indent to land on, so it
+  /// goes to column 0 as before.
+  ///
+  /// If [isShiftPressed] is true, extends the selection to that position.
   void pressHomeKey({bool isShiftPressed = false}) {
     if (suggestionsNotifier.value != null) {
       suggestionsNotifier.value = null;
@@ -2262,17 +2433,61 @@ class CodeForgeController implements DeltaTextInputClient {
 
     final currentLine = getLineAtOffset(selection.extentOffset);
     final lineStart = getLineStartOffset(currentLine);
+    final indentEnd = lineStart + firstNonWhitespaceColumn(currentLine);
+
+    final column = selection.extentOffset - lineStart;
+    final target = (column == indentEnd - lineStart && indentEnd > lineStart)
+        ? lineStart
+        : indentEnd;
 
     if (isShiftPressed) {
       setSelectionSilently(
         TextSelection(
           baseOffset: selection.baseOffset,
-          extentOffset: lineStart,
+          extentOffset: target,
         ),
       );
     } else {
-      setSelectionSilently(TextSelection.collapsed(offset: lineStart));
+      setSelectionSilently(TextSelection.collapsed(offset: target));
     }
+  }
+
+  /// The column of the first non-whitespace character on [lineIndex].
+  ///
+  /// Returns the line's length when the line is blank or all indentation, so
+  /// callers never have to special-case an empty indent.
+  int firstNonWhitespaceColumn(int lineIndex) {
+    final line = getLineText(lineIndex);
+    var column = 0;
+    while (column < line.length) {
+      final unit = line.codeUnitAt(column);
+      if (unit != 0x20 && unit != 0x09) break;
+      column++;
+    }
+    return column;
+  }
+
+  /// Selects the whole line the caret is on, without its line terminator.
+  ///
+  /// Backs the triple-click gesture. A drag that started here keeps extending
+  /// from the same anchor, which is why the selection covers the line text and
+  /// not the trailing newline — including the newline would swallow a second
+  /// line on every drag that passed the end.
+  void selectLine() {
+    if (suggestionsNotifier.value != null) {
+      suggestionsNotifier.value = null;
+    }
+    final line = getLineAtOffset(selection.extentOffset);
+    final start = getLineStartOffset(line);
+    // The terminator stays out of the selection on purpose: including it
+    // would make a shift+down after a triple click jump a whole line.
+    final end = (start + getLineText(line).length).clamp(start, length);
+    setSelectionSilently(TextSelection(baseOffset: start, extentOffset: end));
+  }
+
+  /// Selects all text in the editor.
+  void selectAll() {
+    setSelectionImmediately(TextSelection(baseOffset: 0, extentOffset: length));
   }
 
   /// Moves the cursor to the end of the current line.
@@ -2332,6 +2547,10 @@ class CodeForgeController implements DeltaTextInputClient {
   ///
   /// If no text is selected, does nothing.
   void copy() {
+    if (hasColumnSelection) {
+      Clipboard.setData(ClipboardData(text: columnSelectionText));
+      return;
+    }
     final sel = selection;
     if (sel.start == sel.end) return;
     final selectedText = text.substring(sel.start, sel.end);
@@ -2343,6 +2562,11 @@ class CodeForgeController implements DeltaTextInputClient {
   /// If no text is selected, does nothing.
   void cut() {
     if (readOnly) return;
+    if (hasColumnSelection) {
+      Clipboard.setData(ClipboardData(text: columnSelectionText));
+      deleteColumnSelection();
+      return;
+    }
     final sel = selection;
     if (sel.start == sel.end) return;
     final selectedText = text.substring(sel.start, sel.end);
@@ -2353,17 +2577,25 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Pastes text from the clipboard at the current cursor position.
   ///
   /// Replaces any selected text with the pasted content.
+  ///
+  /// A multi-line paste is re-indented to the caret's column rather than
+  /// landing wherever the copied block happened to be nested; see
+  /// [reindentPastedText].
   Future<void> paste() async {
     if (readOnly) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
-    if (data?.text == null || data!.text!.isEmpty) return;
+    final clipboardText = data?.text;
+    if (clipboardText == null || clipboardText.isEmpty) return;
     final sel = selection;
-    replaceRange(sel.start, sel.end, data.text!);
-  }
-
-  /// Selects all text in the editor.
-  void selectAll() {
-    setSelectionImmediately(TextSelection(baseOffset: 0, extentOffset: length));
+    final caret = sel.start;
+    final lineStart = getLineStartOffset(getLineAtOffset(caret));
+    final beforeCaret = text.substring(lineStart, caret);
+    // Only the whitespace before the caret is indentation. Pasting after code
+    // on the line keeps the following lines at column zero rather than
+    // floating them out past the code that precedes them.
+    final targetIndent = beforeCaret.trim().isEmpty ? beforeCaret : '';
+    final payload = reindentPastedText(clipboardText, targetIndent: targetIndent);
+    replaceRange(sel.start, sel.end, payload);
   }
 
   /// The complete text content of the editor.
@@ -2730,6 +2962,178 @@ class CodeForgeController implements DeltaTextInputClient {
       extentOffset: selection.extentOffset + offsetDelta,
     );
     setSelectionSilently(newSelection);
+  }
+
+  /// Deletes the line(s) the selection touches.
+  ///
+  /// With a multi-line selection the whole covered range goes, terminators
+  /// included. With a collapsed caret, or a selection confined to one line,
+  /// the line goes and the caret lands on the line that took its place — so a
+  /// repeated `Ctrl+Shift+K` walks up through the file the way holding backspace
+  /// at column 0 does, instead of jumping to the end.
+  ///
+  /// The final line has no terminator to take, so it is joined to the one
+  /// before it; deleting the only line leaves an empty document rather than a
+  /// document with a stray newline in it.
+  void deleteLine() {
+    if (readOnly) return;
+    final text = this.text;
+    final sel = this.selection;
+    final start = sel.start;
+    final end = sel.end;
+
+    final blockStart = start == 0
+        ? 0
+        : text.lastIndexOf('\n', start - 1) + 1;
+
+    // A selection that ends exactly at a line start has not really reached
+    // into that line; including it would delete a line the user did not
+    // select.
+    var reachesNextLine = false;
+    if (end > start) {
+      reachesNextLine =
+          text[end - 1] == '\n' || getLineAtOffset(end - 1) > getLineAtOffset(start);
+    }
+
+    int blockEnd;
+    int caret;
+    if (reachesNextLine) {
+      final afterNewline = text.indexOf('\n', end);
+      blockEnd = afterNewline == -1 ? text.length : afterNewline + 1;
+      caret = blockStart;
+    } else {
+      final terminator = text.indexOf('\n', blockStart);
+      if (terminator != -1) {
+        blockEnd = terminator + 1;
+        caret = blockStart;
+      } else if (blockStart == 0) {
+        // The document is a single line with no terminator at all.
+        blockEnd = text.length;
+        caret = 0;
+      } else {
+        // The last line has no terminator to take, so the newline in front of
+        // it goes instead — otherwise every press would leave a blank line.
+        blockEnd = text.length;
+        caret = blockStart - 1;
+      }
+    }
+
+    replaceRange(blockStart, blockEnd, '');
+    final newCaret = caret.clamp(0, length);
+    setSelectionSilently(TextSelection.collapsed(offset: newCaret));
+  }
+
+  /// Grows the selection to the next occurrence of the word under the caret.
+  ///
+  /// With a collapsed caret there is nothing to search for yet, so the word
+  /// under the caret is selected first — the same two-press shape as smart
+  /// Home. Subsequent presses add one more match, searching forward from the
+  /// end of the current one and wrapping at the end of the file, so holding
+  /// the key walks every occurrence in the document.
+  ///
+  /// The occurrences form a chain rather than a set of simultaneous cursors:
+  /// the engine's secondary cursors carry no selection ranges, and extending
+  /// them would mean teaching the whole edit path about multi-range
+  /// selections. A chain still gives the useful result — walk to the spot,
+  /// then press `Esc` to collapse to it — and never leaves the buffer in a
+  /// state an ordinary keystroke would mishandle.
+  void selectNextOccurrence() {
+    final text = this.text;
+    final sel = this.selection;
+    if (sel.isCollapsed) {
+      final range = _wordRangeAt(text, sel.extentOffset);
+      if (range == null) return;
+      setSelectionSilently(
+        TextSelection(baseOffset: range.start, extentOffset: range.end),
+      );
+      return;
+    }
+
+    final needle = text.substring(sel.start, sel.end);
+    // A multi-line match is almost never what the user meant to cycle
+    // through, and searching for one would step a line at a time.
+    if (needle.isEmpty || needle.contains('\n')) return;
+
+    var found = _indexOfOccurrence(text, needle, sel.end);
+    // Nothing after the current match: wrap to the top of the document, which
+    // is what makes the key a cycle instead of a one-way walk.
+    if (found == null || found < sel.start) {
+      found = _indexOfOccurrence(text, needle, 0);
+    }
+    if (found == null || found == sel.start) return;
+    setSelectionSilently(
+      TextSelection(baseOffset: found, extentOffset: found + needle.length),
+    );
+  }
+
+  static int? _indexOfOccurrence(String text, String needle, int from) {
+    if (from > text.length) return null;
+    final index = text.indexOf(needle, from);
+    return index == -1 ? null : index;
+  }
+
+  /// The bounds of the identifier surrounding [offset], or null when the
+  /// offset is not inside one.
+  static ({int start, int end})? _wordRangeAt(String text, int offset) {
+    if (text.isEmpty) return null;
+    final clamped = offset.clamp(0, text.length - 1);
+    bool isWordChar(String ch) {
+      final lower = ch.toLowerCase();
+      return (lower.codeUnitAt(0) >= 0x61 && lower.codeUnitAt(0) <= 0x7A) ||
+          (ch.codeUnitAt(0) >= 0x30 && ch.codeUnitAt(0) <= 0x39) ||
+          ch == '_';
+    }
+
+    var start = clamped;
+    if (start > 0 && !isWordChar(text[start])) start--;
+    while (start > 0 && isWordChar(text[start - 1])) {
+      start--;
+    }
+    var end = start;
+    while (end < text.length && isWordChar(text[end])) {
+      end++;
+    }
+    if (end == start) return null;
+    return (start: start, end: end);
+  }
+
+  /// Wraps or unwraps the selected lines in a [start]/[end] block comment.
+  ///
+  /// With a collapsed caret the whole line the caret is on is toggled, which
+  /// is what makes the key usable without first selecting the block.
+  ///
+  /// Returns without touching the buffer when the language has no block
+  /// comment — JSON, for one — because there is no correct edit to make and
+  /// inserting a guess would corrupt the file.
+  void toggleBlockComment({
+    required String start,
+    required String end,
+    String indentUnit = '    ',
+  }) {
+    if (readOnly) return;
+    final text = this.text;
+    final sel = this.selection;
+
+    final from = sel.isCollapsed
+        ? getLineStartOffset(getLineAtOffset(sel.extentOffset))
+        : text.lastIndexOf('\n', sel.start - 1) + 1;
+    // A selection ending exactly at a line start does not really cover that
+    // line; taking it would comment out a line the user did not select.
+    final to = sel.isCollapsed || text.substring(sel.start, sel.end).endsWith('\n')
+        ? getLineStartOffset(getLineAtOffset(sel.end)) + 1
+        : sel.end;
+    if (from >= text.length || from >= to) return;
+
+    final end_ = to.clamp(0, text.length);
+    final selected = text.substring(from, end_);
+    final toggled = block.toggleBlockComment(
+      selected,
+      start: start,
+      end: end,
+      indentUnit: indentUnit,
+    );
+    if (toggled == selected) return;
+    replaceRange(from, end_, toggled);
   }
 
   /// Duplicates the current line or selected text.
@@ -4187,6 +4591,16 @@ class CodeForgeController implements DeltaTextInputClient {
   }) {
     if (_undoController?.isUndoRedoInProgress ?? false) return;
 
+    // Any edit invalidates the rectangle: its offsets are absolute positions
+    // into a buffer that just changed shape. Clearing here rather than in each
+    // call site means no editing path can leave a stale block on screen.
+    if (_columnSelection.isNotEmpty) {
+      _columnSelection.clear();
+      _columnSelectionAnchor = null;
+      _columnSelectionBounds = null;
+      columnSelectionChanged = true;
+    }
+
     if (!_suppressImeSync) _imeComposingGlobal = TextRange.empty;
     final selectionBefore = _selection;
     _flushBuffer();
@@ -4682,25 +5096,37 @@ class CodeForgeController implements DeltaTextInputClient {
   }
 
   int? Function()? _firstVisibleLineProvider;
+  int? Function()? _visibleLineCountProvider;
   void Function(int line)? _jumpToLineCallback;
 
   /// Sets the viewport callbacks - called by the render object.
   ///
   /// [firstVisibleLine] reports the zero-based index of the topmost visible
-  /// line (null while the editor has no scroll position yet); [jumpToLine]
-  /// scrolls instantly so the given line is the topmost visible one, without
+  /// line (null while the editor has no scroll position yet); [visibleLineCount]
+  /// reports how many whole lines the viewport spans; [jumpToLine] scrolls
+  /// instantly so the given line is the topmost visible one, without
   /// animating, unfolding or highlighting.
+  ///
+  /// [visibleLineCount] is reported separately rather than derived from the
+  /// scroll offset and [editorLineHeight] because line wrapping gives lines
+  /// different heights, so `offset / lineHeight` is not a line number.
   void setViewportCallbacks({
     int? Function()? firstVisibleLine,
+    int? Function()? visibleLineCount,
     void Function(int line)? jumpToLine,
   }) {
     _firstVisibleLineProvider = firstVisibleLine;
+    _visibleLineCountProvider = visibleLineCount;
     _jumpToLineCallback = jumpToLine;
   }
 
   /// The zero-based index of the topmost visible line, or null when the
   /// editor has not been laid out (no mounted viewport reported a line yet).
   int? get firstVisibleLine => _firstVisibleLineProvider?.call();
+
+  /// How many lines the viewport currently spans, or null before the editor
+  /// has been laid out.
+  int? get visibleLineCount => _visibleLineCountProvider?.call();
 
   /// Scrolls instantly so [line] is the topmost visible line.
   ///
@@ -4845,6 +5271,16 @@ class CodeForgeController implements DeltaTextInputClient {
 
   /// Disposes of the controller and releases resources.
   ///
+  /// Whether the host wants the editor's scrollbar thumb always visible,
+  /// regardless of pointer hover.
+  ///
+  /// The overlay minimap sets this while the pointer is over it: the map
+  /// absorbs the pointer events that would otherwise hover the editor and
+  /// reveal the scrollbar, so it announces hover through this flag instead.
+  /// The editor renders the scrollbar with its own decoration either way —
+  /// the flag only widens the visibility condition.
+  final ValueNotifier<bool> scrollbarForcedVisible = ValueNotifier(false);
+
   /// Call this method when the controller is no longer needed to prevent
   /// memory leaks.
   void dispose() {
@@ -4858,7 +5294,27 @@ class CodeForgeController implements DeltaTextInputClient {
     _lspResponsesSubscription?.cancel();
     _listeners.clear();
     _displayChanges.clear();
+    scrollbarForcedVisible.dispose();
     connection?.close();
+  }
+
+  /// Runs [body] and everything it awaits as a single undo unit.
+  ///
+  /// Two edits that a user performed as one keystroke have to undo as one
+  /// keystroke. Accepting a completion that carries `additionalTextEdits` —
+  /// the auto-import pyright sends with almost every third-party symbol —
+  /// writes the inserted name and the `import` line as two separate undo
+  /// entries, so undoing once leaves a dangling reference the user must undo
+  /// a second time to clear. The compound operation has to span the await:
+  /// [applyWorkspaceEdit] completes asynchronously, and ending the compound
+  /// before it returns would put the import back outside the unit.
+  Future<void> runAsSingleUndo(Future<void> Function() body) async {
+    final compound = _undoController?.beginCompoundOperation();
+    try {
+      await body();
+    } finally {
+      compound?.end();
+    }
   }
 
   /// Applies a workspace edit or code action payload coming from the LSP.
