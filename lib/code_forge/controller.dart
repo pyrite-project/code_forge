@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
@@ -83,7 +84,9 @@ class CodeForgeController implements DeltaTextInputClient {
   static const _imeProjectionLineRadius = 2, _imeProjectionMaxChars = 4096;
   static const Duration _lspTypingDebounce = Duration(milliseconds: 300);
   static const Duration _lspDocumentSyncDebounce = Duration(milliseconds: 200);
-  final _isMobile = Platform.isAndroid || Platform.isIOS;
+  final _isMobile =
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
   final List<VoidCallback> _listeners = [];
   final _FrameSafeNotifier _displayChanges = _FrameSafeNotifier();
   final List<LineDecoration> _lineDecorations = [];
@@ -718,7 +721,9 @@ class CodeForgeController implements DeltaTextInputClient {
       codeActionsNotifier.value = null;
     }
     _openedFile = file;
-    if (openedFile != null) {
+    // dart:io file access is unavailable on the web; the host app provides
+    // the content through `text` instead.
+    if (openedFile != null && !kIsWeb) {
       text = File(_openedFile!).readAsStringSync();
     }
 
@@ -1341,8 +1346,7 @@ class CodeForgeController implements DeltaTextInputClient {
     final suggestions = suggestionsNotifier.value;
     if (suggestions == null || suggestions.isEmpty) return;
 
-    final isMobile = Platform.isAndroid || Platform.isIOS;
-    final safeSelectedIndex = isMobile
+    final safeSelectedIndex = _isMobile
         ? (currentlySelectedSuggestion ?? 0).clamp(0, suggestions.length - 1)
         : selectedIndex.clamp(0, suggestions.length - 1);
     final selected = suggestions[safeSelectedIndex];
@@ -2029,7 +2033,15 @@ class CodeForgeController implements DeltaTextInputClient {
   }
 
   /// Save the current content, [controller.text] to the opened file.
+  ///
+  /// Not supported on the web; persist [text] from the host app instead.
   void saveFile() {
+    if (kIsWeb) {
+      throw FlutterError(
+        'saveFile() is not supported on the web.\n'
+        'Persist the content from the host application instead.',
+      );
+    }
     if (openedFile == null) {
       throw FlutterError(
         "No file found.\nPlease open a file by providing a valid filePath to the CodeForge widget",
@@ -4838,7 +4850,7 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Refetch the current file to delflect text changes
   /// Only works if a valid file is provided via `filePath`.
   void refetchFile() {
-    if (_openedFile != null) {
+    if (_openedFile != null && !kIsWeb) {
       text = File(_openedFile!).readAsStringSync();
     }
   }

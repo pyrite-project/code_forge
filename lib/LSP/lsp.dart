@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -999,7 +1000,8 @@ sealed class LspConfig {
         },
         'context': {
           'diagnostics': diagnostics,
-          if (Platform.isAndroid && filePath.endsWith(".java"))
+          if (defaultTargetPlatform == TargetPlatform.android &&
+              filePath.endsWith(".java"))
             'only': [
               'quickfix',
               'refactor.extract',

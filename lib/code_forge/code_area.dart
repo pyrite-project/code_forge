@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 import 'dart:ui' as ui;
 
@@ -952,11 +951,13 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   final ValueNotifier<Offset> _offsetNotifier = ValueNotifier(Offset(0, 0));
   final ValueNotifier<Offset?> _lspActionOffsetNotifier = ValueNotifier(null);
   final ValueNotifier<int> _scrollbarLineNumberIndicator = ValueNotifier(1);
-  final _isMobile = Platform.isAndroid || Platform.isIOS;
+  final _isMobile =
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
   final _suggScrollController = ScrollController();
   final _actionScrollController = ScrollController();
   final Map<String, String> _suggestionDetailsCache = {};
-  final _isMac = Platform.isMacOS;
+  final _isMac = defaultTargetPlatform == TargetPlatform.macOS;
   final OverlayPortalController _contextMenuPortalController =
       OverlayPortalController();
   _CodeFieldRenderer? _codeFieldRenderer;
@@ -7802,10 +7803,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       return null;
     }
 
+    // `PlatformInt64` is `BigInt` on web; convert to `int` before the -1
+    // check, since `BigInt == int` is always false.
     final match = foldsFindMatchingBracket(
       rope: controller.rope.core,
       targetOffset: pos,
-    );
+    ).toInt();
 
     final result = match == -1 ? null : match;
 
