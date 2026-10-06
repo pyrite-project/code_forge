@@ -39,12 +39,28 @@ enum _AltEvent { none, down, up }
 /// does: that version intermittently drops real alt-clicks while the channel
 /// is in flight.
 ///
+/// The engine is not, however, a witness that can settle every lost key-up.
+/// It tracks the keys delivered to *this* window, so a key-up that arrives
+/// while the window is in the background is lost for the engine too, and
+/// `getKeyboardState` keeps reporting Alt as held for exactly as long as the
+/// framework does. The platform alone knows the window is not focused, so the
+/// application supplies [windowFocusProbe] and the tracker watches it while Alt
+/// is believed held. See [_probeWindowFocus].
+///
 /// [isAltPressed] is synchronous because pointer handlers cannot await.
 class EditorModifierKeys {
   EditorModifierKeys();
 
   static const _channelName = 'flutter/keyboard';
   static const _getKeyboardState = 'getKeyboardState';
+
+  /// How often to ask [windowFocusProbe] while Alt is believed held.
+  ///
+  /// Short enough that a normal trip to another window and back is observed,
+  /// and only ever running in the rare state where Alt is believed held, so it
+  /// costs one small platform call per tick in that state and nothing at all
+  /// otherwise.
+  static const _focusWatchInterval = Duration(milliseconds: 100);
 
   /// USB HID usages of the two Alt keys.
   ///
@@ -65,6 +81,15 @@ class EditorModifierKeys {
   /// there is no answer to weigh.
   int _engineAnswerGen = -1;
 
+  /// Counts how many times the cached answer has been thrown away.
+  ///
+  /// Stamped onto every request so a reply can be recognised as belonging to
+  /// the cache generation before the most recent [invalidate]. The [_gen] stamp
+  /// cannot do this job on its own: an Alt key-down and a query issued right
+  /// after it share one generation, so a request made *before* an
+  /// [invalidate] would still look current.
+  int _invalidateSeq = 0;
+
   /// Set when the platform does not implement the channel, so the class stops
   /// querying and callers fall back to the framework cache for good.
   bool _engineUnavailable = false;
@@ -83,6 +108,28 @@ class EditorModifierKeys {
   bool _queryAgain = false;
   bool _disposed = false;
 
+  /// Polls [windowFocusProbe] while Alt is believed held. See [_startFocusWatch].
+  Timer? _focusWatch;
+
+  /// Set when the probe saw the window lose focus while Alt was believed held.
+  ///
+  /// From that moment the key-up is unreachable: it went to whichever window
+  /// the platform focused instead, and neither the framework nor the engine
+  /// can witness an event they never received. This is the one case the
+  /// engine answer cannot overturn, so it is tracked separately.
+  bool _focusLossSuspect = false;
+
+  /// The [_gen] at which the focus loss was observed. Superseded by the next
+  /// Alt key event, which is real evidence and therefore wins.
+  int _focusLossGen = -1;
+
+  /// Host-supplied answer to "does the app window really have OS focus".
+  ///
+  /// Set by the application, which is the side that owns a window-management
+  /// plugin. Left `null` the tracker behaves exactly as it did before, just
+  /// without the safety net for a key-up lost to a focus change.
+  Future<bool> Function()? windowFocusProbe;
+
   /// Whether the engine has confirmed a modifier state at least once.
   bool get hasEngineState => _engineAltPressed != null;
 
@@ -95,14 +142,19 @@ class EditorModifierKeys {
   ///
   ///  1. A key-up we actually received. Alt cannot be held without a newer
   ///     key-down, and that would have replaced this.
-  ///  2. An engine answer taken at or after the newest Alt key event - the
+  ///  2. A focus loss seen while Alt was believed held. No later evidence can
+  ///     rescue the modifier, because the key-up went to another window, so
+  ///     the honest answer is "not held" until the user presses Alt again.
+  ///  3. An engine answer taken at or after the newest Alt key event - the
   ///     only evidence that can overturn the framework's cache, and the
   ///     repair for a key-up that was lost.
-  ///  3. The framework's cache, i.e. "Alt really is down" when its last word
+  ///  4. The framework's cache, i.e. "Alt really is down" when its last word
   ///     was a key-down, so a genuine alt-click keeps working even while the
   ///     channel is still in flight.
   bool get isAltPressed {
     if (_lastAltEvent == _AltEvent.up) return false;
+
+    if (_focusLossSuspect && _focusLossGen >= _altEventGen) return false;
 
     if (_engineAltPressed != null && _engineAnswerGen >= _altEventGen) {
       return _engineAltPressed!;
@@ -126,10 +178,78 @@ class EditorModifierKeys {
     _lastAltEvent = event is KeyUpEvent ? _AltEvent.up : _AltEvent.down;
     _altEventGen = _gen;
 
+    if (event is KeyUpEvent) {
+      _stopFocusWatch();
+    } else {
+      // A key-down is the only state in which a key-up can go missing, so
+      // that is the only state worth watching the window for.
+      _startFocusWatch();
+    }
+
     // Any Alt key event is a chance the modifier changed without the
     // framework noticing, so re-read the engine.
     unawaited(sync());
   }
+
+  /// Begins polling [windowFocusProbe] while Alt is believed held.
+  ///
+  /// Idle - no timer, no platform call - unless the host supplied a probe and
+  /// Alt is actually down, which is the only situation a lost key-up needs.
+  void _startFocusWatch() {
+    if (_disposed || _focusWatch != null || windowFocusProbe == null) return;
+    _focusWatch = Timer.periodic(
+      _focusWatchInterval,
+      (_) => unawaited(_probeWindowFocus()),
+    );
+    // Ask once straight away rather than after a full interval: the window may
+    // already have lost focus by the time Alt went down.
+    unawaited(_probeWindowFocus());
+  }
+
+  void _stopFocusWatch() {
+    _focusWatch?.cancel();
+    _focusWatch = null;
+  }
+
+  /// Asks the host whether the window really has focus, and retires Alt if not.
+  ///
+  /// This is the whole recovery for a key-up lost to a focus change. The
+  /// framework and the engine both only ever saw the key-down, so both will
+  /// keep claiming Alt is held; the platform is the sole witness that the
+  /// window went away and the key-up went with it.
+  Future<void> _probeWindowFocus() async {
+    final probe = windowFocusProbe;
+    if (_disposed || probe == null) {
+      _stopFocusWatch();
+      return;
+    }
+    final bool focused;
+    try {
+      focused = await probe();
+    } catch (_) {
+      // No window plugin on this platform. Stop asking rather than throwing
+      // from a timer for the rest of the session.
+      windowFocusProbe = null;
+      _stopFocusWatch();
+      return;
+    }
+    if (_disposed || focused) return;
+
+    _focusLossGen = _gen;
+    _focusLossSuspect = true;
+    // Anything cached was read while Alt was still held, and is about to be
+    // contradicted; drop it now rather than let it linger.
+    invalidate();
+    // The watch has found what it was looking for, and Alt no longer reads as
+    // held, so the next key-down is what should restart it.
+    _stopFocusWatch();
+  }
+
+  /// Runs one focus probe immediately, as the watch timer would.
+  ///
+  /// Exists so tests can drive the watch without a real timer.
+  @visibleForTesting
+  Future<void> probeWindowFocusNow() => _probeWindowFocus();
 
   /// Asks the engine whether Alt is really held and caches the answer.
   ///
@@ -148,11 +268,20 @@ class EditorModifierKeys {
     // reply that arrives after a newer Alt key event can be recognised as
     // describing an older moment.
     final requestedAtGen = _gen;
+    final requestedAtSeq = _invalidateSeq;
     try {
       final pressed = await _methodChannel.invokeMapMethod<int, int>(
         _getKeyboardState,
       );
       if (_disposed) return null;
+      if (requestedAtSeq != _invalidateSeq) {
+        // The cache was invalidated while this was in flight, so the answer
+        // describes a moment the caller has already rejected. This is what
+        // `onWindowFocus` relies on: it invalidates precisely so that an
+        // answer obtained while the window was in the background cannot
+        // overwrite the drop when it finally lands.
+        return _engineAltPressed;
+      }
       if (pressed == null) {
         // A null map means the engine supports the channel but reports nothing
         // held. Treating that as "no modifiers" is what repairs a stale cache.
@@ -184,6 +313,7 @@ class EditorModifierKeys {
   void invalidate() {
     _engineAltPressed = null;
     _engineAnswerGen = -1;
+    _invalidateSeq++;
   }
 
   /// Call when the host window regains focus.
@@ -209,6 +339,7 @@ class EditorModifierKeys {
 
   void dispose() {
     _disposed = true;
+    _stopFocusWatch();
   }
 
   /// Returns the tracker to its initial state.
@@ -220,12 +351,17 @@ class EditorModifierKeys {
     _disposed = false;
     _engineAltPressed = null;
     _engineAnswerGen = -1;
+    _invalidateSeq = 0;
     _engineUnavailable = false;
     _lastAltEvent = _AltEvent.none;
     _altEventGen = 0;
+    _focusLossSuspect = false;
+    _focusLossGen = -1;
     _gen = 0;
     _queryInFlight = false;
     _queryAgain = false;
+    _stopFocusWatch();
+    windowFocusProbe = null;
   }
 }
 
@@ -245,6 +381,14 @@ final EditorModifierKeys editorModifierKeys = EditorModifierKeys();
 /// [EditorModifierKeys.onWindowFocus] and [EditorModifierKeys.onWindowBlur]
 /// from its own window listener, because this package deliberately does not
 /// depend on a window-management plugin.
+///
+/// Neither of those is enough on its own. `window_manager` only reports focus
+/// changes on macOS and Linux - its Windows embedder never sees `WM_ACTIVATE` -
+/// and the Windows engine has no app lifecycle channel, so
+/// [didChangeAppLifecycleState] never fires either. The host therefore also
+/// sets [EditorModifierKeys.windowFocusProbe], which is the only signal on
+/// Windows that both arrives at all and speaks for the OS rather than for this
+/// process's own key cache.
 class EditorModifierKeysObserver extends WidgetsBindingObserver {
   /// Starts observing. Safe to call once; repeated calls are ignored.
   void attach() {
