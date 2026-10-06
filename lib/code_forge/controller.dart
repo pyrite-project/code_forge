@@ -1915,6 +1915,45 @@ class CodeForgeController implements DeltaTextInputClient {
     notifyListeners();
   }
 
+  /// Re-runs the LSP-backed visual features after the client's capabilities
+  /// changed on a server that is already running.
+  ///
+  /// Flipping a capability switch makes the request gates in `LspConfig` pass
+  /// or stop passing, but whatever the server sent while the old capability was
+  /// active is still painted on screen. This drops the output of the features
+  /// that were switched off and re-requests the ones that were switched on, so
+  /// the editor matches the new settings without reopening the file.
+  ///
+  /// Document colors and inlay hints are not handled here: both are driven by
+  /// dedicated enable/disable entry points that have to bypass the capability
+  /// gate to reach a server that never advertised them.
+  Future<void> refreshLspFeatures() async {
+    if (_isDisposed) return;
+    final capabilities = lspConfig?.capabilities;
+    if (capabilities == null || openedFile == null) return;
+
+    // Semantic tokens are pulled by the viewport when the notifier's version
+    // changes, so bumping it re-requests under the current capability and the
+    // null payload drops whatever the previous capability produced.
+    semanticTokens.value = (null, _semanticTokensVersion++);
+
+    if (capabilities.codeFolding) {
+      _scheduleFoldRangesRefresh();
+    } else {
+      _foldRangesTimer?.cancel();
+      clearLSPFoldRanges();
+    }
+
+    if (capabilities.documentHighlight) {
+      final offset = selection.extentOffset.clamp(0, text.length);
+      final line = getLineAtOffset(offset);
+      scheduleDocumentHighlightsRefresh(line, offset - getLineStartOffset(line));
+    } else {
+      _documentHighlightTimer?.cancel();
+      clearDocumentHighlights();
+    }
+  }
+
   /// Fetches fold ranges from the LSP server.
   ///
   /// If successful, these fold ranges will be used instead of the

@@ -92,7 +92,7 @@ class LspStdioConfig extends LspConfig {
     required String executable,
     required String workspacePath,
     required String languageId,
-    LspClientCapabilities capabilities = const LspClientCapabilities(),
+    LspClientCapabilities? capabilities,
     Map<String, dynamic> initializationOptions = const {},
     Map<String, dynamic> workspaceConfiguration = const {},
     List<String>? args,
@@ -100,6 +100,7 @@ class LspStdioConfig extends LspConfig {
     bool disableWarning = false,
     bool disableError = false,
   }) async {
+    final effectiveCapabilities = capabilities ?? LspClientCapabilities();
     final effectiveInitializationOptions = _withCclsInitializationDefaults(
       executable,
       initializationOptions,
@@ -113,7 +114,7 @@ class LspStdioConfig extends LspConfig {
       environment: environment,
       disableWarning: disableWarning,
       disableError: disableError,
-      capabilities: capabilities,
+      capabilities: effectiveCapabilities,
       initializationOptions: effectiveInitializationOptions,
       workspaceConfiguration: workspaceConfiguration,
     );

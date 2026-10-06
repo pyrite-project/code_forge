@@ -116,12 +116,12 @@ sealed class LspConfig {
   LspConfig({
     required this.workspacePath,
     required this.languageId,
-    this.capabilities = const LspClientCapabilities(),
+    LspClientCapabilities? capabilities,
     this.initializationOptions = const {},
     this.workspaceConfiguration = const {},
     this.disableWarning = false,
     this.disableError = false,
-  }) {
+  }) : capabilities = capabilities ?? LspClientCapabilities() {
     _initOptions.addAll({
       "highlight": {'enabled': true, 'lsRanges': true},
       ...initializationOptions,
@@ -318,6 +318,41 @@ sealed class LspConfig {
     if (capabilities.documentHighlight) {
       textDocumentCapabilities['documentHighlight'] = {
         'dynamicRegistration': false,
+      };
+    }
+
+    if (capabilities.goToDefinition) {
+      textDocumentCapabilities['definition'] = {
+        'dynamicRegistration': false,
+        'linkSupport': false,
+      };
+    }
+
+    if (capabilities.rename) {
+      textDocumentCapabilities['rename'] = {
+        'dynamicRegistration': false,
+        'prepareSupport': true,
+      };
+    }
+
+    if (capabilities.codeAction) {
+      textDocumentCapabilities['codeAction'] = {
+        'dynamicRegistration': false,
+        'codeActionLiteralSupport': {
+          'codeActionKind': {
+            'valueSet': [
+              '',
+              'quickfix',
+              'refactor',
+              'refactor.extract',
+              'refactor.inline',
+              'refactor.rewrite',
+              'source',
+            ],
+          },
+        },
+        'dataSupport': true,
+        'resolveSupport': {'properties': ['edit']},
       };
     }
 
@@ -1365,74 +1400,79 @@ class CustomIcons {
 ///
 /// These capabilities are sent to the language server during initialization,
 /// ensuring the server only advertises features that the client supports.
+///
+/// The flags are mutable so a host that surfaces them as user settings can flip
+/// one while the server is running. Only the client-side request gates react to
+/// that immediately — what the server was told at `initialize` time stays fixed
+/// until the next connection.
 class LspClientCapabilities {
   /// Whether semantic token highlighting is enabled.
   ///
   /// When enabled, the server provides semantic tokens for syntax highlighting
   /// beyond basic syntax. Controlled via 'textDocument/semanticTokens/full' request.
-  final bool semanticHighlighting;
+  bool semanticHighlighting;
 
   /// Whether code completion is enabled.
   ///
   /// When enabled, the server provides completion suggestions as the user types.
   /// Controlled via 'textDocument/completion' request.
-  final bool codeCompletion;
+  bool codeCompletion;
 
   /// Whether hover information is enabled.
   ///
   /// When enabled, hovering over symbols displays documentation and type information.
   /// Controlled via 'textDocument/hover' request.
-  final bool hoverInfo;
+  bool hoverInfo;
 
   /// Whether code actions are enabled.
   ///
   /// When enabled, the server provides quick fixes and refactoring suggestions.
   /// Controlled via 'textDocument/codeAction' request.
-  final bool codeAction;
+  bool codeAction;
 
   /// Whether signature help is enabled.
   ///
   /// When enabled, function signatures and parameter information are displayed
   /// as the user types function arguments.
   /// Controlled via 'textDocument/signatureHelp' request.
-  final bool signatureHelp;
+  bool signatureHelp;
 
   /// Whether document color information is enabled.
   ///
   /// When enabled, the server identifies color values in the document.
   /// Controlled via 'textDocument/documentColor' request.
-  final bool documentColor;
+  bool documentColor;
 
   /// Whether document highlight is enabled.
   ///
   /// When enabled, all occurrences of the symbol at cursor position are highlighted.
   /// Controlled via 'textDocument/documentHighlight' request.
-  final bool documentHighlight;
+  bool documentHighlight;
 
   /// Whether code folding is enabled.
   ///
   /// When enabled, the server provides folding range information for collapsible code blocks.
   /// Controlled via 'textDocument/foldingRange' request.
-  final bool codeFolding;
+  bool codeFolding;
 
   /// Whether inlay hints are enabled.
   ///
   /// When enabled, the server provides inline annotations such as parameter names
   /// and inferred types.
   /// Controlled via 'textDocument/inlayHint' request.
-  final bool inlayHint;
+  bool inlayHint;
 
   /// Whether "go to definition" is enabled.
   ///
   /// When enabled, users can navigate to the definition of symbols.
   /// Controlled via 'textDocument/definition' request.
-  final bool goToDefinition;
+  bool goToDefinition;
 
   /// Whether symbol renaming is enabled.
   ///
   /// When enabled, users can rename symbols across the workspace.
   /// Controlled via 'textDocument/rename' and 'textDocument/prepareRename' requests.
-  final bool rename;
+  bool rename;
 
   /// Creates a new [LspClientCapabilities] instance with customizable feature flags.
   ///
@@ -1451,7 +1491,7 @@ class LspClientCapabilities {
   /// - [inlayHint]: Enable inlay hints (default: true)
   /// - [goToDefinition]: Enable "go to definition" (default: true)
   /// - [rename]: Enable symbol renaming (default: true)
-  const LspClientCapabilities({
+  LspClientCapabilities({
     this.semanticHighlighting = true,
     this.codeCompletion = true,
     this.hoverInfo = true,
@@ -1465,8 +1505,29 @@ class LspClientCapabilities {
     this.rename = true,
   });
 
+  /// Copies every flag from [other] over this instance's own flags.
+  ///
+  /// A running [LspConfig] hands the same instance to every request gate and
+  /// to every editor rendering LSP output, so overwriting the fields in place
+  /// is what lets a settings change reach an already-initialized session.
+  /// Swapping in a fresh object instead would leave all those live references
+  /// reading the values captured at startup.
+  void applyFrom(LspClientCapabilities other) {
+    semanticHighlighting = other.semanticHighlighting;
+    codeCompletion = other.codeCompletion;
+    hoverInfo = other.hoverInfo;
+    codeAction = other.codeAction;
+    signatureHelp = other.signatureHelp;
+    documentColor = other.documentColor;
+    documentHighlight = other.documentHighlight;
+    codeFolding = other.codeFolding;
+    inlayHint = other.inlayHint;
+    goToDefinition = other.goToDefinition;
+    rename = other.rename;
+  }
+
   /// Disable all LSP features
-  static const disableAll = LspClientCapabilities(
+  static final disableAll = LspClientCapabilities(
     semanticHighlighting: false,
     codeCompletion: false,
     hoverInfo: false,
