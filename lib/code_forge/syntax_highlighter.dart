@@ -60,8 +60,23 @@ class SyntaxHighlighter {
   static const int _maxSpanCacheEntries = 8000;
   int get documentVersion => _documentVersion;
   Future<void>? _preHighlightInFlight;
+  DateTime? _preHighlightInFlightSince;
   int _preHighlightInFlightVersion = -1, _version = 0, _documentVersion = 0;
   bool _isEditing = false;
+
+  /// How long an in-flight pre-highlight request stays joinable.
+  ///
+  /// Joining is what keeps concurrent callers from stacking duplicate isolate
+  /// round trips, but a joined future is only as alive as the isolate behind
+  /// it: if one `compute` wedges (a pathological line looping the tokenizer,
+  /// a lost isolate), every later call at the same version would await the
+  /// same dead future forever. For a highlighter whose version never moves —
+  /// the minimap keeps one private instance for the lifetime of a tab — that
+  /// is a permanent freeze of everything built downstream of the await. Past
+  /// this window a new call abandons the join and runs its own request; the
+  /// wedged one, if it ever returns, finds `_preHighlightInFlight` no longer
+  /// identical to it and clears nothing.
+  Duration preHighlightJoinTimeout = const Duration(seconds: 30);
 
   /// Supplies the text of any line by index so multi-line constructs can be
   /// tracked across lines. Without it those constructs are left to the
@@ -923,13 +938,18 @@ class SyntaxHighlighter {
     int endLine,
     String Function(int) getLineText,
   ) async {
-    if (_preHighlightInFlight != null &&
-        _preHighlightInFlightVersion == _version) {
-      return _preHighlightInFlight;
+    final inFlight = _preHighlightInFlight;
+    final since = _preHighlightInFlightSince;
+    if (inFlight != null &&
+        since != null &&
+        _preHighlightInFlightVersion == _version &&
+        DateTime.now().difference(since) < preHighlightJoinTimeout) {
+      return inFlight;
     }
 
     final requestVersion = _version;
     _preHighlightInFlightVersion = requestVersion;
+    _preHighlightInFlightSince = DateTime.now();
     final future = _preHighlightLinesInternal(
       startLine,
       endLine,
@@ -944,6 +964,7 @@ class SyntaxHighlighter {
       if (identical(_preHighlightInFlight, future)) {
         _preHighlightInFlight = null;
         _preHighlightInFlightVersion = -1;
+        _preHighlightInFlightSince = null;
       }
     }
   }
