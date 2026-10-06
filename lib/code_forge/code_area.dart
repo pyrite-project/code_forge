@@ -6051,7 +6051,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   final _dtap = DoubleTapGestureRecognizer();
   final _onetap = TapGestureRecognizer();
 
-  /// When the previous pointer-down happened, and on which line.
+  /// When the previous pointer-down happened, on which line, and how many
+  /// pointer-downs that line has collected inside [_tripleTapWindow].
   ///
   /// Flutter ships no triple-tap recognizer, so the third click is detected
   /// here from the timing of consecutive pointer-downs. Double-tap is left to
@@ -6059,6 +6060,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   /// adds the step after it.
   DateTime? _lastTapDownAt;
   int? _lastTapDownLine;
+  int _tapDownRun = 0;
 
   static const Duration _tripleTapWindow = Duration(milliseconds: 450);
 
@@ -6068,15 +6070,25 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   /// three words of one line at slightly different columns is still a
   /// triple-click on that line, and demanding the same column would make the
   /// gesture feel broken.
+  ///
+  /// The run length is what makes this a triple rather than a double: with only
+  /// the previous pointer-down in hand, the second click of a double-click also
+  /// looks like "same line, soon enough", and it would select the line before
+  /// [_dtap] ever saw the pointer and got its chance to select the word.
   bool _isTripleTapOnSameLine(int textOffset) {
     final now = DateTime.now();
     final line = controller.getLineAtOffset(textOffset);
     final previousAt = _lastTapDownAt;
     final previousLine = _lastTapDownLine;
+    final continuesRun =
+        previousAt != null &&
+        previousLine == line &&
+        now.difference(previousAt) < _tripleTapWindow;
+
+    _tapDownRun = continuesRun ? _tapDownRun + 1 : 1;
     _lastTapDownAt = now;
     _lastTapDownLine = line;
-    if (previousAt == null || previousLine != line) return false;
-    return now.difference(previousAt) < _tripleTapWindow;
+    return _tapDownRun >= 3;
   }
 
   final GutterBuilder? gutterBuilder;
@@ -13572,6 +13584,14 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
 
       if (isMobile) {
+        // The double-tap callback has to be in place before the pointer is
+        // added: [DoubleTapGestureRecognizer] refuses a pointer outright while
+        // every callback is null, so assigning afterwards silently costs the
+        // first click of a session its chance to be half of a double tap.
+        _dtap.onDoubleTap = () {
+          _selectWordAtOffset(textOffset);
+          _showContextMenu(localPosition, textOffset, anchorToSelection: true);
+        };
         _dtap.addPointer(event);
         _draggingCHandle = false;
         _draggingStartHandle = false;
@@ -13579,11 +13599,6 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         _selectionHandleGesture = false;
         _reopenSelectionMenuGesture = false;
         _reopenSelectionMenuMoved = false;
-
-        _dtap.onDoubleTap = () {
-          _selectWordAtOffset(textOffset);
-          _showContextMenu(localPosition, textOffset, anchorToSelection: true);
-        };
 
         _onetap.onTap = () {
           if (_openedLspActionFromBulbTap) {
@@ -13674,12 +13689,16 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           // counting as one.
           _lastTapDownAt = null;
           _lastTapDownLine = null;
+          _tapDownRun = 0;
           return;
         }
-        _dtap.addPointer(event);
+        // Assigned before [DoubleTapGestureRecognizer.addPointer], which
+        // drops any pointer that arrives while the recognizer has no callback
+        // at all; see the mobile branch above.
         _dtap.onDoubleTap = () {
           _selectWordAtOffset(textOffset);
         };
+        _dtap.addPointer(event);
 
         _dragStartOffset = textOffset;
         // Read the engine-confirmed Alt state rather than the framework's key
