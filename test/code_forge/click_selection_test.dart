@@ -1,4 +1,5 @@
 import 'package:code_forge/code_forge.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -9,6 +10,11 @@ import 'package:flutter_test/flutter_test.dart';
 /// has no triple-tap recognizer, and the editor's double-tap recognizer is fed
 /// by hand), so they compete with each other. These tests drive real pointer
 /// events through the widget so that competition is exercised, not mocked.
+///
+/// [debugDefaultTargetPlatformOverride] is pinned to desktop because the
+/// editor picks its pointer-down branch from `defaultTargetPlatform`, which
+/// the test binding otherwise reports as Android; that would run these cases
+/// against the mobile branch they are not written for.
 
 const String _text = 'alpha beta gamma\ndelta epsilon';
 
@@ -27,6 +33,20 @@ void main() {
     controller.text = _text;
     addTearDown(controller.dispose);
   });
+
+  /// Runs [body] with [debugDefaultTargetPlatformOverride] pinned to desktop.
+  ///
+  /// The override has to be set and cleared inside the test body: the framework
+  /// asserts it is unset at the end of every test, so neither a suite-level
+  /// [setUpAll] nor a [tearDown] is early enough.
+  Future<void> onDesktop(Future<void> Function() body) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      await body();
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  }
 
   Future<void> pumpEditor(WidgetTester tester) async {
     // A fresh key per pump gives the editor fresh click tracking, so the
@@ -99,40 +119,46 @@ void main() {
   }
 
   testWidgets('double click selects the word under the caret', (tester) async {
-    final dx = await dxOfWord(tester, 'beta');
-    final position = await positionOn(tester, dx);
+    await onDesktop(() async {
+      final dx = await dxOfWord(tester, 'beta');
+      final position = await positionOn(tester, dx);
 
-    await clickTwice(tester, position);
+      await clickTwice(tester, position);
 
-    expect(selectedText(), 'beta');
+      expect(selectedText(), 'beta');
+    });
   });
 
   testWidgets('triple click selects the whole line', (tester) async {
-    final dx = await dxOfWord(tester, 'beta');
-    final position = await positionOn(tester, dx);
+    await onDesktop(() async {
+      final dx = await dxOfWord(tester, 'beta');
+      final position = await positionOn(tester, dx);
 
-    await clickTwice(tester, position);
-    await tester.tapAt(position);
-    await tester.pump(const Duration(milliseconds: 120));
+      await clickTwice(tester, position);
+      await tester.tapAt(position);
+      await tester.pump(const Duration(milliseconds: 120));
 
-    expect(selectedText(), 'alpha beta gamma');
+      expect(selectedText(), 'alpha beta gamma');
+    });
   });
 
   testWidgets('a slow fourth click starts a fresh single click', (
     tester,
   ) async {
-    final dx = await dxOfWord(tester, 'beta');
-    final position = await positionOn(tester, dx);
+    await onDesktop(() async {
+      final dx = await dxOfWord(tester, 'beta');
+      final position = await positionOn(tester, dx);
 
-    await clickTwice(tester, position);
-    await tester.tapAt(position);
-    await tester.pump(const Duration(milliseconds: 120));
-    // Past the triple-click window, so this is a new gesture and the caret
-    // moves instead of the selection growing.
-    await tester.pump(const Duration(seconds: 1));
-    await tester.tapAt(position);
-    await tester.pump(const Duration(milliseconds: 120));
+      await clickTwice(tester, position);
+      await tester.tapAt(position);
+      await tester.pump(const Duration(milliseconds: 120));
+      // Past the triple-click window, so this is a new gesture and the caret
+      // moves instead of the selection growing.
+      await tester.pump(const Duration(seconds: 1));
+      await tester.tapAt(position);
+      await tester.pump(const Duration(milliseconds: 120));
 
-    expect(controller.selection.isCollapsed, isTrue);
+      expect(controller.selection.isCollapsed, isTrue);
+    });
   });
 }
