@@ -3,12 +3,15 @@ import 'package:flutter_test/flutter_test.dart';
 
 void dump(String name, List<String> lines, {String? lang}) {
   final segs = indentGuideSegments(
-    firstLine: 0, lastLine: lines.length, tabSize: 4,
+    firstLine: 0,
+    lastLine: lines.length,
+    tabSize: 4,
     lineTextAt: (i) => (i >= 0 && i < lines.length) ? lines[i] : '',
     languageId: lang,
   );
   print('--- $name ---');
-  for (final s in segs) print('  SEG col=${s.columns} ${s.startLine}..${s.endLine}');
+  for (final s in segs)
+    print('  SEG col=${s.columns} ${s.startLine}..${s.endLine}');
 }
 
 void main() {

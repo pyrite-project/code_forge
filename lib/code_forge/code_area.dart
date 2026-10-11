@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' as ui;
 
@@ -60,23 +59,14 @@ const double kDefaultOverlayOuterRadius = 12.0;
 /// rounded and still concentric with the surface that holds it.
 const double kMinNestedRadius = 4.0;
 
-/// Gap kept below a code block that has content on that side.
+/// The one gap between any two blocks inside a popup's markdown.
 ///
-/// A side with nothing on it stays flush: the card's own padding already
-/// separates the block from the popup edge, so a second band there would only
-/// add dead space. Where content does follow, the gap is what separates two
-/// blocks of content, and it is twice the card's own padding so the rhythm
-/// still reads as part of the same scale. [codeBlockMargin] holds the full
-/// rule, including the case of a block a rule follows.
+/// Prose, fenced code blocks, and rules all sit `kCodeBlockGap` apart, and a
+/// code block carries no margin of its own — [MarkdownBlock]'s `linesMargin`
+/// is the single source of that rhythm, so a block can never end up with a
+/// different band than the paragraph next to it. A side with nothing before
+/// or after it stays flush against the card's own padding.
 const double kCodeBlockGap = 8.0;
-
-/// Gap kept above a code block that has content on that side.
-///
-/// The top side carries more room than [kCodeBlockGap]. Prose running straight
-/// into a filled, outlined block reads as one lump, and the band that is
-/// enough below the block is not enough to separate them, so the side the
-/// reader arrives from is the wider one.
-const double kCodeBlockTopGap = 12.0;
 
 /// Gap kept on each side of a gutter code-action lightbulb, inside the lane
 /// reserved for it.
@@ -105,6 +95,23 @@ Color codeActionBulbColor(Color? background) {
       ? kLightCodeActionBulbColor
       : kDarkCodeActionBulbColor;
 }
+
+/// The text style for the code-action labels: [base]'s size, height, weight
+/// and color with the editor's mono family dropped, so action titles read in
+/// the UI font the way VS Code renders its action list.
+///
+/// Every other popup text keeps the editor family on purpose — hover and
+/// signature prose reads as editor-adjacent content, and fenced blocks and
+/// inline code are styled straight from the popup's
+/// [HoverDetailsStyle.textStyle], which still carries it.
+/// [TextStyle.copyWith] cannot unset a family, so this rebuilds the style
+/// instead of deriving from it.
+TextStyle overlayProseTextStyle(TextStyle base) => TextStyle(
+  fontSize: base.fontSize,
+  height: base.height,
+  fontWeight: base.fontWeight,
+  color: base.color,
+);
 
 /// Builds the decoration for a fenced Markdown code block inside a popup.
 ///
@@ -135,129 +142,6 @@ BoxDecoration overlayCodeBlockDecoration(
   );
 }
 
-/// A Markdown thematic break: the horizontal rule written as `---`, `***`, or
-/// `___`.
-///
-/// CommonMark also allows spaces between the repeated characters, so `* * *` is
-/// the same rule as `***`.
-final RegExp _thematicBreak = RegExp(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$');
-
-/// The source lines and fence lines of the code block holding [code].
-///
-/// [CodeBuilder] receives the block content but never its siblings or its
-/// position, so a block is located by matching [code] back to the fence it came
-/// from. When two blocks share the same text the first one wins, which keeps
-/// every answer derived from this stable across rebuilds.
-({List<String> lines, int open, int close})? _codeBlockFences(
-  String source,
-  String code,
-) {
-  final lines = const LineSplitter().convert(source);
-  final wanted = code.trim();
-  for (var i = 0; i < lines.length; i++) {
-    if (!_isCodeFence(lines[i])) {
-      continue;
-    }
-    final body = <String>[];
-    var j = i + 1;
-    while (j < lines.length && !_isCodeFence(lines[j])) {
-      body.add(lines[j]);
-      j++;
-    }
-    final matched = body.join('\n').trim() == wanted;
-    if (j >= lines.length) {
-      // An unterminated block runs to the end of the document, so nothing can
-      // follow it while content can still sit above it.
-      if (matched) {
-        return (lines: lines, open: i, close: lines.length - 1);
-      }
-      break;
-    }
-    if (matched) {
-      return (lines: lines, open: i, close: j);
-    }
-    i = j;
-  }
-  return null;
-}
-
-/// The first line after [from] that carries content, or null when the document
-/// ends in whitespace.
-String? _nextContentLine(List<String> lines, int from) {
-  for (var i = from + 1; i < lines.length; i++) {
-    if (lines[i].trim().isNotEmpty) {
-      return lines[i];
-    }
-  }
-  return null;
-}
-
-/// Whether the code block holding [code] is followed by renderable content.
-///
-/// A code block is a filled, outlined surface, so a bottom margin that no
-/// content ever fills reads as a stray empty band inside the popup. The gap
-/// below a block therefore exists only when something actually follows it.
-bool codeBlockHasContentBelow(String source, String code) {
-  final fences = _codeBlockFences(source, code);
-  if (fences == null) {
-    return false;
-  }
-  return _nextContentLine(fences.lines, fences.close) != null;
-}
-
-/// Whether the code block holding [code] is preceded by renderable content.
-///
-/// Prose running straight into the block reads as one lump without it, which is
-/// the same reason a block with nothing above it is left flush.
-bool codeBlockHasContentAbove(String source, String code) {
-  final fences = _codeBlockFences(source, code);
-  if (fences == null) {
-    return false;
-  }
-  for (var i = fences.open - 1; i >= 0; i--) {
-    if (fences.lines[i].trim().isNotEmpty) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/// Whether the first content below the code block holding [code] is a rule.
-///
-/// A rule is a line the author drew to divide the text, so a band between the
-/// block and that rule only breaks the line the rule is there to draw.
-bool codeBlockIsFollowedByRule(String source, String code) {
-  final fences = _codeBlockFences(source, code);
-  if (fences == null) {
-    return false;
-  }
-  final next = _nextContentLine(fences.lines, fences.close);
-  return next != null && _isThematicBreak(next);
-}
-
-/// The margin a popup code block keeps on each of its sides.
-///
-/// A code block is a filled, outlined surface, so a margin on a side that
-/// nothing fills reads as a stray empty band inside the popup. The gap
-/// therefore tracks the content on that side, with the two cases the markdown
-/// around the block decides: a block that opens the document has content only
-/// below, and a block a rule follows keeps that rule flush.
-EdgeInsets codeBlockMargin(String source, String code) => EdgeInsets.only(
-  top: codeBlockHasContentAbove(source, code) ? kCodeBlockTopGap : 0,
-  bottom:
-      codeBlockHasContentBelow(source, code) &&
-          !codeBlockIsFollowedByRule(source, code)
-      ? kCodeBlockGap
-      : 0,
-);
-
-bool _isThematicBreak(String line) => _thematicBreak.hasMatch(line.trim());
-
-bool _isCodeFence(String line) {
-  final trimmed = line.trimLeft();
-  return trimmed.startsWith('```') || trimmed.startsWith('~~~');
-}
-
 /// Builds the [PreConfig] used by every popup that renders a fenced code
 /// block.
 ///
@@ -268,15 +152,10 @@ bool _isCodeFence(String line) {
 ///  * A code block is a surface nested inside the popup that holds it, so its
 ///    corner is `outer - gap` for the real inset. Deriving it that way keeps
 ///    the two arcs concentric instead of drawing an unrelated second radius.
-///  * The gaps on each side track the content on that side. A margin that
-///    nothing fills leaves a dead band inside the popup, and that is plainly
-///    visible on a filled, outlined surface.
-///
-/// The top gap is zero for a block that opens the document, because the card's
-/// own padding already separates it from the popup edge. [codeBlockMargin]
-/// holds the full rule, so a block that follows prose still gets its band.
+///  * The block carries no margin of its own: the popup's `linesMargin` set
+///    to [kCodeBlockGap] is the one rhythm every markdown block shares, and
+///    a private margin would stack on top of it.
 PreConfig overlayCodeBlockConfig({
-  required String source,
   required BorderRadius outer,
   required double gap,
   required Map<String, TextStyle> theme,
@@ -292,29 +171,90 @@ PreConfig overlayCodeBlockConfig({
     builder: (code, codeLanguage) => Container(
       width: double.infinity,
       padding: const EdgeInsets.all(8),
-      margin: codeBlockMargin(source, code),
       decoration: overlayCodeBlockDecoration(
         outer,
         gap: gap,
         background: theme['root']?.backgroundColor ?? Colors.grey[900]!,
         outline: theme['root']?.color ?? Colors.grey,
       ),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Text.rich(
-          TextSpan(
-            children: highLightSpans(
-              code,
-              language: codeLanguage,
-              theme: theme,
-              textStyle: textStyle,
-              styleNotMatched: styleNotMatched,
-            ),
+      // No horizontal scroller here: every popup caps its own width, so an
+      // unconstrained line only ends up clipped. softWrap makes long code
+      // lines fold onto the next line instead.
+      child: Text.rich(
+        TextSpan(
+          children: highLightSpans(
+            code,
+            language: codeLanguage,
+            theme: theme,
+            textStyle: textStyle,
+            styleNotMatched: styleNotMatched,
           ),
-          softWrap: true,
         ),
+        softWrap: true,
       ),
     ),
+  );
+}
+
+/// Line height an inline code chip lays its text out at, as a multiple of
+/// the font size.
+///
+/// A chip is a surface drawn *around* its glyphs, but the line it sits in
+/// only has room for the glyphs: a monospace font's natural line height
+/// already runs well past its ink, so wrapping the glyphs in the default box
+/// plus any padding would widen every line the chip lands on. `1.15` keeps
+/// the box just past the ink, so the chip's single pixel of vertical padding
+/// fits in the room the line already had and the line height stays put.
+const double kChipHeight = 1.15;
+
+/// The [RichTextBuilder] every popup's markdown builds its blocks with.
+///
+/// A paragraph whose only run is a placeholder — the hover rule's 1px line,
+/// or the wrapper around a code block — has no text runs to size its line,
+/// so `Text.rich` falls back to the ambient Material style and the rule
+/// floats in a ~20px box, far from the blocks it divides. Seeding the root
+/// with a 1px style collapses those boxes; every real text run carries an
+/// explicit style from the markdown configs and is sized by it, not by the
+/// root.
+Widget _popupRichText(InlineSpan span) =>
+    Text.rich(span, style: const TextStyle(fontSize: 1, height: 1));
+
+/// The markdown generator that draws popup inline code (`code` tag) as the
+/// same filled, outlined, rounded surface a fenced code block gets.
+///
+/// `markdown_widget`'s own code node renders inline code as a plain text
+/// span, and a text span background has no corners, so `single backtick`
+/// code could never share the look of the ` ``` ` block next to it: same
+/// theme, same popup, two different shapes. This generator replaces that
+/// node instead, and it derives the chip's fill, hairline outline, and
+/// radius from the exact same inputs the fenced block uses — pass the same
+/// [outer], [gap], and [theme] the popup's [overlayCodeBlockConfig]
+/// receives and the two surfaces cannot drift apart.
+///
+/// [textStyle] carries the code font (size and family) and, when it names a
+/// color, that color wins; otherwise the chip text falls back through the
+/// theme root color to [fallbackColor], matching what the block paints for
+/// text the highlighter does not theme.
+SpanNodeGeneratorWithTag overlayInlineCodeGenerator({
+  required BorderRadius outer,
+  required double gap,
+  required Map<String, TextStyle> theme,
+  required TextStyle textStyle,
+  Color? fallbackColor,
+}) {
+  final BoxDecoration decoration = overlayCodeBlockDecoration(
+    outer,
+    gap: gap,
+    background: theme['root']?.backgroundColor ?? Colors.grey[900]!,
+    outline: theme['root']?.color ?? Colors.grey,
+  );
+  final TextStyle codeStyle = textStyle.copyWith(
+    color: textStyle.color ?? theme['root']?.color ?? fallbackColor,
+  );
+  return SpanNodeGeneratorWithTag(
+    tag: MarkdownTag.code.name,
+    generator: (element, config, visitor) =>
+        _OverlayInlineCodeNode(element.textContent, decoration, codeStyle),
   );
 }
 
@@ -1169,17 +1109,21 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
           keywordIconColor: Color(0xFFC678DD),
           labelTextStyle: TextStyle(
             fontSize: widget.textStyle?.fontSize ?? 14,
-            fontWeight: FontWeight.w500,
+            // Same family, size and weight as the editor text: a heavier
+            // weight reads as a larger font next to the code it matches.
             color: _editorTheme['root']!.color,
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
           ),
           detailTextStyle: TextStyle(
             fontSize: (widget.textStyle?.fontSize ?? 14) * 0.85,
             color: _editorTheme['root']!.color?.withAlpha(150),
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
           ),
           typeTextStyle: TextStyle(
             fontSize: (widget.textStyle?.fontSize ?? 14) * 0.9,
             fontStyle: FontStyle.italic,
             color: _editorTheme['root']!.color?.withAlpha(180),
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
           ),
           shape: RoundedRectangleBorder(
             borderRadius: _overlayBorderRadius,
@@ -2311,8 +2255,11 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     final caret = _controller.selection.extentOffset;
     final currentLine = _controller.getLineAtOffset(caret);
     final column = caret - _controller.getLineStartOffset(currentLine);
-    final targetLine = (currentLine + (downwards ? linesPerPage : -linesPerPage))
-        .clamp(0, _controller.lineCount - 1);
+    final targetLine =
+        (currentLine + (downwards ? linesPerPage : -linesPerPage)).clamp(
+          0,
+          _controller.lineCount - 1,
+        );
     final targetColumn = column.clamp(
       0,
       _controller.getLineText(targetLine).length,
@@ -2652,7 +2599,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .instance,
                                                         )) {
                                                       if (!_readOnly) {
-                                                        _controller.deleteLine();
+                                                        _controller
+                                                            .deleteLine();
                                                         _commonKeyFunctions();
                                                       }
                                                       return KeyEventResult
@@ -2666,7 +2614,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .instance,
                                                         )) {
                                                       if (!_readOnly) {
-                                                        _controller.moveLineUp();
+                                                        _controller
+                                                            .moveLineUp();
                                                         _commonKeyFunctions();
                                                       }
                                                       return KeyEventResult
@@ -2709,7 +2658,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           );
                                                       if (!_readOnly) {
                                                         if (_controller
-                                                                .hasColumnSelection) {
+                                                            .hasColumnSelection) {
                                                           _controller
                                                               .extendColumnSelection(
                                                                 downwards:
@@ -2725,7 +2674,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           .handled;
                                                     }
 
-                                                    if (shrtCt.toggleBlockComment
+                                                    if (shrtCt
+                                                        .toggleBlockComment
                                                         .accepts(
                                                           event,
                                                           HardwareKeyboard
@@ -2740,7 +2690,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       // host that has a real
                                                       // block comment
                                                       // implements it.
-                                                      widget.onToggleBlockComment
+                                                      widget
+                                                          .onToggleBlockComment
                                                           ?.call();
                                                       _commonKeyFunctions();
                                                       return KeyEventResult
@@ -2774,13 +2725,14 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                     }
 
                                                     if (shrtCt
-                                                            .goToImplementation
-                                                            .accepts(
-                                                              event,
-                                                              HardwareKeyboard
-                                                                  .instance,
-                                                            )) {
-                                                      widget.onGoToImplementation
+                                                        .goToImplementation
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
+                                                      widget
+                                                          .onGoToImplementation
                                                           ?.call();
                                                       _commonKeyFunctions();
                                                       return KeyEventResult
@@ -2794,11 +2746,12 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .instance,
                                                         )) {
                                                       _controller.toggleFold(
-                                                        _controller.getLineAtOffset(
-                                                          _controller
-                                                              .selection
-                                                              .extentOffset,
-                                                        ),
+                                                        _controller
+                                                            .getLineAtOffset(
+                                                              _controller
+                                                                  .selection
+                                                                  .extentOffset,
+                                                            ),
                                                       );
                                                       _commonKeyFunctions();
                                                       return KeyEventResult
@@ -2816,11 +2769,12 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       // the unbind key has to go
                                                       // through the same path.
                                                       _controller.toggleFold(
-                                                        _controller.getLineAtOffset(
-                                                          _controller
-                                                              .selection
-                                                              .extentOffset,
-                                                        ),
+                                                        _controller
+                                                            .getLineAtOffset(
+                                                              _controller
+                                                                  .selection
+                                                                  .extentOffset,
+                                                            ),
                                                       );
                                                       _commonKeyFunctions();
                                                       return KeyEventResult
@@ -2829,8 +2783,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
                                                     if (shrtCt.foldAll.accepts(
                                                       event,
-                                                      HardwareKeyboard
-                                                          .instance,
+                                                      HardwareKeyboard.instance,
                                                     )) {
                                                       _controller.foldAll();
                                                       _commonKeyFunctions();
@@ -2838,11 +2791,12 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           .handled;
                                                     }
 
-                                                    if (shrtCt.unfoldAll.accepts(
-                                                      event,
-                                                      HardwareKeyboard
-                                                          .instance,
-                                                    )) {
+                                                    if (shrtCt.unfoldAll
+                                                        .accepts(
+                                                          event,
+                                                          HardwareKeyboard
+                                                              .instance,
+                                                        )) {
                                                       _controller.unfoldAll();
                                                       _commonKeyFunctions();
                                                       return KeyEventResult
@@ -3499,19 +3453,16 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               .enter:
                                                           case LogicalKeyboardKey
                                                               .tab:
-                                                            _controller
-                                                                .runAsSingleUndo(
-                                                                  () async {
-                                                                    _acceptSuggestion();
-                                                                    if (_extraText
-                                                                        .isNotEmpty) {
-                                                                      await _controller
-                                                                          .applyWorkspaceEdit(
-                                                                            _extraText,
-                                                                          );
-                                                                    }
-                                                                  },
-                                                                );
+                                                            _controller.runAsSingleUndo(() async {
+                                                              _acceptSuggestion();
+                                                              if (_extraText
+                                                                  .isNotEmpty) {
+                                                                await _controller
+                                                                    .applyWorkspaceEdit(
+                                                                      _extraText,
+                                                                    );
+                                                              }
+                                                            });
                                                             setState(() {
                                                               _isSignatureInvoked =
                                                                   true;
@@ -4208,6 +4159,24 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                 .length) {
                                                       return TextSpan(
                                                         text: label,
+                                                        style: TextStyle(
+                                                          fontSize:
+                                                              widget
+                                                                  .textStyle
+                                                                  ?.fontSize ??
+                                                              14,
+                                                          color:
+                                                              _editorTheme['root']
+                                                                  ?.color,
+                                                          // A signature is code,
+                                                          // so it follows the
+                                                          // editor font.
+                                                          fontFamily:
+                                                              widget
+                                                                  .textStyle
+                                                                  ?.fontFamily ??
+                                                              'monospace',
+                                                        ),
                                                       );
                                                     }
 
@@ -4235,14 +4204,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       return TextSpan(
                                                         style: TextStyle(
                                                           fontSize:
-                                                              (widget
-                                                                      .textStyle
-                                                                      ?.fontSize ??
-                                                                  15) +
-                                                              1.75,
+                                                              widget
+                                                                  .textStyle
+                                                                  ?.fontSize ??
+                                                              14,
                                                           color:
                                                               _editorTheme['root']
                                                                   ?.color,
+                                                          fontFamily:
+                                                              widget
+                                                                  .textStyle
+                                                                  ?.fontFamily ??
+                                                              'monospace',
                                                         ),
                                                         children: [
                                                           TextSpan(
@@ -4288,14 +4261,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                         return TextSpan(
                                                           style: TextStyle(
                                                             fontSize:
-                                                                (widget
-                                                                        .textStyle
-                                                                        ?.fontSize ??
-                                                                    15) +
-                                                                1.75,
+                                                                widget
+                                                                    .textStyle
+                                                                    ?.fontSize ??
+                                                                14,
                                                             color:
                                                                 _editorTheme['root']
                                                                     ?.color,
+                                                            fontFamily:
+                                                                widget
+                                                                    .textStyle
+                                                                    ?.fontFamily ??
+                                                                'monospace',
                                                           ),
                                                           children: [
                                                             TextSpan(
@@ -4324,14 +4301,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       text: label,
                                                       style: TextStyle(
                                                         fontSize:
-                                                            (widget
-                                                                    .textStyle
-                                                                    ?.fontSize ??
-                                                                15) +
-                                                            1.75,
+                                                            widget
+                                                                .textStyle
+                                                                ?.fontSize ??
+                                                            14,
                                                         color:
                                                             _editorTheme['root']
                                                                 ?.color,
+                                                        fontFamily:
+                                                            widget
+                                                                .textStyle
+                                                                ?.fontFamily ??
+                                                            'monospace',
                                                       ),
                                                     );
                                                   })(),
@@ -4353,6 +4334,27 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                 ),
                                                 child: MarkdownBlock(
                                                   data: signature.documentation,
+                                                  generator: MarkdownGenerator(
+                                                    linesMargin:
+                                                        EdgeInsets.only(
+                                                          top: kCodeBlockGap,
+                                                        ),
+                                                    richTextBuilder:
+                                                        _popupRichText,
+                                                    generators: [
+                                                      overlayInlineCodeGenerator(
+                                                        outer:
+                                                            _overlayBorderRadius,
+                                                        gap: 6.5,
+                                                        theme: _editorTheme,
+                                                        textStyle:
+                                                            _hoverDetailsStyle
+                                                                .textStyle,
+                                                        fallbackColor:
+                                                            _overlayForeground,
+                                                      ),
+                                                    ],
+                                                  ),
                                                   config: MarkdownConfig.darkConfig.copy(
                                                     configs: [
                                                       ...overlayHeadingConfigs(
@@ -4365,8 +4367,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                 .textStyle,
                                                       ),
                                                       overlayCodeBlockConfig(
-                                                        source: signature
-                                                            .documentation,
                                                         outer:
                                                             _overlayBorderRadius,
                                                         gap: 6.5,
@@ -4710,24 +4710,21 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                     ? item.label
                                                                     : item
                                                                           as String;
-                                                                _controller
-                                                                    .runAsSingleUndo(
-                                                                      () async {
-                                                                        _controller
-                                                                            .insertAtCurrentCursor(
-                                                                              text,
-                                                                              replaceTypedChar:
-                                                                                  true,
-                                                                            );
-                                                                        if (_extraText
-                                                                            .isNotEmpty) {
-                                                                          await _controller
-                                                                              .applyWorkspaceEdit(
-                                                                                _extraText,
-                                                                              );
-                                                                        }
-                                                                      },
-                                                                    );
+                                                                _controller.runAsSingleUndo(() async {
+                                                                  _controller
+                                                                      .insertAtCurrentCursor(
+                                                                        text,
+                                                                        replaceTypedChar:
+                                                                            true,
+                                                                      );
+                                                                  if (_extraText
+                                                                      .isNotEmpty) {
+                                                                    await _controller
+                                                                        .applyWorkspaceEdit(
+                                                                          _extraText,
+                                                                        );
+                                                                  }
+                                                                });
                                                                 _suggestionNotifier
                                                                         .value =
                                                                     null;
@@ -4984,6 +4981,30 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           child: MarkdownBlock(
                                                             data:
                                                                 _selectedSuggestionMd!,
+                                                            generator: MarkdownGenerator(
+                                                              linesMargin:
+                                                                  EdgeInsets.only(
+                                                                    top:
+                                                                        kCodeBlockGap,
+                                                                  ),
+                                                              richTextBuilder:
+                                                                  _popupRichText,
+                                                              generators: [
+                                                                overlayInlineCodeGenerator(
+                                                                  outer:
+                                                                      _overlayBorderRadius,
+                                                                  gap:
+                                                                      kOverlayPadding,
+                                                                  theme:
+                                                                      _editorTheme,
+                                                                  textStyle:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle,
+                                                                  fallbackColor:
+                                                                      _overlayForeground,
+                                                                ),
+                                                              ],
+                                                            ),
                                                             config: MarkdownConfig.darkConfig.copy(
                                                               configs: [
                                                                 ...overlayHeadingConfigs(
@@ -4996,8 +5017,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                           .textStyle,
                                                                 ),
                                                                 overlayCodeBlockConfig(
-                                                                  source:
-                                                                      _selectedSuggestionMd!,
                                                                   outer:
                                                                       _overlayBorderRadius,
                                                                   gap:
@@ -5059,7 +5078,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                           final viewportWidth = overlayBounds.width;
                           final desiredWidth = _isMobile
                               ? viewportWidth * 0.63
-                              : min(viewportWidth * 0.4, 520.0);
+                              : min(viewportWidth * 0.45, 640.0);
                           final width = min(
                             desiredWidth,
                             max(70.0, viewportWidth - 20),
@@ -5253,8 +5272,17 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                 shape: _hoverDetailsStyle.shape,
                                                 clipBehavior: Clip.antiAlias,
                                                 child: Padding(
-                                                  padding: EdgeInsets.all(
-                                                    kOverlayPadding,
+                                                  // No top padding: the
+                                                  // markdown's own inter-block
+                                                  // gap is the top inset, so
+                                                  // the first block sits the
+                                                  // same distance from the
+                                                  // card edge as blocks sit
+                                                  // from each other.
+                                                  padding: EdgeInsets.only(
+                                                    left: kOverlayPadding,
+                                                    right: kOverlayPadding,
+                                                    bottom: kOverlayPadding,
                                                   ),
                                                   child: PopupScrollConfiguration(
                                                     child: RawScrollbar(
@@ -5274,8 +5302,11 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                           generator: MarkdownGenerator(
                                                             linesMargin:
                                                                 EdgeInsets.only(
-                                                                  top: 1,
+                                                                  top:
+                                                                      kCodeBlockGap,
                                                                 ),
+                                                            richTextBuilder:
+                                                                _popupRichText,
                                                             generators: [
                                                               SpanNodeGeneratorWithTag(
                                                                 tag: MarkdownTag
@@ -5292,6 +5323,26 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                       ).colorScheme.outline,
                                                                     ),
                                                               ),
+                                                              overlayInlineCodeGenerator(
+                                                                outer:
+                                                                    _overlayBorderRadius,
+                                                                gap:
+                                                                    kOverlayPadding,
+                                                                theme:
+                                                                    _editorTheme,
+                                                                textStyle: TextStyle(
+                                                                  fontSize: _hoverDetailsStyle
+                                                                      .textStyle
+                                                                      .fontSize,
+                                                                  fontFamily:
+                                                                      _hoverDetailsStyle
+                                                                          .textStyle
+                                                                          .fontFamily ??
+                                                                      'monospace',
+                                                                ),
+                                                                fallbackColor:
+                                                                    _overlayForeground,
+                                                              ),
                                                             ],
                                                           ),
                                                           config: MarkdownConfig.darkConfig.copy(
@@ -5305,18 +5356,16 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                     _hoverDetailsStyle
                                                                         .textStyle,
                                                               ),
-                                                              CodeConfig(
-                                                                style: TextStyle(
-                                                                  fontFamily:
-                                                                      _hoverDetailsStyle
-                                                                          .textStyle
-                                                                          .fontFamily ??
-                                                                      'monospace',
-                                                                ),
-                                                              ),
+                                                              // Inline code is
+                                                              // drawn by
+                                                              // [overlayInlineCodeGenerator]
+                                                              // above, so the
+                                                              // package's
+                                                              // CodeConfig no
+                                                              // longer
+                                                              // participates in
+                                                              // this popup.
                                                               overlayCodeBlockConfig(
-                                                                source:
-                                                                    hoverMessage,
                                                                 outer:
                                                                     _overlayBorderRadius,
                                                                 gap:
@@ -5524,6 +5573,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                         final actionData = _lspActionNotifier
                                             .value!
                                             .cast<Map<String, dynamic>>();
+                                        // Action titles are prose carrying code
+                                        // fragments, not editor content, so the
+                                        // label reads in the UI font like VS
+                                        // Code's action list. The completion
+                                        // list keeps the editor family on
+                                        // purpose; only this popup speaks
+                                        // prose.
+                                        final labelStyle =
+                                            overlayProseTextStyle(
+                                              _suggestionStyle.labelTextStyle ??
+                                                  _suggestionStyle.textStyle,
+                                            );
                                         return Tooltip(
                                           message: actionData[indx]['title'],
                                           // `container: true` keeps this tooltip
@@ -5631,29 +5692,14 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                       Expanded(
                                                         child: Text(
                                                           actionData[indx]['title'],
-                                                          style:
-                                                              _suggestionStyle
-                                                                  .labelTextStyle
-                                                                  ?.copyWith(
-                                                                    color:
-                                                                        indx ==
-                                                                            _actionSelIndex
-                                                                        ? Colors
-                                                                              .white
-                                                                        : _suggestionStyle
-                                                                              .labelTextStyle
-                                                                              ?.color,
-                                                                  ) ??
-                                                              _suggestionStyle.textStyle.copyWith(
-                                                                color:
-                                                                    indx ==
-                                                                        _actionSelIndex
-                                                                    ? Colors
-                                                                          .white
-                                                                    : _suggestionStyle
-                                                                          .textStyle
-                                                                          .color,
-                                                              ),
+                                                          style: labelStyle.copyWith(
+                                                            color:
+                                                                indx ==
+                                                                    _actionSelIndex
+                                                                ? Colors.white
+                                                                : labelStyle
+                                                                      .color,
+                                                          ),
                                                           overflow: TextOverflow
                                                               .ellipsis,
                                                         ),
@@ -8047,8 +8093,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       return null;
     }
     final top = vscrollController.offset;
-    final bottom =
-        top + vscrollController.position.viewportDimension;
+    final bottom = top + vscrollController.position.viewportDimension;
     final first = _findVisibleLineByYPosition(top);
     final last = _findVisibleLineByYPosition(bottom);
     return (last - first).clamp(1, controller.lineCount);
@@ -11563,7 +11608,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
       final contentWidth =
           size.width - _gutterWidth - (innerPadding?.horizontal ?? 0);
-      final para = _paragraphCache[lineIndex] ??
+      final para =
+          _paragraphCache[lineIndex] ??
           _buildHighlightedParagraph(
             lineIndex,
             lineText,
@@ -14228,6 +14274,102 @@ class _HoverDividerNode extends SpanNode {
   InlineSpan build() => WidgetSpan(
     alignment: PlaceholderAlignment.middle,
     child: Container(height: 1, color: color),
+  );
+}
+
+/// The padding an inline code chip paints around its text.
+///
+/// Horizontal room so the fill does not hug the glyphs, vertical room that
+/// stays inside the leading the line already has.
+const EdgeInsets kInlineCodeChipPadding = EdgeInsets.symmetric(
+  horizontal: 5,
+  vertical: 1,
+);
+
+/// Paints an inline code chip's fill, outline, and radius around its text.
+///
+/// The chip's layout box is exactly its text box — the surface is drawn
+/// [kInlineCodeChipPadding] beyond it, the way CSS paints an inline code
+/// background around the glyphs without giving the padding a say in the
+/// line's layout. A [Container] with padding cannot do that: its padding is
+/// layout, and padding in the line box is what bloats the lines a chip sits
+/// on.
+class InlineCodeChipPainter extends CustomPainter {
+  InlineCodeChipPainter({required this.decoration});
+
+  final BoxDecoration decoration;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Rect.fromLTRB(
+      -kInlineCodeChipPadding.left,
+      -kInlineCodeChipPadding.top,
+      size.width + kInlineCodeChipPadding.right,
+      size.height + kInlineCodeChipPadding.bottom,
+    );
+    // Every decoration this file builds is uniform, so any corner carries
+    // the radius the chip paints.
+    final borderRadius = decoration.borderRadius;
+    final double radius = borderRadius is BorderRadius
+        ? borderRadius.topLeft.x
+        : 0;
+    final rrect = RRect.fromRectAndRadius(rect, Radius.circular(radius));
+    canvas.drawRRect(rrect, Paint()..color = decoration.color!);
+    final side = decoration.border?.top;
+    if (side != null && side.style == BorderStyle.solid) {
+      canvas.drawRRect(
+        rrect,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = side.width
+          ..color = side.color,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(InlineCodeChipPainter oldDelegate) =>
+      oldDelegate.decoration != decoration;
+}
+
+/// Inline code inside a popup, drawn as a chip that shares the fenced code
+/// block's surface.
+///
+/// The chip is a [WidgetSpan] because a text span background is a rectangle
+/// with no corners. Everything that makes it *read* as code (the fill, the
+/// outline, the radius, the font) comes from [decoration] and [textStyle],
+/// which [overlayInlineCodeGenerator] derives from the same inputs as the
+/// block.
+///
+/// The span aligns on the text baseline, so the chip's glyphs sit on the
+/// same line every other run sits on — a middle-aligned box drifts with
+/// whatever metrics the paragraph's root style happens to carry. And the
+/// surface is painted rather than padded into the box
+/// ([InlineCodeChipPainter]): the layout box stays the text's own
+/// ([kChipHeight] keeps it just past the ink), so the line the chip lands on
+/// never grows for the chip's sake.
+class _OverlayInlineCodeNode extends SpanNode {
+  _OverlayInlineCodeNode(this.text, this.decoration, this.textStyle);
+
+  final String text;
+  final BoxDecoration decoration;
+  final TextStyle textStyle;
+
+  @override
+  InlineSpan build() => WidgetSpan(
+    alignment: PlaceholderAlignment.baseline,
+    baseline: TextBaseline.alphabetic,
+    child: CustomPaint(
+      painter: InlineCodeChipPainter(decoration: decoration),
+      // softWrap so a long token folds inside the chip instead of pushing
+      // the chip past the popup edge; the whole chip still wraps as a unit
+      // between lines.
+      child: Text(
+        text,
+        style: textStyle.copyWith(height: kChipHeight),
+        softWrap: true,
+      ),
+    ),
   );
 }
 
