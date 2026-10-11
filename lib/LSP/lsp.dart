@@ -56,6 +56,14 @@ sealed class LspConfig {
 
   bool isInitialized = false;
 
+  /// Whether the client's `initialized` notification has been sent.
+  ///
+  /// Between the server's `initialize` reply and that notification, the
+  /// protocol forbids every other client message; strict servers (zuban) exit
+  /// on receiving one, which is what turns a stray early request into a dead
+  /// process and broken-pipe writes.
+  bool _handshakeComplete = false;
+
   /// Stream of responses from the LSP server.
   /// Use this to listen for notifications like diagnostics.
   Stream<Map<String, dynamic>> get responses => _responseController.stream;
@@ -162,20 +170,47 @@ sealed class LspConfig {
 
   void dispose();
 
+  /// Whether this config's transport can still serve requests.
+  ///
+  /// The stdio transport reports `false` once its server process exited, so a
+  /// host holding pooled configs can replace a dead server instead of handing
+  /// it to every later editor.
+  bool get isUsable => true;
+
+  /// Rejects client messages the protocol forbids before the handshake
+  /// completed, so a caller racing the startup cannot kill the server with an
+  /// out-of-order request — the rejection stays a local, catchable error.
+  void _ensureHandshakeAllows(String method) {
+    if (_handshakeComplete ||
+        method == 'initialize' ||
+        method == 'initialized') {
+      return;
+    }
+    throw StateError(
+      'LSP "$method" was not sent: the initialize handshake has not completed',
+    );
+  }
+
   /// Sends a request to the LSP server and waits for a response.
   /// Transient transport and JSON-RPC errors are retried up to three times.
   Future<Map<String, dynamic>> sendRequest({
     required String method,
     required Map<String, dynamic> params,
   }) async {
-    for (var attempt = 0; attempt <= _maxRequestRetries; attempt++) {
+    _ensureHandshakeAllows(method);
+    // `initialize` is sent exactly once: a resent one arrives after the server
+    // left its pre-initialized state, and strict servers such as zuban exit on
+    // it — which turns every later write into a broken pipe. Its timeout or
+    // error response is final.
+    final maxAttempts = method == 'initialize' ? 1 : _maxRequestRetries + 1;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         final response = await _sendRequestOnce(method: method, params: params);
-        if (response['error'] == null || attempt == _maxRequestRetries) {
+        if (response['error'] == null || attempt == maxAttempts - 1) {
           return response;
         }
       } catch (error, stackTrace) {
-        if (attempt == _maxRequestRetries) {
+        if (attempt == maxAttempts - 1) {
           Error.throwWithStackTrace(error, stackTrace);
         }
       }
@@ -213,6 +248,18 @@ sealed class LspConfig {
   }
 
   Future<void> _initialize() async {
+    try {
+      return await _initializeHandshake();
+    } on Object {
+      // Only a dead transport may retry the handshake; caching the failure
+      // forever would keep every later editor of this workspace offline even
+      // after the pool replaced the process.
+      if (!isUsable) _initialization = null;
+      rethrow;
+    }
+  }
+
+  Future<void> _initializeHandshake() async {
     final workspaceUri = Uri.directory(workspacePath).toString();
     final response = await sendRequest(
       method: 'initialize',
@@ -254,6 +301,7 @@ sealed class LspConfig {
     }
 
     await sendNotification(method: 'initialized', params: {});
+    _handshakeComplete = true;
     isInitialized = true;
   }
 

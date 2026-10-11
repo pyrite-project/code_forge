@@ -1795,7 +1795,14 @@ class CodeForgeController implements DeltaTextInputClient {
   /// await controller.fetchDocumentColors();
   /// ```
   Future<void> fetchDocumentColors({bool force = false}) async {
-    if (!_documentColorsEnabled || lspConfig == null || openedFile == null) {
+    // `setDocumentColorsEnabled` fires during controller construction, while
+    // the handshake is still in flight; requesting colors then would send a
+    // pre-`initialized` request that strict servers (zuban) exit on. The
+    // fetch re-runs from `_openDocumentInLsp` once the handshake completes.
+    if (!_documentColorsEnabled ||
+        lspConfig == null ||
+        !lspConfig!.isInitialized ||
+        openedFile == null) {
       return;
     }
 
@@ -1934,7 +1941,13 @@ class CodeForgeController implements DeltaTextInputClient {
   Future<void> refreshLspFeatures() async {
     if (_isDisposed) return;
     final capabilities = lspConfig?.capabilities;
-    if (capabilities == null || openedFile == null) return;
+    // A config still mid-handshake must not be probed: any early request is a
+    // protocol violation that strict servers (zuban) answer by exiting.
+    if (capabilities == null ||
+        openedFile == null ||
+        lspConfig?.isInitialized != true) {
+      return;
+    }
 
     // Semantic tokens are pulled by the viewport when the notifier's version
     // changes, so bumping it re-requests under the current capability and the
@@ -1968,7 +1981,9 @@ class CodeForgeController implements DeltaTextInputClient {
   /// await controller.fetchLSPFoldRanges();
   /// ```
   Future<void> fetchLSPFoldRanges() async {
-    if (lspConfig == null || openedFile == null) return;
+    if (lspConfig == null || !lspConfig!.isInitialized || openedFile == null) {
+      return;
+    }
 
     try {
       final response = await lspConfig!.getLSPFoldRanges(openedFile!);

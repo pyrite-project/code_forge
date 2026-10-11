@@ -100,6 +100,7 @@ class LspSocketConfig extends LspConfig {
     required String method,
     required Map<String, dynamic> params,
   }) async {
+    _ensureHandshakeAllows(method);
     final id = _nextId++;
     final request = {
       'jsonrpc': '2.0',
@@ -109,8 +110,13 @@ class LspSocketConfig extends LspConfig {
     };
 
     final responseFuture = _waitForResponse(id);
+    // The connection can drop while the write below is still in flight,
+    // completing the response future before the await at the bottom observes
+    // it; mark it ignored so that window never surfaces as an unhandled
+    // exception.
+    responseFuture.ignore();
     _channel.sink.add(jsonEncode(request));
-    return responseFuture;
+    return await responseFuture;
   }
 
   @override
@@ -118,6 +124,7 @@ class LspSocketConfig extends LspConfig {
     required String method,
     required Map<String, dynamic> params,
   }) async {
+    _ensureHandshakeAllows(method);
     _channel.sink.add(
       jsonEncode({'jsonrpc': '2.0', 'method': method, 'params': params}),
     );

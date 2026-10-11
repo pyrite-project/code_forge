@@ -75,6 +75,14 @@ class LspStdioConfig extends LspConfig {
   final _buffer = <int>[];
   Future<void> _sendTail = Future<void>.value();
 
+  /// Last stderr bytes the server printed, so a server that dies during
+  /// startup reports why instead of surfacing only as a broken-pipe write.
+  static const int _stderrTailLimit = 8 * 1024;
+  final List<int> _stderrTail = <int>[];
+
+  /// Exit code of the server process, or null while it is running.
+  int? _exitCode;
+
   LspStdioConfig._({
     required this.executable,
     required super.workspacePath,
@@ -183,7 +191,42 @@ class LspStdioConfig extends LspConfig {
       onError: _failPendingRequests,
       onDone: () => _failPendingRequests(StateError('LSP stdio closed')),
     );
-    _process.stderr.listen((data) => debugPrint(utf8.decode(data)));
+    _process.stderr.listen((data) {
+      debugPrint(utf8.decode(data, allowMalformed: true));
+      _stderrTail.addAll(data);
+      if (_stderrTail.length > _stderrTailLimit) {
+        _stderrTail.removeRange(0, _stderrTail.length - _stderrTailLimit);
+      }
+    });
+    unawaited(
+      _process.exitCode.then((code) {
+        _exitCode = code;
+        // Wake in-flight requests with the real reason instead of leaving them
+        // to time out against a process that is already gone.
+        _failPendingRequests(StateError(_serverExitMessage()));
+      }),
+    );
+  }
+
+  String _serverExitMessage() {
+    final tail = utf8.decode(_stderrTail, allowMalformed: true).trim();
+    return 'LSP server process exited (code ${_exitCode ?? 'unknown'})'
+        '${tail.isEmpty ? '' : ': $tail'}';
+  }
+
+  /// Replaces a bare send failure with the server's exit reason when the
+  /// process is already gone — `stdin` writes then report a broken pipe that
+  /// hides what actually happened.
+  Object _describeSendFailure(Object error) {
+    if (_exitCode == null) return error;
+    return StateError('${_serverExitMessage()} (original error: $error)');
+  }
+
+  /// Fails fast when the server has exited: a write into its stdin can still
+  /// "succeed" into the kernel buffer and only time out later, so every sender
+  /// checks liveness first and reports the exit reason instead.
+  void _ensureServerAlive() {
+    if (_exitCode != null) throw StateError(_serverExitMessage());
   }
 
   int get pid => _process.pid;
@@ -231,6 +274,8 @@ class LspStdioConfig extends LspConfig {
     required String method,
     required Map<String, dynamic> params,
   }) async {
+    _ensureHandshakeAllows(method);
+    _ensureServerAlive();
     final id = _nextId++;
     final request = {
       'jsonrpc': '2.0',
@@ -240,6 +285,10 @@ class LspStdioConfig extends LspConfig {
     };
 
     final responseFuture = _waitForResponse(id);
+    // The server can die while the write below is still in flight, completing
+    // the response future before the await at the bottom observes it; mark it
+    // ignored so that window never surfaces as an unhandled exception.
+    responseFuture.ignore();
 
     await _sendLspMessage(request);
 
@@ -251,6 +300,8 @@ class LspStdioConfig extends LspConfig {
     required String method,
     required Map<String, dynamic> params,
   }) async {
+    _ensureHandshakeAllows(method);
+    _ensureServerAlive();
     await _sendLspMessage({
       'jsonrpc': '2.0',
       'method': method,
@@ -263,6 +314,7 @@ class LspStdioConfig extends LspConfig {
     int id,
     List<dynamic> result,
   ) async {
+    _ensureServerAlive();
     final request = {'jsonrpc': '2.0', 'id': id, 'result': result};
     await _sendLspMessage(request);
     return request;
@@ -282,13 +334,16 @@ class LspStdioConfig extends LspConfig {
         }
       } catch (e, st) {
         if (!completer.isCompleted) {
-          completer.completeError(e, st);
+          completer.completeError(_describeSendFailure(e), st);
         }
       }
     });
 
     return completer.future;
   }
+
+  @override
+  bool get isUsable => _exitCode == null;
 
   @override
   void dispose() {
