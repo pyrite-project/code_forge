@@ -98,22 +98,20 @@ class _CodeForgeRootOverlayPortalState
             // popup is anchored with `bottom`, so it landed hundreds of pixels
             // below the word whenever it flipped above the cursor.
             //
-            // `UnconstrainedBox` is what actually makes the width and height
-            // here take effect. The overlay lays its children out with tight
-            // constraints spanning the whole overlay, and a `SizedBox` under
-            // tight constraints cannot shrink: it defers to the parent and
-            // renders at the overlay's full size. That is precisely the bug
-            // described above, so the box has to be laid out without a
-            // constraint that would override the target size. It is positioned
-            // back at the top left so dropping the constraints does not move
-            // the child.
-            child: UnconstrainedBox(
-              alignment: Alignment.topLeft,
-              child: SizedBox(
-                width: widget.targetSize.width,
-                height: widget.targetSize.height,
-                child: _OverflowHitTestStack(children: [widget.overlayChild]),
-              ),
+            // The overlay lays its children out with tight constraints spanning
+            // the whole overlay, under which a `SizedBox` cannot shrink, so
+            // [_TargetSizedBox] lays the child out at the target size whatever
+            // it is given.
+            //
+            // It also takes hits outside its own box. A popup is positioned
+            // relative to the target and routinely extends past it -- a
+            // completion list near the bottom of the editor, a hover flipped
+            // above the cursor -- and a box that rejected positions outside
+            // itself let a click on that part fall through to whatever lies
+            // underneath.
+            child: _TargetSizedBox(
+              size: widget.targetSize,
+              child: _OverflowHitTestStack(children: [widget.overlayChild]),
             ),
           ),
         );
@@ -165,5 +163,51 @@ class _RenderOverflowHitTestStack extends RenderStack {
       return true;
     }
     return false;
+  }
+}
+
+/// Lays its child out at exactly [size], whatever constraints it is given, and
+/// passes hits to the child wherever they land.
+class _TargetSizedBox extends SingleChildRenderObjectWidget {
+  const _TargetSizedBox({required this.size, required super.child});
+
+  final Size size;
+
+  @override
+  _RenderTargetSizedBox createRenderObject(BuildContext context) {
+    return _RenderTargetSizedBox(size);
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderTargetSizedBox renderObject,
+  ) {
+    renderObject.targetSize = size;
+  }
+}
+
+class _RenderTargetSizedBox extends RenderProxyBox {
+  _RenderTargetSizedBox(this._targetSize);
+
+  Size _targetSize;
+
+  set targetSize(Size value) {
+    if (value == _targetSize) return;
+    _targetSize = value;
+    markNeedsLayout();
+  }
+
+  @override
+  void performLayout() {
+    child?.layout(BoxConstraints.tight(_targetSize));
+    size = constraints.constrain(_targetSize);
+  }
+
+  @override
+  bool hitTest(BoxHitTestResult result, {required Offset position}) {
+    if (!hitTestChildren(result, position: position)) return false;
+    result.add(BoxHitTestEntry(this, position));
+    return true;
   }
 }
