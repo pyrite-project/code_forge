@@ -256,15 +256,29 @@ class FindController extends ChangeNotifier {
   }
 
   /// Replaces all matches with the text in [replaceInputController].
+  ///
+  /// Each match is replaced on its own, walking backwards so an earlier edit
+  /// cannot invalidate the offsets of a later one. Rewriting the whole buffer
+  /// in a single call used to be simpler, but it told the language server that
+  /// the entire document had changed and handed the undo stack one edit whose
+  /// span was the whole file — neither is what the user did.
   void replaceAll() {
     if (_matches.isEmpty || _lastQuery.isEmpty) return;
 
     try {
-      final text = _codeController.text;
       final regExp = _buildRegExp(_lastQuery);
-      final newText = text.replaceAllMapped(regExp, _replacementFor);
+      // Re-scan instead of trusting `_matches`: the buffer may have changed
+      // since the last search, and a stale offset would corrupt the edit.
+      final targets = regExp.allMatches(_codeController.text).toList();
+      if (targets.isEmpty) return;
 
-      _codeController.replaceRange(0, text.length, newText);
+      for (final match in targets.reversed) {
+        _codeController.replaceRange(
+          match.start,
+          match.end,
+          _replacementFor(match),
+        );
+      }
       find(_lastQuery, scrollToMatch: false);
     } catch (e) {
       debugPrint('FindController: Replace All failed. Error: $e');
