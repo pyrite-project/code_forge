@@ -1543,17 +1543,25 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   Future<void> _fetchCodeActionsForCurrentPosition() async {
     if (_controller.lspConfig == null) return;
     final sel = _controller.selection;
-    final cursor = sel.extentOffset;
-    final line = _controller.getLineAtOffset(cursor);
-    final lineStart = _controller.getLineStartOffset(line);
-    final character = cursor - lineStart;
+    // Ask about the selection, not only the caret. A refactor such as
+    // "extract" or "surround with" is defined over a range, and the server
+    // answers a zero-width request at the caret with nothing for it. With a
+    // collapsed caret both ends are the same position, so the simple case is
+    // unchanged.
+    final startOffset = sel.isValid ? sel.start : sel.extentOffset;
+    final endOffset = sel.isValid ? sel.end : sel.extentOffset;
+    final startLine = _controller.getLineAtOffset(startOffset);
+    final startCharacter =
+        startOffset - _controller.getLineStartOffset(startLine);
+    final endLine = _controller.getLineAtOffset(endOffset);
+    final endCharacter = endOffset - _controller.getLineStartOffset(endLine);
 
     final actions = await _controller.lspConfig!.getCodeActions(
       filePath: _filePath!,
-      startLine: line,
-      startCharacter: character,
-      endLine: line,
-      endCharacter: character,
+      startLine: startLine,
+      startCharacter: startCharacter,
+      endLine: endLine,
+      endCharacter: endCharacter,
       diagnostics: _diagnosticsNotifier.value
           .map((item) => item.toJson())
           .toList(),
