@@ -612,6 +612,15 @@ class CodeForge extends StatefulWidget {
   /// Invoked by `Ctrl+F12`.
   final VoidCallback? onGoToImplementation;
 
+  /// Offers every key press to the host before the engine acts on it.
+  ///
+  /// Returns true to consume the press: the engine then skips its own action
+  /// for that key entirely. This is how a host hands `Tab` to an inline
+  /// (FIM) completion provider — the provider captures the key only while it
+  /// owns a suggestion, accepts or dismisses it, and lets everything else
+  /// fall through untouched.
+  final bool Function(KeyEvent event)? onInterceptKey;
+
   /// Styling options for text selection and cursor.
   final CodeSelectionStyle? selectionStyle;
 
@@ -799,6 +808,7 @@ class CodeForge extends StatefulWidget {
     this.onFormatDocument,
     this.onFindReferences,
     this.onGoToImplementation,
+    this.onInterceptKey,
     this.customCodeSnippets,
     this.customContextMenuItems,
     this.contextMenuBuilder,
@@ -2557,6 +2567,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                         .isComposingActive) {
                                                       return KeyEventResult
                                                           .ignored;
+                                                    }
+
+                                                    // The host (a plugin
+                                                    // owning an inline
+                                                    // completion, say) gets
+                                                    // the first look at every
+                                                    // press and can consume it
+                                                    // before the engine acts.
+                                                    if (widget.onInterceptKey
+                                                            ?.call(event) ??
+                                                        false) {
+                                                      return KeyEventResult
+                                                          .handled;
                                                     }
 
                                                     final shrtCt =
