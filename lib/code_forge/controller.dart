@@ -143,6 +143,7 @@ class CodeForgeController implements DeltaTextInputClient {
   bool _cclsForcedRefreshAttempted = false;
   bool _lspFoldRangesAdjustedNotFetched = false;
   bool _inlayHintsVisible = false, _inlayHintsTemporary = false;
+  Timer? _inlayHintsTimer;
   bool _documentColorsEnabled = true, _forceDocumentColorRequests = false;
   bool _readOnlyBeforeInlayHints = false, documentHighlightsChanged = false;
   int _imeProjectionStartOffset = 0,
@@ -431,6 +432,7 @@ class CodeForgeController implements DeltaTextInputClient {
 
         _scheduleDocumentColorRefresh();
         _scheduleFoldRangesRefresh();
+        _scheduleInlayHintsRefresh();
 
         if (isTypingLenMatch) {
           final cursorPosition = currentSelection.extentOffset;
@@ -1685,8 +1687,8 @@ class CodeForgeController implements DeltaTextInputClient {
 
   /// Shows inlay hints in the editor.
   ///
-  /// This fetches inlay hints from the LSP server for the visible range
-  /// and displays them inline in the code. By default, hints are shown as a
+  /// This fetches inlay hints from the LSP server for the whole document and
+  /// displays them inline in the code. By default, hints are shown as a
   /// temporary read-only view; pass [readOnly] as false for persistent hints.
   ///
   /// Inlay hints show type annotations (kind: 1) and parameter names (kind: 2).
@@ -1711,16 +1713,28 @@ class CodeForgeController implements DeltaTextInputClient {
     _inlayHintsTemporary = readOnly;
     _readOnlyBeforeInlayHints = this.readOnly;
     if (readOnly) this.readOnly = true;
+    await _fetchInlayHints();
+  }
+
+  /// Requests inlay hints for the complete document and replaces the cache.
+  ///
+  /// Earlier versions stopped the request at line 500, which silently left
+  /// everything past that line without hints and made the feature look broken
+  /// in any file longer than a few screens. A language server answers a
+  /// whole-document request with the hints it wants to show, so the cap only
+  /// ever hid information the user had asked for.
+  Future<void> _fetchInlayHints() async {
+    if (lspConfig == null || openedFile == null) return;
     final requestId = ++_inlayHintsRequestId;
 
     try {
-      final endLine = lineCount > 500 ? 500 : lineCount;
+      final lastLine = lineCount == 0 ? 0 : lineCount - 1;
       final response = await lspConfig!.getInlayHints(
         openedFile!,
         0,
         0,
-        endLine,
-        0,
+        lastLine,
+        getLineText(lastLine).length,
         force: true,
       );
 
@@ -1745,6 +1759,22 @@ class CodeForgeController implements DeltaTextInputClient {
       _inlayHintsTemporary = false;
       this.readOnly = _readOnlyBeforeInlayHints;
     }
+  }
+
+  /// Re-fetches inlay hints after an edit, if they are currently on screen.
+  ///
+  /// The offsets carry an edit's insertions and deletions with them: a hint
+  /// fetched for the previous document can name the wrong line once text
+  /// above it moves. Re-requesting on the same debounce the colour and fold
+  /// refreshes use keeps the hints pinned to the code they describe.
+  void _scheduleInlayHintsRefresh() {
+    if (!_inlayHintsVisible) return;
+    _inlayHintsTimer?.cancel();
+    _inlayHintsTimer = Timer(const Duration(milliseconds: 500), () {
+      if (!_isDisposed && _lspReady && _inlayHintsVisible) {
+        unawaited(_fetchInlayHints());
+      }
+    });
   }
 
   /// Hides inlay hints from the editor.
@@ -1964,7 +1994,10 @@ class CodeForgeController implements DeltaTextInputClient {
     if (capabilities.documentHighlight) {
       final offset = selection.extentOffset.clamp(0, text.length);
       final line = getLineAtOffset(offset);
-      scheduleDocumentHighlightsRefresh(line, offset - getLineStartOffset(line));
+      scheduleDocumentHighlightsRefresh(
+        line,
+        offset - getLineStartOffset(line),
+      );
     } else {
       _documentHighlightTimer?.cancel();
       clearDocumentHighlights();
@@ -2508,10 +2541,7 @@ class CodeForgeController implements DeltaTextInputClient {
 
     if (isShiftPressed) {
       setSelectionSilently(
-        TextSelection(
-          baseOffset: selection.baseOffset,
-          extentOffset: target,
-        ),
+        TextSelection(baseOffset: selection.baseOffset, extentOffset: target),
       );
     } else {
       setSelectionSilently(TextSelection.collapsed(offset: target));
@@ -2660,7 +2690,10 @@ class CodeForgeController implements DeltaTextInputClient {
     // on the line keeps the following lines at column zero rather than
     // floating them out past the code that precedes them.
     final targetIndent = beforeCaret.trim().isEmpty ? beforeCaret : '';
-    final payload = reindentPastedText(clipboardText, targetIndent: targetIndent);
+    final payload = reindentPastedText(
+      clipboardText,
+      targetIndent: targetIndent,
+    );
     replaceRange(sel.start, sel.end, payload);
   }
 
@@ -3048,9 +3081,7 @@ class CodeForgeController implements DeltaTextInputClient {
     final start = sel.start;
     final end = sel.end;
 
-    final blockStart = start == 0
-        ? 0
-        : text.lastIndexOf('\n', start - 1) + 1;
+    final blockStart = start == 0 ? 0 : text.lastIndexOf('\n', start - 1) + 1;
 
     // A selection that ends exactly at a line start has not really reached
     // into that line; including it would delete a line the user did not
@@ -3058,7 +3089,8 @@ class CodeForgeController implements DeltaTextInputClient {
     var reachesNextLine = false;
     if (end > start) {
       reachesNextLine =
-          text[end - 1] == '\n' || getLineAtOffset(end - 1) > getLineAtOffset(start);
+          text[end - 1] == '\n' ||
+          getLineAtOffset(end - 1) > getLineAtOffset(start);
     }
 
     int blockEnd;
@@ -3185,7 +3217,8 @@ class CodeForgeController implements DeltaTextInputClient {
         : text.lastIndexOf('\n', sel.start - 1) + 1;
     // A selection ending exactly at a line start does not really cover that
     // line; taking it would comment out a line the user did not select.
-    final to = sel.isCollapsed || text.substring(sel.start, sel.end).endsWith('\n')
+    final to =
+        sel.isCollapsed || text.substring(sel.start, sel.end).endsWith('\n')
         ? getLineStartOffset(getLineAtOffset(sel.end)) + 1
         : sel.end;
     if (from >= text.length || from >= to) return;
@@ -5356,6 +5389,7 @@ class CodeForgeController implements DeltaTextInputClient {
     _codeActionTimer?.cancel();
     _documentColorTimer?.cancel();
     _foldRangesTimer?.cancel();
+    _inlayHintsTimer?.cancel();
     _documentHighlightTimer?.cancel();
     _lspResponsesSubscription?.cancel();
     _listeners.clear();

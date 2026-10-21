@@ -159,7 +159,11 @@ class FindController extends ChangeNotifier {
       pattern = RegExp.escape(pattern);
     }
 
-    if (_matchWholeWord) {
+    // Whole-word wrapping is only meaningful for literal searches. Wrapping an
+    // arbitrary pattern in `\b` changes its meaning — `\b^foo` can never
+    // match, and `\b(a|b)\b` narrows the anchors the user wrote — so a regex
+    // search keeps the pattern exactly as typed.
+    if (_matchWholeWord && !_isRegex) {
       pattern = r'\b' + pattern + r'\b';
     }
 
