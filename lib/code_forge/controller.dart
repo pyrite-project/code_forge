@@ -168,6 +168,10 @@ class CodeForgeController implements DeltaTextInputClient {
   String? _activeCompletionKey;
   ({String filePath, String prefix, int line, int character})?
   _queuedCompletionRequest;
+  // Completion requests only stay alive for a word the user began typing
+  // themselves; a word they dismissed stays quiet until a new one begins.
+  bool _completionWordSessionActive = false;
+  bool _completionSuppressedForWord = false;
 
   CodeForgeController({this.lspConfig}) {
     if (lspConfig != null) {
@@ -337,6 +341,15 @@ class CodeForgeController implements DeltaTextInputClient {
           final cursorPosition = selection.extentOffset;
           final prefix = getCurrentWordPrefix(text, cursorPosition);
           if (_isTyping && selection.extentOffset > 0) {
+            final triggerChar = text[cursorPosition - 1];
+            final isTriggerChar = _isCompletionTriggerChar(triggerChar);
+            final isAlphaChar = _isAlpha(triggerChar);
+
+            if (!isTriggerChar && !isAlphaChar) {
+              if (!_isDisposed) suggestionsNotifier.value = null;
+              return;
+            }
+
             String currentWord = '';
             if (text.isNotEmpty) {
               final match = RegExp(
@@ -360,12 +373,13 @@ class CodeForgeController implements DeltaTextInputClient {
                   .toList();
             }
             _sortSuggestions(prefix);
-            final triggerChar = text[cursorPosition - 1];
-            final isTriggerChar = _isCompletionTriggerChar(triggerChar);
-            final isAlphaChar = _isAlpha(triggerChar);
 
-            if (!isTriggerChar && !isAlphaChar) {
+            if (_suggestions.isEmpty || _wordCache.contains(prefix)) {
+              // The word is spelled out, or nothing matches it anymore.
               if (!_isDisposed) suggestionsNotifier.value = null;
+              return;
+            }
+            if (!_completionWordSessionActive || _completionSuppressedForWord) {
               return;
             }
             if (!_isDisposed) suggestionsNotifier.value = _suggestions;
@@ -445,14 +459,27 @@ class CodeForgeController implements DeltaTextInputClient {
           final isTriggerChar = _isCompletionTriggerChar(triggerChar);
           final isAlphaChar = _isAlpha(triggerChar);
 
-          if ((isTriggerChar || isAlphaChar) && !_isDisposed) {
+          // A request goes out only while the word under the cursor is one
+          // the user began typing themselves and has not dismissed; trigger
+          // characters (member access) always ask. A response for a word
+          // that is already spelled out closes the popup instead of opening
+          // it, see _showFetchedSuggestions.
+          final startsCompletion =
+              isTriggerChar ||
+              (isAlphaChar &&
+                  _completionWordSessionActive &&
+                  !_completionSuppressedForWord);
+
+          if (startsCompletion && !_isDisposed) {
             _requestCompletions(
               prefix: prefix,
               line: line,
               character: character,
             );
-          } else {
-            if (!_isDisposed) suggestionsNotifier.value = null;
+          } else if (isAlphaChar && !_isDisposed) {
+            _narrowOpenSuggestions(prefix);
+          } else if (!_isDisposed) {
+            suggestionsNotifier.value = null;
           }
         } else {
           if (!_isDisposed) suggestionsNotifier.value = null;
@@ -549,8 +576,7 @@ class CodeForgeController implements DeltaTextInputClient {
     }
     if (_isDisposed || requestId != _completionRequestId) return;
     _suggestions = completions;
-    _sortSuggestions(prefix);
-    if (!_isDisposed) suggestionsNotifier.value = _suggestions;
+    _showFetchedSuggestions(prefix);
 
     final pendingCompletion = _queuedCompletionRequest;
     _queuedCompletionRequest = null;
@@ -577,6 +603,131 @@ class CodeForgeController implements DeltaTextInputClient {
     ({String filePath, String prefix, int line, int character}) request,
   ) {
     return '${request.filePath}|${request.line}|${request.character}|${request.prefix}';
+  }
+
+  /// Publishes fetched completions only while they still describe the word at
+  /// the cursor. The user keeps typing while a request is in flight, so the
+  /// list is narrowed to what has been typed by now, and a word that is
+  /// already spelled out — whether it grew past the request or was typed
+  /// wholesale inside the debounce window — closes the popup instead of
+  /// opening it.
+  void _showFetchedSuggestions(String requestPrefix) {
+    if (_isDisposed) return;
+    final currentPrefix = getCurrentWordPrefix(text, selection.extentOffset);
+    final lowerRequest = requestPrefix.toLowerCase();
+    final lowerCurrent = currentPrefix.toLowerCase();
+    if (!lowerCurrent.startsWith(lowerRequest)) {
+      // The caret moved off the word the request was made for; a queued
+      // request, if any, delivers the follow-up.
+      suggestionsNotifier.value = null;
+      return;
+    }
+
+    if (_hasExactSuggestionMatch(currentPrefix)) {
+      suggestionsNotifier.value = null;
+      return;
+    }
+
+    final narrowed = currentPrefix.isEmpty
+        ? List<dynamic>.of(_suggestions)
+        : _suggestions
+              .where(
+                (suggestion) =>
+                    _suggestionLabel(
+                      suggestion,
+                    )?.toLowerCase().startsWith(lowerCurrent) ??
+                    false,
+              )
+              .toList();
+    if (narrowed.isEmpty) {
+      suggestionsNotifier.value = null;
+      return;
+    }
+    _suggestions = narrowed;
+    _sortSuggestions(currentPrefix);
+    suggestionsNotifier.value = _suggestions;
+  }
+
+  /// Narrows an already open popup to [prefix] without asking the LSP again.
+  /// Typing inside a word never reopens the popup, and a prefix that already
+  /// spells out one of the suggestions closes it.
+  void _narrowOpenSuggestions(String prefix) {
+    final current = suggestionsNotifier.value;
+    if (current == null || current.isEmpty) return;
+    final lower = prefix.toLowerCase();
+    final narrowed = _suggestions
+        .where(
+          (suggestion) =>
+              _suggestionLabel(suggestion)?.toLowerCase().startsWith(lower) ??
+              false,
+        )
+        .toList();
+    if (narrowed.isEmpty || _hasExactSuggestionMatch(prefix)) {
+      suggestionsNotifier.value = null;
+      return;
+    }
+    _suggestions = narrowed;
+    _sortSuggestions(prefix);
+    suggestionsNotifier.value = _suggestions;
+  }
+
+  String? _suggestionLabel(dynamic suggestion) {
+    if (suggestion is LspCompletion) return suggestion.label;
+    if (suggestion is String) return suggestion;
+    return null;
+  }
+
+  /// Whether [prefix] already spells out one of the known suggestions, i.e.
+  /// the word under the cursor is complete and needs no completion.
+  bool _hasExactSuggestionMatch(String prefix) {
+    if (prefix.isEmpty) return false;
+    final lower = prefix.toLowerCase();
+    for (final suggestion in _suggestions) {
+      final label = _suggestionLabel(suggestion);
+      if (label != null && label.toLowerCase() == lower) return true;
+    }
+    return false;
+  }
+
+  /// Whether the character just typed before the cursor begins a new word
+  /// instead of extending the one before it. An underscore counts as a
+  /// boundary so names like `__init__` still get completion offers.
+  bool _startsNewWord() {
+    final String lineText;
+    final int column;
+    if (isBufferActive) {
+      lineText = bufferLineText ?? '';
+      column = bufferCursorColumn;
+    } else {
+      final offset = selection.extentOffset;
+      if (offset == 0) return true;
+      final lineIndex = getLineAtOffset(offset);
+      lineText = getLineText(lineIndex);
+      column = offset - getLineStartOffset(lineIndex);
+    }
+    if (column <= 1) return true;
+    final previous = lineText[column - 2];
+    return previous == '_' || !_isIdentChar(previous.codeUnitAt(0));
+  }
+
+  /// Keeps the per-word completion session in step with typing: only a word
+  /// the user began with a fresh start character keeps completion requests
+  /// alive, and any other edit (punctuation, paste, delete, IME commit) ends
+  /// the session and clears a dismissal.
+  void _updateCompletionWordSessionForDelta(TextEditingDelta delta) {
+    final isSingleAlphaInsert =
+        delta is TextEditingDeltaInsertion &&
+        delta.textInserted.length == 1 &&
+        _isAlpha(delta.textInserted);
+    if (!isSingleAlphaInsert) {
+      _completionWordSessionActive = false;
+      _completionSuppressedForWord = false;
+      return;
+    }
+    if (_startsNewWord()) {
+      _completionWordSessionActive = true;
+      _completionSuppressedForWord = false;
+    }
   }
 
   /// The semantic tokens generated by the LSP server.
@@ -1491,6 +1642,17 @@ class CodeForgeController implements DeltaTextInputClient {
     codeActionsNotifier.value = null;
   }
 
+  /// Closes the completion popup and cancels any completion request still in
+  /// flight, so a late response cannot pop the popup back open. The current
+  /// word stays quiet until a new word begins.
+  void dismissSuggestions() {
+    suggestionsNotifier.value = null;
+    _completionSuppressedForWord = true;
+    _completionRequestId++;
+    _activeCompletionKey = null;
+    _queuedCompletionRequest = null;
+  }
+
   /// Accepts the currently selected suggestion and inserts it at the cursor position.
   ///
   /// For mobile devices, uses [currentlySelectedSuggestion] to determine which
@@ -1801,9 +1963,17 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Sets inlay hints directly.
   ///
   /// Use this method if you want to provide custom inlay hints
-  /// instead of fetching them from the LSP server.
+  /// instead of fetching them from the LSP server. The hints show
+  /// immediately, even when no [lspConfig] is attached — [showInlayHints]
+  /// cannot run without one. They carry no read-only intent, so a later
+  /// [hideInlayHints] restores the read-only state unchanged.
   void setInlayHints(List<InlayHint> hints) {
     _inlayHints = hints;
+    if (hints.isNotEmpty && !_inlayHintsVisible) {
+      _inlayHintsVisible = true;
+      _inlayHintsTemporary = false;
+      _readOnlyBeforeInlayHints = readOnly;
+    }
     inlayHintsChanged = true;
     notifyListeners();
   }
@@ -2865,6 +3035,8 @@ class CodeForgeController implements DeltaTextInputClient {
     _imeProjectionDirty = true;
     dirtyRegion = TextRange(start: 0, end: newText.length);
     _isTyping = false;
+    _completionWordSessionActive = false;
+    _completionSuppressedForWord = false;
     _scheduleLspFullSync(newText);
     notifyListeners();
   }
@@ -2887,6 +3059,8 @@ class CodeForgeController implements DeltaTextInputClient {
       _selection = _commitCompositionAndRemapSelection(newSelection);
       selectionOnly = true;
       _isTyping = false;
+      _completionWordSessionActive = false;
+      _completionSuppressedForWord = false;
       _imeProjectionDirty = true;
       requestImeReset?.call();
       notifyListeners();
@@ -2900,6 +3074,8 @@ class CodeForgeController implements DeltaTextInputClient {
     _selection = newSelection;
     selectionOnly = true;
     _isTyping = false;
+    _completionWordSessionActive = false;
+    _completionSuppressedForWord = false;
     _imeProjectionDirty = true;
 
     // Push the new projection to the platform synchronously instead of on a
@@ -2938,6 +3114,8 @@ class CodeForgeController implements DeltaTextInputClient {
     _selection = newSelection;
     selectionOnly = true;
     _isTyping = false;
+    _completionWordSessionActive = false;
+    _completionSuppressedForWord = false;
     _imeProjectionDirty = true;
 
     _syncToConnection();
@@ -2965,6 +3143,8 @@ class CodeForgeController implements DeltaTextInputClient {
     _selection = newSelection;
     selectionOnly = true;
     _isTyping = false;
+    _completionWordSessionActive = false;
+    _completionSuppressedForWord = false;
     _imeProjectionDirty = true;
 
     _syncToConnection();
@@ -3394,6 +3574,8 @@ class CodeForgeController implements DeltaTextInputClient {
           _localImeSelectionToGlobal(delta.selection),
         );
       }
+
+      _updateCompletionWordSessionForDelta(delta);
 
       _trackImeComposing(
         delta.composing,
@@ -5629,7 +5811,9 @@ class CodeForgeController implements DeltaTextInputClient {
 
   bool _isCompletionTriggerChar(String s) {
     if (s.isEmpty) return false;
-    return s == '.' || s == ':' || s == '>' || s == '/' || s == '@';
+    // `:` stays excluded: Python block statements end with it (`for i in
+    // range():`), where the popup would swallow the auto-indented newline.
+    return s == '.' || s == '>' || s == '/' || s == '@';
   }
 
   List<LspSemanticToken> _convertCclsSymbolsToTokens(List<dynamic> symbols) {

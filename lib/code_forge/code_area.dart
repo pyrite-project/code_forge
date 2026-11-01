@@ -43,6 +43,33 @@ const double kHoverAnchorGap = 0.0;
 /// `outer == gap + inner`.
 const double kOverlayPadding = 8.0;
 
+/// Keys the platform IME must receive while it owns a composition (marked
+/// text) in the editor: candidate navigation, paging and dismissal.
+///
+/// During a composition the editor's focus handler ignores every key so the
+/// IME can drive the session, but unhandled keys then bubble up to the
+/// app-level shortcut table, where plain arrows map to focus traversal or
+/// scroll intents. Those consume the event before the embedder can hand it to
+/// the input method, which is why the down arrow cannot expand the candidate
+/// window. For these keys the focus handler answers
+/// [KeyEventResult.skipRemainingHandlers] instead: remaining framework
+/// handlers are skipped while the event is still reported unhandled, so the
+/// embedder forwards it to the IME exactly like a native text view does.
+// Not `const`: LogicalKeyboardKey overrides ==, which a constant set
+// disallows.
+final Set<LogicalKeyboardKey> kImeCompositionPassThroughKeys =
+    <LogicalKeyboardKey>{
+      LogicalKeyboardKey.arrowUp,
+      LogicalKeyboardKey.arrowDown,
+      LogicalKeyboardKey.arrowLeft,
+      LogicalKeyboardKey.arrowRight,
+      LogicalKeyboardKey.pageUp,
+      LogicalKeyboardKey.pageDown,
+      LogicalKeyboardKey.home,
+      LogicalKeyboardKey.end,
+      LogicalKeyboardKey.escape,
+    };
+
 /// Default outer corner radius for every floating overlay this editor shows.
 ///
 /// A host app that defines its own corner scale should pass its own value via
@@ -929,6 +956,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final String? _filePath;
   late final FindController _findController;
   late final VoidCallback _semanticTokensListener;
+  late final VoidCallback _diagnosticsListener;
   late final VoidCallback _controllerListener;
   late final bool _deleteFoldRangeOnDeletingFirstLine;
   late final VoidCallback _signatureListener, _hoverListener;
@@ -1202,6 +1230,18 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       });
     };
     _controller.semanticTokens.addListener(_semanticTokensListener);
+
+    // Diagnostics reach the renderer only through the widget property captured
+    // at build time, so a publish that changes nothing else (the usual case:
+    // an edit fixed the error and the server republishes) would keep painting
+    // the stale squiggles until the next semantic-token or suggestion update
+    // rebuilt the tree. Push the fresh list straight into the live renderer
+    // instead; before it exists (initState, openedFile clearing the list) the
+    // first build reads the notifier anyway.
+    _diagnosticsListener = () {
+      _codeFieldRenderer?.updateDiagnostics(_diagnosticsNotifier.value);
+    };
+    _controller.diagnosticsNotifier.addListener(_diagnosticsListener);
 
     _focusNode.addListener(() {
       if (_focusNode.hasFocus && !_readOnly) {
@@ -1567,7 +1607,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
           .toList(),
     );
 
-    _suggestionNotifier.value = null;
+    _controller.dismissSuggestions();
     _lspActionNotifier.value = actions;
     _actionSelIndex = 0;
     _lspActionOffsetNotifier.value = _offsetNotifier.value;
@@ -1730,6 +1770,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       _onScrollbarForcedVisibleChanged,
     );
     _controller.semanticTokens.removeListener(_semanticTokensListener);
+    _controller.diagnosticsNotifier.removeListener(_diagnosticsListener);
     _lspSignatureNotifier.removeListener(_signatureListener);
     _hoverNotifier.removeListener(_hoverListener);
     _isHoveringPopup.removeListener(_isHoveringPopupListener);
@@ -1775,7 +1816,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     }
 
     if (_suggestionNotifier.value != null) {
-      _suggestionNotifier.value = null;
+      _controller.dismissSuggestions();
     }
 
     if (widget.textDirection == TextDirection.rtl) {
@@ -1791,7 +1832,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
   void _handleArrowLeft(bool withShift) {
     if (_suggestionNotifier.value != null) {
-      _suggestionNotifier.value = null;
+      _controller.dismissSuggestions();
     }
 
     if (widget.textDirection == TextDirection.rtl) {
@@ -1831,7 +1872,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
   void _handleHomeKey(bool withShift) {
     if (_suggestionNotifier.value != null) {
-      _suggestionNotifier.value = null;
+      _controller.dismissSuggestions();
     }
 
     _controller.pressHomeKey(isShiftPressed: withShift);
@@ -1839,7 +1880,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
 
   void _handleEndKey(bool withShift) {
     if (_suggestionNotifier.value != null) {
-      _suggestionNotifier.value = null;
+      _controller.dismissSuggestions();
     }
 
     _controller.pressEndKey(isShiftPressed: withShift);
@@ -2573,6 +2614,29 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                   onKeyEvent: (node, event) {
                                                     if (_controller
                                                         .isComposingActive) {
+                                                      // Navigation keys must
+                                                      // reach the IME so it can
+                                                      // drive its candidate
+                                                      // window, but a plain
+                                                      // `ignored` lets them
+                                                      // bubble into the
+                                                      // app-level shortcut
+                                                      // tables, which consume
+                                                      // arrows as scroll or
+                                                      // focus traversal.
+                                                      // Skipping the remaining
+                                                      // framework handlers while
+                                                      // reporting unhandled
+                                                      // keeps the app tables out
+                                                      // and still hands the key
+                                                      // to the input method.
+                                                      if (kImeCompositionPassThroughKeys
+                                                          .contains(
+                                                            event.logicalKey,
+                                                          )) {
+                                                        return KeyEventResult
+                                                            .skipRemainingHandlers;
+                                                      }
                                                       return KeyEventResult
                                                           .ignored;
                                                     }
@@ -3502,9 +3566,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                 .handled;
                                                           case LogicalKeyboardKey
                                                               .escape:
-                                                            _suggestionNotifier
-                                                                    .value =
-                                                                null;
+                                                            _controller
+                                                                .dismissSuggestions();
                                                             return KeyEventResult
                                                                 .handled;
                                                           default:
@@ -3878,9 +3941,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               false;
                                                           _aiNotifier.value =
                                                               null;
-                                                          _suggestionNotifier
-                                                                  .value =
-                                                              null;
+                                                          _controller
+                                                              .dismissSuggestions();
                                                           _hoverNotifier.value =
                                                               null;
                                                           _controller
@@ -4451,6 +4513,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 return SizedBox.shrink();
                               }
                               final completionScrlCtrl = ScrollController();
+                              // Horizontal clamping stays on the overlay rect,
+                              // so a narrow editor can still show a wide list.
+                              // The vertical room is measured separately, see
+                              // below.
                               final overlayBounds =
                                   CodeForgeRootOverlayGeometry.maybeOf(
                                     context,
@@ -4480,17 +4546,28 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                         .clamp(minimumLeft, maximumLeft)
                                         .toDouble();
                               final fontSize = widget.textStyle?.fontSize ?? 14;
+                              // The room above and below the caret is measured
+                              // against the editor viewport, never against the
+                              // overlay rect: the overlay reaches past the
+                              // editor, so measuring against it let the list
+                              // grow taller than the space on either side of
+                              // the caret. The list then had to be slid back
+                              // into the box, which put it over the caret's own
+                              // line -- it read as sitting beside the cursor and
+                              // hid the code around it.
                               final spaceBelow =
-                                  overlayBounds.bottom -
+                                  popupHeight -
                                   offset.dy -
                                   fontSize -
                                   popupBottomGap -
                                   10;
-                              final spaceAbove =
-                                  offset.dy - overlayBounds.top - 10;
+                              final spaceAbove = offset.dy - 10;
                               final shouldPositionAbove =
                                   estimatedHeight > spaceBelow &&
                                   spaceAbove >= spaceBelow;
+                              // Bounded by the room on the chosen side, so the
+                              // list always fits entirely above or entirely
+                              // below the caret line.
                               final availableHeight = max(
                                 0.0,
                                 min(
@@ -4924,8 +5001,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                             // whole overlay box, which is what
                                             // used to throw this popup off the
                                             // editor.
+                                            //
+                                            // It follows the list to the side
+                                            // the list opened on: docs left
+                                            // below the caret while the list
+                                            // flipped above it had no room left
+                                            // in the editor and collapsed.
+                                            final documentationAbove =
+                                                viewportWidth >= 700 &&
+                                                shouldPositionAbove;
                                             final documentationTop =
-                                                offset.dy + fontSize + 10;
+                                                documentationAbove
+                                                ? offset.dy - 10
+                                                : offset.dy + fontSize + 10;
                                             final documentationGapBelow =
                                                 viewportWidth < 700
                                                 ? (offset.dy <
@@ -4958,30 +5046,37 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                             suggestionWidth);
                                             return Positioned.fill(
                                               child: CustomSingleChildLayout(
-                                                delegate:
-                                                    _AnchoredPopupLayoutDelegate(
-                                                      anchorY: documentationTop,
-                                                      left: documentationLeft,
-                                                      positionAbove: false,
-                                                      gapBelow:
-                                                          documentationGapBelow
-                                                              .toDouble(),
-                                                      maxWidth:
-                                                          viewportWidth < 700
-                                                          ? viewportWidth * 0.63
-                                                          : 420,
-                                                      minWidth: 70,
-                                                      maxHeight: min(
-                                                        400.0,
-                                                        max(
-                                                          0.0,
-                                                          overlayBounds.bottom -
-                                                              documentationTop -
-                                                              documentationGapBelow -
-                                                              popupBottomGap,
-                                                        ),
-                                                      ),
+                                                delegate: _AnchoredPopupLayoutDelegate(
+                                                  anchorY: documentationTop,
+                                                  left: documentationLeft,
+                                                  positionAbove:
+                                                      documentationAbove,
+                                                  gapBelow:
+                                                      documentationGapBelow
+                                                          .toDouble(),
+                                                  gapAbove: 10,
+                                                  maxWidth: viewportWidth < 700
+                                                      ? viewportWidth * 0.63
+                                                      : 420,
+                                                  minWidth: 70,
+                                                  // Same rule as the list
+                                                  // beside it: the room is
+                                                  // the editor's, not the
+                                                  // overlay's.
+                                                  maxHeight: min(
+                                                    400.0,
+                                                    max(
+                                                      0.0,
+                                                      documentationAbove
+                                                          ? documentationTop -
+                                                                10
+                                                          : popupHeight -
+                                                                documentationTop -
+                                                                documentationGapBelow -
+                                                                popupBottomGap,
                                                     ),
+                                                  ),
+                                                ),
                                                 child: Card(
                                                   color: _hoverDetailsStyle
                                                       .backgroundColor,
@@ -7344,6 +7439,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
     if (controller.inlayHintsChanged) {
       controller.inlayHintsChanged = false;
+      _caretInfoCache.clear();
       markNeedsPaint();
       return;
     }
@@ -8530,7 +8626,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     }
 
     final colorBoxOffset = _getColorBoxOffsetForLine(lineIndex, clampedCol);
-    caretX += colorBoxOffset;
+    final inlayHintOffset = _getInlayHintOffsetForLine(lineIndex, clampedCol);
+    caretX += colorBoxOffset + inlayHintOffset;
 
     final ghostOffset = _getTotalVirtualOffset(lineIndex);
 
@@ -8646,7 +8743,8 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     }
 
     final colorBoxOffset = _getColorBoxOffsetForLine(lineIndex, clampedCol);
-    caretX += colorBoxOffset;
+    final inlayHintOffset = _getInlayHintOffsetForLine(lineIndex, clampedCol);
+    caretX += colorBoxOffset + inlayHintOffset;
 
     final ghostOffset = _getTotalVirtualOffset(lineIndex);
 
@@ -8673,6 +8771,24 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     for (final docColor in colors) {
       if (docColor.line == line && docColor.startColumn < column) {
         offset += totalColorWidth;
+      }
+    }
+    return offset;
+  }
+
+  /// Horizontal shift the inlay hints painted on [line] insert before
+  /// [column], in content pixels: [_drawInlayHints] repaints the source text
+  /// after each hint one hint-width to the right, so caret and hit-test math
+  /// done on the plain paragraph must add this back. [column] is a UTF-16
+  /// offset, matching `InlayHint.column`.
+  double _getInlayHintOffsetForLine(int line, int column) {
+    if (!controller.inlayHintsVisible || controller.inlayHints.isEmpty) {
+      return 0;
+    }
+    double offset = 0;
+    for (final hint in controller.inlayHints) {
+      if (hint.line == line && hint.column < column) {
+        offset += _inlayHintDisplayWidth(hint);
       }
     }
     return offset;
@@ -8759,6 +8875,38 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         }
       }
       localX -= totalAdjustment;
+    }
+
+    // The hint layer repaints the text after each hint one hint-width to the
+    // right, so undo that shift before asking the plain paragraph where the
+    // tap landed.
+    if (controller.inlayHintsVisible && controller.inlayHints.isNotEmpty) {
+      final lineHints =
+          controller.inlayHints
+              .where((hint) => hint.line == tappedLineIndex)
+              .toList()
+            ..sort((a, b) => a.column.compareTo(b.column));
+
+      double hintAdjustment = 0;
+      for (final hint in lineHints) {
+        final hintColumn = hint.column.clamp(0, lineText.length);
+        final hintPlainX =
+            para.getBoxesForRange(0, hintColumn).lastOrNull?.right ?? 0;
+        final hintStartX = hintPlainX + hintAdjustment;
+        final hintWidth = _inlayHintDisplayWidth(hint);
+
+        if (localX > hintStartX + hintWidth) {
+          hintAdjustment += hintWidth;
+        } else if (localX > hintStartX) {
+          // The tap landed on the hint itself: the caret goes to the hint's
+          // insertion column.
+          localX = hintStartX;
+          break;
+        } else {
+          break;
+        }
+      }
+      localX -= hintAdjustment;
     }
 
     final hasActiveFolds = _hasActiveFolds;
@@ -11545,12 +11693,21 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           lineText,
           lineSelEnd,
         );
+        // The hint layer repaints the text after each hint one hint-width to
+        // the right, so the highlight must follow the same shift to stay
+        // under the characters it covers.
+        final inlayOffsetStart = _getInlayHintOffsetForLine(
+          lineIndex,
+          utf16Start,
+        );
+        final inlayOffsetEnd = _getInlayHintOffsetForLine(lineIndex, utf16End);
         final boxes = para.getBoxesForRange(utf16Start, utf16End);
 
         for (int i = 0; i < boxes.length; i++) {
           final box = boxes[i];
-          final adjustedLeft = box.left + colorBoxOffsetStart;
-          final adjustedRight = box.right + colorBoxOffsetEnd;
+          final adjustedLeft =
+              box.left + colorBoxOffsetStart + inlayOffsetStart;
+          final adjustedRight = box.right + colorBoxOffsetEnd + inlayOffsetEnd;
 
           final screenX = offset.dx + textX + adjustedLeft;
           final screenY =
@@ -13016,6 +13173,19 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         Paint()..color = bgColor,
       );
 
+      // That erase wiped the highlight _drawSelection laid down past the
+      // first hint; put it back before the text and chips are repainted on
+      // top of it.
+      _paintSelectionPastFirstHint(
+        canvas,
+        line,
+        lineText,
+        para,
+        baseScreenX,
+        baseScreenY,
+        firstHint.column,
+      );
+
       double currentX = firstHintX;
       int lastColumn = firstHint.column;
 
@@ -13120,6 +13290,68 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         );
         canvas.restore();
       }
+    }
+  }
+
+  /// Repaints the current selection on [line] from [fromColumn] to the
+  /// selection's end, in the coordinates [_drawInlayHints] paints at:
+  /// source text past each hint sits one hint-width to the right of where
+  /// the plain paragraph puts it, so the highlight follows that shift.
+  void _paintSelectionPastFirstHint(
+    Canvas canvas,
+    int line,
+    String lineText,
+    ui.Paragraph para,
+    double baseScreenX,
+    double baseScreenY,
+    int fromColumn,
+  ) {
+    final selection = controller.selection;
+    if (selection.isCollapsed || !selection.isValid) return;
+
+    final startLine = controller.getLineAtOffset(selection.start);
+    final endLine = controller.getLineAtOffset(selection.end);
+    if (line < startLine || line > endLine) return;
+
+    final lineStartOffset = controller.getLineStartOffset(line);
+    final lineLength = lineText.length;
+    var lineSelStart = line == startLine
+        ? selection.start - lineStartOffset
+        : 0;
+    var lineSelEnd = line == endLine
+        ? selection.end - lineStartOffset
+        : lineLength;
+    lineSelStart = lineSelStart.clamp(0, lineLength);
+    lineSelEnd = lineSelEnd.clamp(0, lineLength);
+
+    if (lineSelEnd <= fromColumn) return;
+    if (lineSelStart < fromColumn) lineSelStart = fromColumn;
+
+    final utf16Start = CodeForgeController.scalarToUtf16Offset(
+      lineText,
+      lineSelStart,
+    );
+    final utf16End = CodeForgeController.scalarToUtf16Offset(
+      lineText,
+      lineSelEnd,
+    );
+    final inlayOffsetStart = _getInlayHintOffsetForLine(line, utf16Start);
+    final inlayOffsetEnd = _getInlayHintOffsetForLine(line, utf16End);
+
+    final paint = Paint()..color = selectionStyle.selectionColor;
+    for (final box in para.getBoxesForRange(utf16Start, utf16End)) {
+      final left = box.left + inlayOffsetStart;
+      final right = box.right + inlayOffsetEnd;
+      if (right <= left) continue;
+      canvas.drawRect(
+        Rect.fromLTWH(
+          baseScreenX + left,
+          baseScreenY,
+          right - left,
+          _lineHeight,
+        ),
+        paint,
+      );
     }
   }
 
@@ -14279,9 +14511,16 @@ class _AnchoredPopupLayoutDelegate extends SingleChildLayoutDelegate {
     positionAbove
         // Bottom edge sits `gapAbove` above the anchor line.
         ? max(0, anchorY - gapAbove - childSize.height)
-        // Top edge sits `gapBelow` below the anchor line. `size.height` is
-        // only used here to keep the popup from being pushed out of the box.
-        : min(max(0, size.height - childSize.height), anchorY + gapBelow),
+        // Top edge sits `gapBelow` below the anchor line.
+        //
+        // Deliberately not clamped against `size.height - childSize.height`.
+        // That clamp slid an over-tall popup up until its bottom met the box,
+        // which put a completion list on top of the very caret line it was
+        // anchored to. Callers bound the child with `maxHeight` derived from
+        // the room on the chosen side, so the popup fits without any slide;
+        // if one ever does not fit, overflowing the box is the lesser evil --
+        // it never hides the line being edited.
+        : anchorY + gapBelow,
   );
 
   @override
