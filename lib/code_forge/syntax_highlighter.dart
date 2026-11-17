@@ -907,12 +907,33 @@ class SyntaxHighlighter {
   ) {
     final baseStyle = style ?? baseTextStyle ?? editorTheme['root'];
 
+    // Theme (and plugin) token styles may carry any TextStyle field, so every
+    // supported field is forwarded; fontSize/fontFamily fall back to the
+    // editor's own settings only when the token style does not set them.
+    return _buildUiTextStyle(baseStyle, fontSize, fontFamily);
+  }
+
+  ui.TextStyle _buildUiTextStyle(
+    TextStyle? baseStyle,
+    double fontSize,
+    String? fontFamily,
+  ) {
+    final backgroundColor = baseStyle?.backgroundColor;
     return ui.TextStyle(
       color: baseStyle?.color ?? editorTheme['root']?.color ?? Colors.black,
-      fontSize: fontSize,
-      fontFamily: fontFamily,
+      background: backgroundColor == null
+          ? null
+          : (ui.Paint()..color = backgroundColor),
+      fontSize: baseStyle?.fontSize ?? fontSize,
+      fontFamily: baseStyle?.fontFamily ?? fontFamily,
       fontWeight: baseStyle?.fontWeight,
       fontStyle: baseStyle?.fontStyle,
+      letterSpacing: baseStyle?.letterSpacing,
+      wordSpacing: baseStyle?.wordSpacing,
+      height: baseStyle?.height,
+      decoration: baseStyle?.decoration,
+      decorationColor: baseStyle?.decorationColor,
+      decorationStyle: baseStyle?.decorationStyle,
     );
   }
 
@@ -924,13 +945,10 @@ class SyntaxHighlighter {
     final themeStyle = className != null ? editorTheme[className] : null;
     final baseStyle = themeStyle ?? baseTextStyle ?? editorTheme['root'];
 
-    return ui.TextStyle(
-      color: baseStyle?.color ?? editorTheme['root']?.color ?? Colors.black,
-      fontSize: fontSize,
-      fontFamily: fontFamily,
-      fontWeight: baseStyle?.fontWeight,
-      fontStyle: baseStyle?.fontStyle,
-    );
+    // Same field forwarding as _textStyleToUiStyle: a token style may carry
+    // any TextStyle field and only falls back to the editor's own settings
+    // for the fields it leaves unset.
+    return _buildUiTextStyle(baseStyle, fontSize, fontFamily);
   }
 
   Future<void> preHighlightLines(

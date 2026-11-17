@@ -923,13 +923,19 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   late final AnimationController _caretBlinkController;
   late final AnimationController _caretSmoothController;
   late final AnimationController _lineHighlightController;
-  late final Map<String, TextStyle> _editorTheme;
-  late final Mode _language;
-  late final CodeSelectionStyle _selectionStyle;
-  late final GutterStyle _gutterStyle;
-  late final SuggestionStyle _suggestionStyle;
-  late final HoverDetailsStyle _hoverDetailsStyle;
-  late final BorderRadius _overlayBorderRadius;
+
+  // Theme-dependent state. These are recomputed from the widget in
+  // [didUpdateWidget] when the caller hands in new theme inputs, so a theme
+  // switch updates the editor in place instead of requiring the host to
+  // recreate the element (which would drop the scroll position and fold
+  // state).
+  late Map<String, TextStyle> _editorTheme;
+  late Mode _language;
+  late CodeSelectionStyle _selectionStyle;
+  late GutterStyle _gutterStyle;
+  late SuggestionStyle _suggestionStyle;
+  late HoverDetailsStyle _hoverDetailsStyle;
+  late BorderRadius _overlayBorderRadius;
 
   /// Radius for a full-bleed row inside a popup list.
 
@@ -940,7 +946,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
   /// corner, and reusing the full outer radius turned a 24 pixel row into a
   /// stadium notched at its middle corners.
   static const BorderRadius _overlayRowBorderRadius = BorderRadius.zero;
-  late final ScrollbarDecoration _scrollbarDecoration;
+  late ScrollbarDecoration _scrollbarDecoration;
   late final ValueNotifier<List<dynamic>?> _suggestionNotifier;
   late final ValueNotifier<(Offset, Map<String, int>)?> _hoverNotifier;
   late final ValueNotifier<Map<String, dynamic>?> _hoverContentNotifier;
@@ -1029,21 +1035,7 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         widget.horizontalScrollController ?? ScrollController();
     _vscrollController = widget.verticalScrollController ?? ScrollController();
     _editorTheme = widget.editorTheme ?? lightfairTheme;
-    // One outer radius drives every floating overlay this editor shows, and
-    // anything nested inside one of them is derived from it. Resolution order:
-    // an explicit [CodeForge.overlayBorderRadius] wins, then the radius of a
-    // caller-supplied style, then the package default. Deriving the code block
-    // from the same value is what keeps a nested corner from ever growing
-    // larger than the popup that contains it. Full-bleed popup rows take their
-    // corner from the card's clip instead; see [_overlayRowBorderRadius].
-    final double resolvedOuter =
-        widget.overlayBorderRadius?.topLeft.x ??
-        _radiusOf(
-          (widget.hoverDetailsStyle ?? widget.suggestionStyle)?.shape ??
-              const RoundedRectangleBorder(),
-        ) ??
-        kDefaultOverlayOuterRadius;
-    _overlayBorderRadius = BorderRadius.circular(resolvedOuter);
+    _resolveThemeDerivedStyles();
     _language = widget.language ?? Mode();
     _suggestionNotifier = _controller.suggestionsNotifier;
     _prevSnippetTextLength = _controller.text.length;
@@ -1093,118 +1085,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
     if (widget.useSpaceAsTab != _controller.useSpaceAsTab) {
       _controller.useSpaceAsTab = widget.useSpaceAsTab;
     }
-
-    _scrollbarDecoration =
-        widget.scrollbarDecoration ??
-        ScrollbarDecoration(
-          thumbColor: _editorTheme['root']?.color?.withAlpha(150),
-          thickness: 8,
-        );
-
-    _gutterStyle =
-        widget.gutterStyle ??
-        GutterStyle(
-          lineNumberStyle: null,
-          foldedIconColor: _editorTheme['root']?.color,
-          unfoldedIconColor: _editorTheme['root']?.color,
-          backgroundColor: _editorTheme['root']?.backgroundColor,
-        );
-
-    _suggestionStyle =
-        widget.suggestionStyle ??
-        SuggestionStyle(
-          elevation: 8,
-          textStyle: (() {
-            TextStyle style = widget.textStyle ?? TextStyle();
-            if (style.color == null) {
-              style = style.copyWith(color: _editorTheme['root']!.color);
-            }
-            return style;
-          })(),
-          backgroundColor: (() {
-            final lightnessDelta = 0.03;
-            final base = _editorTheme['root']!.backgroundColor!;
-            final hsl = HSLColor.fromColor(base);
-            final newLightness = (hsl.lightness + lightnessDelta).clamp(
-              0.0,
-              1.0,
-            );
-            return hsl.withLightness(newLightness).toColor();
-          })(),
-          focusColor: ui.Color.fromARGB(108, 2, 66, 129),
-          hoverColor: Colors.grey.withAlpha(15),
-          splashColor: Colors.blueAccent.withAlpha(50),
-          selectedBackgroundColor: Color(0xFF094771),
-          borderColor:
-              _editorTheme['root']!.color?.withAlpha(50) ?? Colors.grey[400],
-          borderWidth: 1.0,
-          itemHeight: 24.0,
-          iconSize: 16.0,
-          methodIconColor: Color(0xFFDCDFE4),
-          propertyIconColor: Color(0xFF98C379),
-          classIconColor: Color(0xFFE06C75),
-          variableIconColor: Color(0xFF61AFEF),
-          keywordIconColor: Color(0xFFC678DD),
-          labelTextStyle: TextStyle(
-            fontSize: widget.textStyle?.fontSize ?? 14,
-            // Same family, size and weight as the editor text: a heavier
-            // weight reads as a larger font next to the code it matches.
-            color: _editorTheme['root']!.color,
-            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
-          ),
-          detailTextStyle: TextStyle(
-            fontSize: (widget.textStyle?.fontSize ?? 14) * 0.85,
-            color: _editorTheme['root']!.color?.withAlpha(150),
-            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
-          ),
-          typeTextStyle: TextStyle(
-            fontSize: (widget.textStyle?.fontSize ?? 14) * 0.9,
-            fontStyle: FontStyle.italic,
-            color: _editorTheme['root']!.color?.withAlpha(180),
-            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: _overlayBorderRadius,
-            side: BorderSide(
-              color:
-                  _editorTheme['root']!.color?.withAlpha(50) ??
-                  Colors.grey[400]!,
-              width: 1.0,
-            ),
-          ),
-        );
-
-    _hoverDetailsStyle =
-        widget.hoverDetailsStyle ??
-        HoverDetailsStyle(
-          shape: RoundedRectangleBorder(
-            borderRadius: _overlayBorderRadius,
-            side: BorderSide(
-              color: _editorTheme['root']!.color ?? Colors.grey[400]!,
-              width: 0.2,
-            ),
-          ),
-          backgroundColor: (() {
-            final lightnessDelta = 0.03;
-            final base = _editorTheme['root']!.backgroundColor!;
-            final hsl = HSLColor.fromColor(base);
-            final newLightness = (hsl.lightness + lightnessDelta).clamp(
-              0.0,
-              1.0,
-            );
-            return hsl.withLightness(newLightness).toColor();
-          })(),
-          focusColor: Colors.blueAccent.withAlpha(50),
-          hoverColor: Colors.grey.withAlpha(15),
-          splashColor: Colors.blueAccent.withAlpha(50),
-          textStyle: (() {
-            TextStyle style = widget.textStyle ?? _editorTheme['root']!;
-            if (style.color == null) {
-              style = style.copyWith(color: _editorTheme['root']!.color);
-            }
-            return style;
-          })(),
-        );
 
     _caretBlinkController = AnimationController(
       vsync: this,
@@ -1731,6 +1611,191 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       ..repeat(reverse: true);
   }
 
+  /// Recomputes every style derived from the theme-dependent widget inputs:
+  /// the floating-overlay radius, the scrollbar, gutter, suggestion and hover
+  /// styles.
+  ///
+  /// Called from [initState] and again from [didUpdateWidget] when the host
+  /// hands in a new theme, so a theme switch repaints the editor in place
+  /// instead of requiring the host to recreate the element (which would drop
+  /// the scroll position and fold state).
+  void _resolveThemeDerivedStyles() {
+    // One outer radius drives every floating overlay this editor shows, and
+    // anything nested inside one of them is derived from it. Resolution order:
+    // an explicit [CodeForge.overlayBorderRadius] wins, then the radius of a
+    // caller-supplied style, then the package default. Deriving the code block
+    // from the same value is what keeps a nested corner from ever growing
+    // larger than the popup that contains it. Full-bleed popup rows take their
+    // corner from the card's clip instead; see [_overlayRowBorderRadius].
+    final double resolvedOuter =
+        widget.overlayBorderRadius?.topLeft.x ??
+        _radiusOf(
+          (widget.hoverDetailsStyle ?? widget.suggestionStyle)?.shape ??
+              const RoundedRectangleBorder(),
+        ) ??
+        kDefaultOverlayOuterRadius;
+    _overlayBorderRadius = BorderRadius.circular(resolvedOuter);
+
+    _scrollbarDecoration =
+        widget.scrollbarDecoration ??
+        ScrollbarDecoration(
+          thumbColor: _editorTheme['root']?.color?.withAlpha(150),
+          thickness: 8,
+        );
+
+    _gutterStyle =
+        widget.gutterStyle ??
+        GutterStyle(
+          lineNumberStyle: null,
+          foldedIconColor: _editorTheme['root']?.color,
+          unfoldedIconColor: _editorTheme['root']?.color,
+          backgroundColor: _editorTheme['root']?.backgroundColor,
+        );
+
+    _suggestionStyle =
+        widget.suggestionStyle ??
+        SuggestionStyle(
+          elevation: 8,
+          textStyle: (() {
+            TextStyle style = widget.textStyle ?? TextStyle();
+            if (style.color == null) {
+              style = style.copyWith(color: _editorTheme['root']!.color);
+            }
+            return style;
+          })(),
+          backgroundColor: (() {
+            final lightnessDelta = 0.03;
+            final base = _editorTheme['root']!.backgroundColor!;
+            final hsl = HSLColor.fromColor(base);
+            final newLightness = (hsl.lightness + lightnessDelta).clamp(
+              0.0,
+              1.0,
+            );
+            return hsl.withLightness(newLightness).toColor();
+          })(),
+          focusColor: ui.Color.fromARGB(108, 2, 66, 129),
+          hoverColor: Colors.grey.withAlpha(15),
+          splashColor: Colors.blueAccent.withAlpha(50),
+          selectedBackgroundColor: Color(0xFF094771),
+          borderColor:
+              _editorTheme['root']!.color?.withAlpha(50) ?? Colors.grey[400],
+          borderWidth: 1.0,
+          itemHeight: 24.0,
+          iconSize: 16.0,
+          methodIconColor: Color(0xFFDCDFE4),
+          propertyIconColor: Color(0xFF98C379),
+          classIconColor: Color(0xFFE06C75),
+          variableIconColor: Color(0xFF61AFEF),
+          keywordIconColor: Color(0xFFC678DD),
+          labelTextStyle: TextStyle(
+            fontSize: widget.textStyle?.fontSize ?? 14,
+            // Same family, size and weight as the editor text: a heavier
+            // weight reads as a larger font next to the code it matches.
+            color: _editorTheme['root']!.color,
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
+          ),
+          detailTextStyle: TextStyle(
+            fontSize: (widget.textStyle?.fontSize ?? 14) * 0.85,
+            color: _editorTheme['root']!.color?.withAlpha(150),
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
+          ),
+          typeTextStyle: TextStyle(
+            fontSize: (widget.textStyle?.fontSize ?? 14) * 0.9,
+            fontStyle: FontStyle.italic,
+            color: _editorTheme['root']!.color?.withAlpha(180),
+            fontFamily: widget.textStyle?.fontFamily ?? 'monospace',
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: _overlayBorderRadius,
+            side: BorderSide(
+              color:
+                  _editorTheme['root']!.color?.withAlpha(50) ??
+                  Colors.grey[400]!,
+              width: 1.0,
+            ),
+          ),
+        );
+
+    _hoverDetailsStyle =
+        widget.hoverDetailsStyle ??
+        HoverDetailsStyle(
+          shape: RoundedRectangleBorder(
+            borderRadius: _overlayBorderRadius,
+            side: BorderSide(
+              color: _editorTheme['root']!.color ?? Colors.grey[400]!,
+              width: 0.2,
+            ),
+          ),
+          backgroundColor: (() {
+            final lightnessDelta = 0.03;
+            final base = _editorTheme['root']!.backgroundColor!;
+            final hsl = HSLColor.fromColor(base);
+            final newLightness = (hsl.lightness + lightnessDelta).clamp(
+              0.0,
+              1.0,
+            );
+            return hsl.withLightness(newLightness).toColor();
+          })(),
+          focusColor: Colors.blueAccent.withAlpha(50),
+          hoverColor: Colors.grey.withAlpha(15),
+          splashColor: Colors.blueAccent.withAlpha(50),
+          textStyle: (() {
+            TextStyle style = widget.textStyle ?? _editorTheme['root']!;
+            if (style.color == null) {
+              style = style.copyWith(color: _editorTheme['root']!.color);
+            }
+            return style;
+          })(),
+        );
+  }
+
+  /// Applies theme-related widget updates in place.
+  ///
+  /// The renderer has its own update path for these (`_CodeField
+  /// .updateRenderObject` forwards the new values), so updating the state
+  /// fields here is all a theme switch needs — the scroll position, undo
+  /// stack, find state and fold ranges survive because the element is never
+  /// recreated.
+  void _applyThemeDependentWidgetChanges(CodeForge oldWidget) {
+    // `mapEquals` rather than identity: hosts that resolve the theme map per
+    // build hand in an equal-but-fresh map when nothing actually changed.
+    final themeChanged = !mapEquals(
+      widget.editorTheme ?? lightfairTheme,
+      oldWidget.editorTheme ?? lightfairTheme,
+    );
+    final selectionChanged =
+        !identical(widget.selectionStyle, oldWidget.selectionStyle);
+    final hoverChanged =
+        !identical(widget.hoverDetailsStyle, oldWidget.hoverDetailsStyle);
+    final suggestionChanged =
+        !identical(widget.suggestionStyle, oldWidget.suggestionStyle);
+    final scrollbarChanged =
+        !identical(widget.scrollbarDecoration, oldWidget.scrollbarDecoration);
+    final languageChanged = !identical(widget.language, oldWidget.language);
+
+    if (!themeChanged &&
+        !selectionChanged &&
+        !hoverChanged &&
+        !suggestionChanged &&
+        !scrollbarChanged &&
+        !languageChanged) {
+      return;
+    }
+
+    setState(() {
+      if (themeChanged) {
+        _editorTheme = widget.editorTheme ?? lightfairTheme;
+      }
+      if (selectionChanged) {
+        _selectionStyle = widget.selectionStyle ?? CodeSelectionStyle();
+      }
+      if (languageChanged) {
+        _language = widget.language ?? Mode();
+      }
+      _resolveThemeDerivedStyles();
+    });
+  }
+
   @override
   void didUpdateWidget(covariant CodeForge oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1746,6 +1811,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
         }
       });
     }
+
+    _applyThemeDependentWidgetChanges(oldWidget);
 
     final oldTabSize = oldWidget.tabSize ?? (oldWidget.useSpaceAsTab ? 2 : 1);
     final newTabSize = widget.tabSize ?? (widget.useSpaceAsTab ? 2 : 1);
@@ -6148,6 +6215,7 @@ class _CodeField extends LeafRenderObjectWidget {
       ..selectionStyle = selectionStyle
       ..ghostTextStyle = ghostTextStyle
       ..smoothCursor = smoothCursor
+      ..matchHighlightStyle = matchHighlightStyle
       ..textDirection = textDirection
       ..diagnosticColors = diagnosticColors;
   }
@@ -6219,8 +6287,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   >
   _caretInfoCache = {};
   final Map<int, int> _lineIndentCache = {};
-  final MatchHighlightStyle? _matchHighlightStyle;
-  final MatchHighlightStyle? matchHighlightStyle;
+  MatchHighlightStyle? _matchHighlightStyle;
   DiagnosticColorsStyle? _diagnosticColors;
   final _dtap = DoubleTapGestureRecognizer();
   final _onetap = TapGestureRecognizer();
@@ -6644,7 +6711,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     this.languageId,
     this.lspConfig,
     this.filePath,
-    this.matchHighlightStyle,
+    MatchHighlightStyle? matchHighlightStyle,
     DiagnosticColorsStyle? diagnosticColors,
     this.onHoverSetByTap,
     this.onModifierTap,
@@ -6950,6 +7017,17 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     markNeedsPaint();
   }
 
+  MatchHighlightStyle? get matchHighlightStyle => _matchHighlightStyle;
+
+  /// Find-match highlight colors, updatable in place so a theme switch
+  /// repaints the highlights without recreating the render object (which
+  /// would drop the scroll position).
+  set matchHighlightStyle(MatchHighlightStyle? style) {
+    if (identical(style, _matchHighlightStyle)) return;
+    _matchHighlightStyle = style;
+    markNeedsPaint();
+  }
+
   set editorTheme(Map<String, TextStyle> theme) {
     if (identical(theme, _editorTheme)) return;
     _editorTheme = theme;
@@ -6962,6 +7040,15 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     _paragraphCache.clear();
     _bracketCache.clear();
     _indentGuideCache.clear();
+    // The caret and bracket colors follow the theme when no explicit cursor
+    // color was supplied, so an in-place theme switch repaints them too.
+    if (_selectionStyle.cursorColor == null) {
+      final rootColor = theme['root']?.color;
+      if (rootColor != null) {
+        _caretPainter.color = rootColor;
+        _bracketHighlightPainter.color = rootColor;
+      }
+    }
     markNeedsLayout();
     markNeedsPaint();
   }
