@@ -175,158 +175,7 @@ class CodeForgeController implements DeltaTextInputClient {
 
   CodeForgeController({this.lspConfig}) {
     if (lspConfig != null) {
-      (() async {
-        try {
-          if (lspConfig is LspSocketConfig) {
-            await (lspConfig! as LspSocketConfig).connect();
-          }
-          if (!lspConfig!.isInitialized) {
-            await lspConfig!.initialize();
-          }
-          if (openedFile != null) {
-            await _openDocumentInLsp();
-          }
-        } catch (e) {
-          debugPrint('Error initializing LSP: $e');
-        } finally {
-          _listeners.add(_highlightListener);
-        }
-      })();
-
-      _lspResponsesSubscription = lspConfig!.responses.listen((data) async {
-        try {
-          if (data['method'] == 'workspace/applyEdit') {
-            final Map<String, dynamic>? params = data['params'];
-            if (params != null && params.isNotEmpty) {
-              if (params.containsKey('edit')) {
-                await applyWorkspaceEdit(params);
-              }
-            }
-          }
-
-          if (data['method'] == 'workspace/configuration') {
-            final id = data['id'];
-            final params = data['params'] as Map?;
-            final items = params?['items'];
-            final configurationItems = items is List ? items : const [null];
-            await lspConfig!.sendResponse(
-              id,
-              configurationItems
-                  .map(
-                    (item) => LspConfig.workspaceConfigurationForSection(
-                      lspConfig!.workspaceConfiguration,
-                      item is Map ? item['section'] : null,
-                    ),
-                  )
-                  .toList(),
-            );
-          }
-
-          if (data['method'] == 'textDocument/publishDiagnostics') {
-            final params = data['params'] as Map?;
-            final filePath = openedFile;
-            if (filePath == null ||
-                params?['uri'] != Uri.file(filePath).toString()) {
-              return;
-            }
-            final requestId = ++_codeActionRequestId;
-            final List<dynamic> rawDiagnostics = params?['diagnostics'] ?? [];
-            if (rawDiagnostics.isNotEmpty) {
-              final List<LspErrors> errors = [];
-              for (final item in rawDiagnostics) {
-                if (item is! Map<String, dynamic>) continue;
-                int severity = item['severity'] ?? 0;
-                if (severity == 1 && lspConfig!.disableError) {
-                  severity = 0;
-                }
-                if (severity == 2 && lspConfig!.disableWarning) {
-                  severity = 0;
-                }
-                if (severity > 0) {
-                  errors.add(
-                    LspErrors(
-                      severity: severity,
-                      range: item['range'],
-                      message: item['message'] ?? '',
-                    ),
-                  );
-                }
-              }
-              if (!_isDisposed) _setDiagnostics(errors);
-
-              _codeActionTimer?.cancel();
-              _codeActionTimer = Timer(
-                const Duration(milliseconds: 250),
-                () async {
-                  if (_isDisposed || requestId != _codeActionRequestId) return;
-                  if (errors.isEmpty) {
-                    codeActionsNotifier.value = null;
-                    return;
-                  }
-                  try {
-                    final config = lspConfig;
-                    if (config == null || openedFile != filePath) return;
-                    final actions = await _fetchCodeActionsForDiagnostics(
-                      config: config,
-                      filePath: filePath,
-                      rawDiagnostics: rawDiagnostics
-                          .whereType<Map<String, dynamic>>()
-                          .toList(),
-                    );
-                    if (!_isDisposed &&
-                        requestId == _codeActionRequestId &&
-                        openedFile == filePath) {
-                      codeActionsNotifier.value = actions;
-                    }
-                  } catch (e) {
-                    debugPrint('Error fetching code actions: $e');
-                  }
-                },
-              );
-            } else {
-              if (!_isDisposed && requestId == _codeActionRequestId) {
-                _setDiagnostics([]);
-                codeActionsNotifier.value = null;
-              }
-            }
-          }
-
-          if (data['method'] == r'$ccls/publishSemanticHighlight') {
-            final params = data['params'] as Map<String, dynamic>?;
-            if (params != null) {
-              final uri = params['uri'] as String?;
-              final symbols = params['symbols'] as List<dynamic>?;
-
-              if (uri != null &&
-                  openedFile != null &&
-                  uri.endsWith(openedFile!.split('/').last) &&
-                  symbols != null) {
-                _usesCclsSemanticHighlight = true;
-                final tokens = _convertCclsSymbolsToTokens(symbols);
-
-                if (tokens.isEmpty &&
-                    !_cclsForcedRefreshAttempted &&
-                    lspConfig != null &&
-                    openedFile != null) {
-                  _cclsForcedRefreshAttempted = true;
-                  unawaited(() async {
-                    try {
-                      await lspConfig!.updateDocument(openedFile!, text);
-                      await lspConfig!.saveDocument(openedFile!, text);
-                    } catch (_) {}
-                  }());
-                }
-
-                if (!_isDisposed) {
-                  semanticTokens.value = (tokens, _semanticTokensVersion++);
-                }
-              }
-            }
-          }
-        } catch (e, st) {
-          debugPrint('Error handling LSP response: $e\n$st');
-        }
-      });
+      unawaited(_attachLsp(lspConfig!));
     } else {
       _listeners.add(() async {
         if (!enableLocalSuggestions) return;
@@ -388,6 +237,203 @@ class CodeForgeController implements DeltaTextInputClient {
           }
         });
       });
+    }
+  }
+
+  /// Wires up a language server for this controller: subscribes to server
+  /// messages before the handshake (servers push notifications as soon as
+  /// the transport is up), connects, initializes and opens the current
+  /// document. Runs from the constructor and again after a server crash,
+  /// through [reattachLsp].
+  Future<void> _attachLsp(LspConfig config) async {
+    _lspResponsesSubscription = config.responses.listen(
+      (data) => unawaited(_handleLspServerMessage(data)),
+    );
+    try {
+      if (config is LspSocketConfig) {
+        await config.connect();
+      }
+      if (!config.isInitialized) {
+        await config.initialize();
+      }
+      if (openedFile != null) {
+        await _openDocumentInLsp();
+      }
+    } catch (e) {
+      debugPrint('Error initializing LSP: $e');
+    } finally {
+      // Reattach guards with `contains`: a crash restart must not stack a
+      // second highlight listener on top of the constructor's.
+      if (!_listeners.contains(_highlightListener)) {
+        _listeners.add(_highlightListener);
+      }
+    }
+  }
+
+  /// Swaps in a replacement language server after the previous one died:
+  /// drops the old subscription and the stale on-screen state, then re-runs
+  /// the full handshake and document-open flow. The controller instance
+  /// stays, so editor widgets holding it need no change.
+  Future<void> reattachLsp(LspConfig newConfig) async {
+    if (_isDisposed) return;
+    await _lspResponsesSubscription?.cancel();
+    _lspResponsesSubscription = null;
+    _lspReady = false;
+    if (!_isDisposed) _setDiagnostics([]);
+    codeActionsNotifier.value = null;
+    _lspFoldRanges = null;
+    _documentColors = [];
+    _documentHighlights = [];
+    lspConfig = newConfig;
+    await _attachLsp(newConfig);
+  }
+
+  /// Takes the language server away from this controller without disposing
+  /// it: the editor stays fully editable while offline. Used when the launch
+  /// settings moved and no usable server exists for this tab any more.
+  void detachLsp() {
+    if (_isDisposed) return;
+    unawaited(_lspResponsesSubscription?.cancel());
+    _lspResponsesSubscription = null;
+    _lspReady = false;
+    lspConfig = null;
+    _setDiagnostics([]);
+    codeActionsNotifier.value = null;
+    _lspFoldRanges = null;
+    _documentColors = [];
+    _documentHighlights = [];
+  }
+
+  /// Handles one message from the attached language server.
+  Future<void> _handleLspServerMessage(Map<String, dynamic> data) async {
+    try {
+      if (data['method'] == 'workspace/applyEdit') {
+        final Map<String, dynamic>? params = data['params'];
+        if (params != null && params.isNotEmpty) {
+          if (params.containsKey('edit')) {
+            await applyWorkspaceEdit(params);
+          }
+        }
+      }
+
+      if (data['method'] == 'workspace/configuration') {
+        final id = data['id'];
+        final params = data['params'] as Map?;
+        final items = params?['items'];
+        final configurationItems = items is List ? items : const [null];
+        await lspConfig!.sendResponse(
+          id,
+          configurationItems
+              .map(
+                (item) => LspConfig.workspaceConfigurationForSection(
+                  lspConfig!.workspaceConfiguration,
+                  item is Map ? item['section'] : null,
+                ),
+              )
+              .toList(),
+        );
+      }
+
+      if (data['method'] == 'textDocument/publishDiagnostics') {
+        final params = data['params'] as Map?;
+        final filePath = openedFile;
+        if (filePath == null ||
+            params?['uri'] != Uri.file(filePath).toString()) {
+          return;
+        }
+        final requestId = ++_codeActionRequestId;
+        final List<dynamic> rawDiagnostics = params?['diagnostics'] ?? [];
+        if (rawDiagnostics.isNotEmpty) {
+          final List<LspErrors> errors = [];
+          for (final item in rawDiagnostics) {
+            if (item is! Map<String, dynamic>) continue;
+            int severity = item['severity'] ?? 0;
+            if (severity == 1 && lspConfig!.disableError) {
+              severity = 0;
+            }
+            if (severity == 2 && lspConfig!.disableWarning) {
+              severity = 0;
+            }
+            if (severity > 0) {
+              errors.add(
+                LspErrors(
+                  severity: severity,
+                  range: item['range'],
+                  message: item['message'] ?? '',
+                ),
+              );
+            }
+          }
+          if (!_isDisposed) _setDiagnostics(errors);
+
+          _codeActionTimer?.cancel();
+          _codeActionTimer = Timer(const Duration(milliseconds: 250), () async {
+            if (_isDisposed || requestId != _codeActionRequestId) return;
+            if (errors.isEmpty) {
+              codeActionsNotifier.value = null;
+              return;
+            }
+            try {
+              final config = lspConfig;
+              if (config == null || openedFile != filePath) return;
+              final actions = await _fetchCodeActionsForDiagnostics(
+                config: config,
+                filePath: filePath,
+                rawDiagnostics: rawDiagnostics
+                    .whereType<Map<String, dynamic>>()
+                    .toList(),
+              );
+              if (!_isDisposed &&
+                  requestId == _codeActionRequestId &&
+                  openedFile == filePath) {
+                codeActionsNotifier.value = actions;
+              }
+            } catch (e) {
+              debugPrint('Error fetching code actions: $e');
+            }
+          });
+        } else {
+          if (!_isDisposed && requestId == _codeActionRequestId) {
+            _setDiagnostics([]);
+            codeActionsNotifier.value = null;
+          }
+        }
+      }
+
+      if (data['method'] == r'$ccls/publishSemanticHighlight') {
+        final params = data['params'] as Map<String, dynamic>?;
+        if (params != null) {
+          final uri = params['uri'] as String?;
+          final symbols = params['symbols'] as List<dynamic>?;
+
+          if (uri != null &&
+              openedFile != null &&
+              uri.endsWith(openedFile!.split('/').last) &&
+              symbols != null) {
+            _usesCclsSemanticHighlight = true;
+            final tokens = _convertCclsSymbolsToTokens(symbols);
+
+            if (tokens.isEmpty &&
+                !_cclsForcedRefreshAttempted &&
+                lspConfig != null &&
+                openedFile != null) {
+              _cclsForcedRefreshAttempted = true;
+              unawaited(() async {
+                try {
+                  await lspConfig!.updateDocument(openedFile!, text);
+                  await lspConfig!.saveDocument(openedFile!, text);
+                } catch (_) {}
+              }());
+            }
+
+            if (!_isDisposed) {
+              semanticTokens.value = (tokens, _semanticTokensVersion++);
+            }
+          }
+        }
+      }
+    } catch (e, st) {
+      debugPrint('Error handling LSP response: $e\n$st');
     }
   }
 

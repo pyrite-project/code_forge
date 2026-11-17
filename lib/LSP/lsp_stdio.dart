@@ -83,6 +83,10 @@ class LspStdioConfig extends LspConfig {
   /// Exit code of the server process, or null while it is running.
   int? _exitCode;
 
+  /// Set by [dispose]; only an exit that happens without it counts as a
+  /// crash and triggers [onUnexpectedExit].
+  bool _disposedByClient = false;
+
   LspStdioConfig._({
     required this.executable,
     required super.workspacePath,
@@ -192,7 +196,9 @@ class LspStdioConfig extends LspConfig {
       onDone: () => _failPendingRequests(StateError('LSP stdio closed')),
     );
     _process.stderr.listen((data) {
-      debugPrint(utf8.decode(data, allowMalformed: true));
+      // Collected but not echoed live: a crashing server (zuban's panic dump,
+      // for example) prints dozens of lines per crash, and the reason reaches
+      // the caller through [_serverExitMessage] anyway.
       _stderrTail.addAll(data);
       if (_stderrTail.length > _stderrTailLimit) {
         _stderrTail.removeRange(0, _stderrTail.length - _stderrTailLimit);
@@ -204,6 +210,9 @@ class LspStdioConfig extends LspConfig {
         // Wake in-flight requests with the real reason instead of leaving them
         // to time out against a process that is already gone.
         _failPendingRequests(StateError(_serverExitMessage()));
+        if (!_disposedByClient) {
+          onUnexpectedExit?.call();
+        }
       }),
     );
   }
@@ -211,7 +220,28 @@ class LspStdioConfig extends LspConfig {
   String _serverExitMessage() {
     final tail = utf8.decode(_stderrTail, allowMalformed: true).trim();
     return 'LSP server process exited (code ${_exitCode ?? 'unknown'})'
-        '${tail.isEmpty ? '' : ': $tail'}';
+        '${tail.isEmpty ? '' : ': ${_exitReasonFromTail(tail)}'}';
+  }
+
+  /// Condenses the stderr tail to the actual exit reason.
+  ///
+  /// A panicking server dumps its whole backtrace into stderr (zuban prints
+  /// fifty-odd `<unknown>` frames per crash), and every failed request would
+  /// otherwise repeat all of it. What identifies the crash is the first
+  /// `panicked at` line plus the message on the next line; anything else is
+  /// noise, so at most two lines — or a short prefix when the tail has no
+  /// recognizable shape — reach the caller.
+  String _exitReasonFromTail(String tail) {
+    final lines = const LineSplitter().convert(tail);
+    final panicIndex = lines.indexWhere((line) => line.contains('panicked at'));
+    if (panicIndex != -1) {
+      final reason = [
+        lines[panicIndex],
+        if (panicIndex + 1 < lines.length) lines[panicIndex + 1],
+      ].join(' | ');
+      return reason.length > 300 ? reason.substring(0, 300) : reason;
+    }
+    return tail.length > 200 ? tail.substring(0, 200) : tail;
   }
 
   /// Replaces a bare send failure with the server's exit reason when the
@@ -347,6 +377,7 @@ class LspStdioConfig extends LspConfig {
 
   @override
   void dispose() {
+    _disposedByClient = true;
     _failPendingRequests(StateError('LSP stdio disposed'));
     _process.kill();
     _responseController.close();

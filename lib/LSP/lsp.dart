@@ -51,6 +51,13 @@ sealed class LspConfig {
   List<String>? _serverTokenTypes, _serverTokenModifiers;
   bool _serverSupportsSemanticTokensRange = false;
   bool _serverSupportsSemanticTokensFull = false;
+
+  /// Options the server advertised in its `initialize` result, keyed by the
+  /// capability name from the LSP spec. A request must not be sent when its
+  /// capability is missing: servers answer with `MethodNotFound` (pylsp has no
+  /// `textDocument/documentColor`, for example), which surfaces as an error
+  /// for every edit instead of a graceful "feature unavailable".
+  Map<String, dynamic> _serverCapabilities = const {};
   final Map<String, dynamic> _initOptions = {};
   Future<void>? _initialization;
 
@@ -177,6 +184,13 @@ sealed class LspConfig {
   /// it to every later editor.
   bool get isUsable => true;
 
+  /// Invoked when the transport dies without the client disposing this
+  /// config — a crashed server process (stdio) or a dropped connection
+  /// (WebSocket). Hosts use it to restart the server and rebind the editors
+  /// that still hold this config, instead of leaving them to fail every
+  /// later request against a dead transport.
+  void Function()? onUnexpectedExit;
+
   /// Rejects client messages the protocol forbids before the handshake
   /// completed, so a caller racing the startup cannot kill the server with an
   /// out-of-order request — the rejection stays a local, catchable error.
@@ -280,6 +294,9 @@ sealed class LspConfig {
     }
 
     final capabilities = response['result']?['capabilities'];
+    _serverCapabilities = Map<String, dynamic>.from(
+      capabilities as Map? ?? const {},
+    );
     _serverSupportsSemanticTokensRange = false;
     _serverSupportsSemanticTokensFull = false;
     final semanticTokensProvider = capabilities?['semanticTokensProvider'];
@@ -401,7 +418,9 @@ sealed class LspConfig {
           },
         },
         'dataSupport': true,
-        'resolveSupport': {'properties': ['edit']},
+        'resolveSupport': {
+          'properties': ['edit'],
+        },
       };
     }
 
@@ -784,6 +803,13 @@ sealed class LspConfig {
     return result;
   }
 
+  /// Whether the server advertised [capability] in `initialize`.
+  ///
+  /// Absence means the server never implemented it — the spec's own signal —
+  /// and sending the request would only produce `MethodNotFound`.
+  bool _serverSupports(String capability) =>
+      _serverCapabilities.containsKey(capability);
+
   Future<Map<String, dynamic>> getColorPresentation(
     String filePath, {
     required double red,
@@ -794,6 +820,7 @@ sealed class LspConfig {
     bool force = false,
   }) async {
     if (!force && !capabilities.documentColor) return {'result': []};
+    if (!_serverSupports('colorPresentation')) return {'result': []};
 
     /// Requests color presentation(s) for a color at a given range.
     ///
@@ -827,6 +854,7 @@ sealed class LspConfig {
     bool force = false,
   }) async {
     if (!force && !capabilities.documentColor) return {'result': []};
+    if (!_serverSupports('documentColorProvider')) return {'result': []};
     final response = await sendRequest(
       method: "textDocument/documentColor",
       params: {

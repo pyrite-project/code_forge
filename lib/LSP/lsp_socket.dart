@@ -31,6 +31,15 @@ class LspSocketConfig extends LspConfig {
   Object? _connectionError;
   StackTrace? _connectionStackTrace;
 
+  /// Set when the connection ended without [dispose] — a dropped server. It
+  /// also makes [isUsable] false, so a host holding pooled configs replaces
+  /// the dead transport instead of handing it to every later editor.
+  bool _closed = false;
+
+  /// Set by [dispose] so the stream's onDone can tell a deliberate stop from
+  /// a drop; only the latter triggers [onUnexpectedExit].
+  bool _disposedByClient = false;
+
   LspSocketConfig({
     required super.workspacePath,
     required super.languageId,
@@ -75,7 +84,13 @@ class LspSocketConfig extends LspConfig {
           }
         },
         onError: _failPendingRequests,
-        onDone: () => _failPendingRequests(StateError('LSP socket closed')),
+        onDone: () {
+          _closed = true;
+          _failPendingRequests(StateError('LSP socket closed'));
+          if (!_disposedByClient) {
+            onUnexpectedExit?.call();
+          }
+        },
       );
     }
     try {
@@ -142,7 +157,12 @@ class LspSocketConfig extends LspConfig {
   }
 
   @override
+  bool get isUsable => !_closed && _connectionError == null;
+
+  @override
   void dispose() {
+    _disposedByClient = true;
+    _closed = true;
     _channel.sink.close();
     _failPendingRequests(StateError('LSP socket disposed'));
     _responseController.close();
