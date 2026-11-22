@@ -1,5 +1,6 @@
 import 'package:code_forge/code_forge.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -118,6 +119,29 @@ void main() {
     await tester.pump(const Duration(milliseconds: 120));
   }
 
+  /// A press with a mouse pointer: [tester.tapAt] always speaks touch, and the
+  /// editor gates its double-tap recognizer per pointer kind, so the mouse
+  /// path needs its own tap.
+  Future<void> mouseTapAt(WidgetTester tester, Offset position) async {
+    final gesture = await tester.startGesture(
+      position,
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.up();
+  }
+
+  /// Two mouse presses at [first] and [second], inside the double-tap window.
+  Future<void> mouseClickTwice(
+    WidgetTester tester,
+    Offset first,
+    Offset second,
+  ) async {
+    await mouseTapAt(tester, first);
+    await tester.pump(const Duration(milliseconds: 120));
+    await mouseTapAt(tester, second);
+    await tester.pump(const Duration(milliseconds: 120));
+  }
+
   testWidgets('double click selects the word under the caret', (tester) async {
     await onDesktop(() async {
       final dx = await dxOfWord(tester, 'beta');
@@ -159,6 +183,83 @@ void main() {
       await tester.pump(const Duration(milliseconds: 120));
 
       expect(controller.selection.isCollapsed, isTrue);
+    });
+  });
+
+  testWidgets('a mouse click far from the previous one stays a single click', (
+    tester,
+  ) async {
+    await onDesktop(() async {
+      final dx = await dxOfWord(tester, 'beta');
+      final position = await positionOn(tester, dx);
+
+      // 40 logical px apart: inside the framework's 100px pairing radius but
+      // on a different word, so a mouse pair this far apart must not read as
+      // a double tap.
+      await mouseClickTwice(tester, position, position + const Offset(40, 0));
+
+      expect(controller.selection.isCollapsed, isTrue);
+    });
+  });
+
+  testWidgets(
+    'a mouse double click a few pixels apart still selects the word',
+    (tester) async {
+      await onDesktop(() async {
+        final dx = await dxOfWord(tester, 'beta');
+        final position = await positionOn(tester, dx);
+
+        await mouseClickTwice(tester, position, position + const Offset(4, 0));
+
+        expect(selectedText(), 'beta');
+      });
+    },
+  );
+
+  testWidgets(
+    'a single click elsewhere does not block a following double click',
+    (tester) async {
+      await onDesktop(() async {
+        final dxBeta = await dxOfWord(tester, 'beta');
+        final dxGamma = await dxOfWord(tester, 'gamma');
+        final position = await positionOn(tester, dxBeta);
+        final gammaPosition = position + Offset(dxGamma - dxBeta, 0);
+
+        // Clicking once to place the caret is the common prelude to a double
+        // click on a different word. The double click's first press lands far
+        // from that single click, which must not stop it from opening a pair.
+        await mouseTapAt(tester, position);
+        // The fake clock only advances the framework's double-tap timer; the
+        // editor's triple-tap detection reads the real clock, so a real wait
+        // is what separates the single click from the double click.
+        await tester.pump(const Duration(seconds: 1));
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 600)),
+        );
+        await mouseClickTwice(tester, gammaPosition, gammaPosition);
+
+        expect(selectedText(), 'gamma');
+      });
+    },
+  );
+
+  testWidgets('touch taps keep pairing across the framework radius', (
+    tester,
+  ) async {
+    await onDesktop(() async {
+      final dxBeta = await dxOfWord(tester, 'beta');
+      final dxGamma = await dxOfWord(tester, 'gamma');
+      final position = await positionOn(tester, dxBeta);
+      final gammaPosition = position + Offset(dxGamma - dxBeta, 0);
+
+      await tester.tapAt(position);
+      await tester.pump(const Duration(milliseconds: 120));
+      await tester.tapAt(gammaPosition);
+      await tester.pump(const Duration(milliseconds: 120));
+
+      // The second tap is on another word tens of px away: only the
+      // framework's touch-sized pairing radius makes this a double tap.
+      expect(controller.selection.isCollapsed, isFalse);
     });
   });
 }

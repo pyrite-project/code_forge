@@ -1763,14 +1763,22 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
       widget.editorTheme ?? lightfairTheme,
       oldWidget.editorTheme ?? lightfairTheme,
     );
-    final selectionChanged =
-        !identical(widget.selectionStyle, oldWidget.selectionStyle);
-    final hoverChanged =
-        !identical(widget.hoverDetailsStyle, oldWidget.hoverDetailsStyle);
-    final suggestionChanged =
-        !identical(widget.suggestionStyle, oldWidget.suggestionStyle);
-    final scrollbarChanged =
-        !identical(widget.scrollbarDecoration, oldWidget.scrollbarDecoration);
+    final selectionChanged = !identical(
+      widget.selectionStyle,
+      oldWidget.selectionStyle,
+    );
+    final hoverChanged = !identical(
+      widget.hoverDetailsStyle,
+      oldWidget.hoverDetailsStyle,
+    );
+    final suggestionChanged = !identical(
+      widget.suggestionStyle,
+      oldWidget.suggestionStyle,
+    );
+    final scrollbarChanged = !identical(
+      widget.scrollbarDecoration,
+      oldWidget.scrollbarDecoration,
+    );
     final languageChanged = !identical(widget.language, oldWidget.language);
 
     if (!themeChanged &&
@@ -4008,6 +4016,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                               false;
                                                           _aiNotifier.value =
                                                               null;
+                                                          _controller
+                                                              .clearGhostText();
                                                           _controller
                                                               .dismissSuggestions();
                                                           _hoverNotifier.value =
@@ -6305,6 +6315,20 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
   static const Duration _tripleTapWindow = Duration(milliseconds: 450);
 
+  /// The radius a mouse double tap's second press must fall inside, measured
+  /// from the first press, for the pair to select a word.
+  ///
+  /// [DoubleTapGestureRecognizer] pairs taps up to [kDoubleTapSlop] (100
+  /// logical px) apart, a tolerance sized for touch input. A mouse points
+  /// precisely enough that presses on different words should not pair, so a
+  /// mouse pair is accepted only when it stays within this tighter radius;
+  /// the recognizer's own time window, button, and drag checks still apply.
+  static const double _mouseDoubleTapSlop = 8.0;
+
+  /// Position of the previous text-area press, the anchor
+  /// [_doubleTapMaySelectWord] measures a mouse pair's second press against.
+  Offset? _lastMouseDownPosition;
+
   /// Records this pointer-down and reports whether it completes a triple click.
   ///
   /// The line, not the exact position, is what has to repeat: clicking the
@@ -6330,6 +6354,22 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     _lastTapDownAt = now;
     _lastTapDownLine = line;
     return _tapDownRun >= 3;
+  }
+
+  /// Whether a completed double tap may select the word under [event].
+  ///
+  /// Every press is fed to the recognizer, so a press far from the previous
+  /// one still opens a fresh pair instead of being swallowed by the previous
+  /// press's armed state. The radius is enforced here, when the pair fires:
+  /// touch and stylus pairs keep the framework tolerance, while a mouse pair
+  /// selects only when its second press landed within [_mouseDoubleTapSlop]
+  /// of the previous text-area press.
+  bool _doubleTapMaySelectWord(PointerDownEvent event, Offset? previousPress) {
+    if (event.kind != PointerDeviceKind.mouse) {
+      return true;
+    }
+    return previousPress != null &&
+        (event.position - previousPress).distance <= _mouseDoubleTapSlop;
   }
 
   final GutterBuilder? gutterBuilder;
@@ -6885,9 +6925,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     });
 
     aiNotifier.addListener(() {
-      final previousAiResponse = _aiResponse;
       _aiResponse = aiNotifier.value;
-      aiOffsetNotifier.value = _getCaretInfo().offset;
 
       if (_aiResponse != null && _aiResponse!.isNotEmpty) {
         final aiLines = _aiResponse!.split('\n');
@@ -6895,10 +6933,14 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           controller.selection.extentOffset.clamp(0, controller.length),
         );
         _ghostTextLineCount = aiLines.length - 1;
-      } else if (_aiResponse == null && previousAiResponse != null) {
+      } else if (controller.ghostText == null) {
         _ghostTextAnchorLine = null;
         _ghostTextLineCount = 0;
       }
+      // Cached caret positions carry the ghost visual offset, so they must
+      // not outlive the ghost state they were computed under.
+      _caretInfoCache.clear();
+      aiOffsetNotifier.value = _getCaretInfo().offset;
 
       markNeedsLayout();
       markNeedsPaint();
@@ -7551,10 +7593,13 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         _ghostTextAnchorLine = ghost.line;
         final ghostLines = ghost.text.split('\n');
         _ghostTextLineCount = ghostLines.length - 1;
-      } else if (_aiResponse == null) {
+      } else if (_aiResponse == null || _aiResponse!.isEmpty) {
         _ghostTextAnchorLine = null;
         _ghostTextLineCount = 0;
       }
+      // Cached caret positions carry the ghost visual offset, so they must
+      // not outlive the ghost state they were computed under.
+      _caretInfoCache.clear();
       _virtualRemovedTotalLineCount = 0;
       for (final block in controller.virtualRemovedBlocks) {
         _virtualRemovedTotalLineCount += block.lineCount;
@@ -7580,6 +7625,13 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
     if (controller.selectionOnly) {
       controller.selectionOnly = false;
+      // A caret move invalidates a non-persistent suggestion: the ghost is
+      // anchored where the caret was, and leaving it drawn there would
+      // decouple it from the caret while the next suggestion is in flight.
+      final ghost = controller.ghostText;
+      if (ghost != null && !ghost.shouldPersist) {
+        controller.clearGhostText();
+      }
       if (!_isFoldToggleInProgress) {
         _ensureCaretVisible();
       }
@@ -8522,13 +8574,34 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   }
 
   int _findVisibleLineByYPosition(double y) {
+    _syncGhostBandState();
     final lineCount = controller.lineCount;
     if (lineCount == 0) return 0;
 
     final hasActiveFolds = _hasActiveFolds;
     final hasVirtualBlocks = _virtualRemovedTotalLineCount > 0;
 
+    // Ghost text renders a band of _ghostTextLineCount extra rows below its
+    // anchor line, shifting every later line down. The y→line conversion has
+    // to skip that band; a y inside the band belongs to the anchor line.
+    final ghostLineCount = _ghostTextLineCount;
+    final ghostAnchor = _ghostTextAnchorLine;
+    final hasGhostBand =
+        ghostLineCount > 0 &&
+        ghostAnchor != null &&
+        ghostAnchor >= 0 &&
+        ghostAnchor < lineCount;
+
     if (!lineWrap && !hasActiveFolds && !hasVirtualBlocks) {
+      if (hasGhostBand) {
+        final anchor = ghostAnchor;
+        final bandTop = (anchor + 1) * _lineHeight;
+        if (y >= bandTop) {
+          final bandBottom = bandTop + ghostLineCount * _lineHeight;
+          if (y < bandBottom) return anchor;
+          y -= ghostLineCount * _lineHeight;
+        }
+      }
       return (y / _lineHeight).floor().clamp(0, lineCount - 1);
     }
 
@@ -8550,11 +8623,27 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
           return i;
         }
         currentY += _lineHeight;
+        if (i == ghostAnchor && ghostLineCount > 0) {
+          if (currentY + ghostLineCount * _lineHeight > y) {
+            return i;
+          }
+          currentY += ghostLineCount * _lineHeight;
+        }
       }
       return lineCount - 1;
     }
 
     if (!lineWrap && hasActiveFolds) {
+      if (hasGhostBand) {
+        final anchor = ghostAnchor;
+        final bandTop =
+            _getLineYOffset(anchor, hasActiveFolds) + _lineHeight;
+        if (y >= bandTop) {
+          final bandBottom = bandTop + ghostLineCount * _lineHeight;
+          if (y < bandBottom) return anchor;
+          y -= ghostLineCount * _lineHeight;
+        }
+      }
       _ensureFoldedLineCacheValid();
       int lo = 0, hi = lineCount - 1;
       while (lo < hi) {
@@ -8591,6 +8680,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         return i;
       }
       currentY += lineHeight;
+      if (i == ghostAnchor && ghostLineCount > 0) {
+        if (currentY + ghostLineCount * _lineHeight > y) {
+          return i;
+        }
+        currentY += ghostLineCount * _lineHeight;
+      }
     }
     return lineCount - 1;
   }
@@ -8879,6 +8974,24 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
       }
     }
     return offset;
+  }
+
+  /// UTF-16 column of the leftmost inlay hint painted on [line], or null when
+  /// the line carries none.
+  ///
+  /// [_drawInlayHints] erases the line from that column rightwards before it
+  /// repaints the shifted text, so it marks where this layer stops owning the
+  /// selection. Columns are UTF-16 offsets, matching `InlayHint.column`.
+  int? _firstInlayHintColumnForLine(int line) {
+    if (!controller.inlayHintsVisible || controller.inlayHints.isEmpty) {
+      return null;
+    }
+    int? first;
+    for (final hint in controller.inlayHints) {
+      if (hint.line != line) continue;
+      if (first == null || hint.column < first) first = hint.column;
+    }
+    return first;
   }
 
   int _getTextOffsetFromPosition(Offset position) {
@@ -9323,7 +9436,32 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   double get _totalVirtualExtraHeight =>
       _ghostTextExtraHeight + _virtualRemovedExtraHeight;
 
+  /// The ghost object the cached band fields were derived from.
+  GhostText? _ghostBandSource;
+
+  /// Re-derives the ghost band geometry from the controller's current ghost
+  /// text.
+  ///
+  /// Painting, hit-testing and layout all consume the band offsets, while
+  /// [_drawGhostText] reads the controller directly. Deriving the band at
+  /// point of use keeps those views anchored to the same ghost even when a
+  /// decoration notification was consumed by an earlier branch of
+  /// [_onControllerChange] before the band fields could be refreshed.
+  void _syncGhostBandState() {
+    final ghost = controller.ghostText;
+    if (identical(ghost, _ghostBandSource)) return;
+    _ghostBandSource = ghost;
+    if (ghost != null && ghost.text.isNotEmpty) {
+      _ghostTextAnchorLine = ghost.line;
+      _ghostTextLineCount = ghost.text.split('\n').length - 1;
+    } else if (_aiResponse == null || _aiResponse!.isEmpty) {
+      _ghostTextAnchorLine = null;
+      _ghostTextLineCount = 0;
+    }
+  }
+
   double _getGhostTextVisualOffset(int lineIndex) {
+    _syncGhostBandState();
     if (_ghostTextAnchorLine == null || _ghostTextLineCount <= 0) return 0;
     if (lineIndex <= _ghostTextAnchorLine!) return 0;
     return _ghostTextExtraHeight;
@@ -9348,6 +9486,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
 
   @override
   void performLayout() {
+    _syncGhostBandState();
     final lineCount = controller.lineCount;
 
     if (lineCount != _cachedLineCount) {
@@ -9631,6 +9770,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
   @override
   void paint(PaintingContext context, Offset offset) {
     _checkDocumentVersionAndClearCache();
+    _syncGhostBandState();
 
     final canvas = context.canvas;
     final viewTop = vscrollController.offset;
@@ -11736,6 +11876,17 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         lineSelEnd = lineLength;
       }
 
+      // The hint layer erases from the first hint to the end of the line and
+      // repaints the shifted text — and the selection under it — itself. Paint
+      // no further than that boundary: everything past it would be wiped, and
+      // where the erase and the repaint only partly overlap the two translucent
+      // fills stack into a darker band.
+      final firstHintColumn = _firstInlayHintColumnForLine(lineIndex);
+      if (firstHintColumn != null && lineSelStart < lineSelEnd) {
+        if (lineSelStart >= firstHintColumn) continue;
+        if (lineSelEnd > firstHintColumn) lineSelEnd = firstHintColumn;
+      }
+
       final contentWidth =
           size.width - _gutterWidth - (innerPadding?.horizontal ?? 0);
       final paragraphWidth = lineWrap
@@ -13425,21 +13576,23 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final inlayOffsetStart = _getInlayHintOffsetForLine(line, utf16Start);
     final inlayOffsetEnd = _getInlayHintOffsetForLine(line, utf16End);
 
-    final paint = Paint()..color = selectionStyle.selectionColor;
-    for (final box in para.getBoxesForRange(utf16Start, utf16End)) {
-      final left = box.left + inlayOffsetStart;
-      final right = box.right + inlayOffsetEnd;
-      if (right <= left) continue;
-      canvas.drawRect(
-        Rect.fromLTWH(
-          baseScreenX + left,
-          baseScreenY,
-          right - left,
-          _lineHeight,
-        ),
-        paint,
-      );
-    }
+    // One rect from the first box to the last, not one per box: a paragraph
+    // splits into a box per font-fallback run (an italic token in a font
+    // without an italic face is one), and stretching every box by the range's
+    // whole shift makes them overlap, so the translucent fill paints the same
+    // pixels twice and leaves a darker band. The shifted segments tile the
+    // line contiguously — each moves right by exactly the hints before it, and
+    // the chip sits in the gap that opens — so a single rect covers the
+    // selection once.
+    final boxes = para.getBoxesForRange(utf16Start, utf16End);
+    if (boxes.isEmpty) return;
+    final left = boxes.first.left + inlayOffsetStart;
+    final right = boxes.last.right + inlayOffsetEnd;
+    if (right <= left) return;
+    canvas.drawRect(
+      Rect.fromLTWH(baseScreenX + left, baseScreenY, right - left, _lineHeight),
+      Paint()..color = selectionStyle.selectionColor,
+    );
   }
 
   void _drawDocumentColors(
@@ -13988,9 +14141,17 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         // added: [DoubleTapGestureRecognizer] refuses a pointer outright while
         // every callback is null, so assigning afterwards silently costs the
         // first click of a session its chance to be half of a double tap.
+        final previousMouseDown = _lastMouseDownPosition;
+        _lastMouseDownPosition = event.position;
         _dtap.onDoubleTap = () {
-          _selectWordAtOffset(textOffset);
-          _showContextMenu(localPosition, textOffset, anchorToSelection: true);
+          if (_doubleTapMaySelectWord(event, previousMouseDown)) {
+            _selectWordAtOffset(textOffset);
+            _showContextMenu(
+              localPosition,
+              textOffset,
+              anchorToSelection: true,
+            );
+          }
         };
         _dtap.addPointer(event);
         _draggingCHandle = false;
@@ -14095,8 +14256,12 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
         // Assigned before [DoubleTapGestureRecognizer.addPointer], which
         // drops any pointer that arrives while the recognizer has no callback
         // at all; see the mobile branch above.
+        final previousMouseDown = _lastMouseDownPosition;
+        _lastMouseDownPosition = event.position;
         _dtap.onDoubleTap = () {
-          _selectWordAtOffset(textOffset);
+          if (_doubleTapMaySelectWord(event, previousMouseDown)) {
+            _selectWordAtOffset(textOffset);
+          }
         };
         _dtap.addPointer(event);
 
@@ -14410,6 +14575,7 @@ class _CodeFieldRenderer extends RenderBox implements MouseTrackerAnnotation {
     final screenY =
         _getLineYOffset(line, _hasActiveFolds) +
         rowTop +
+        _getTotalVirtualOffset(line) +
         (innerPadding?.top ?? 0) -
         vscrollController.offset;
 
