@@ -43,6 +43,14 @@ const double kHoverAnchorGap = 0.0;
 /// `outer == gap + inner`.
 const double kOverlayPadding = 8.0;
 
+/// Width a completion item's documentation pane asks for when it sits beside
+/// the completion list.
+///
+/// The pane is only shown when a side of the list has this much room left: in
+/// a narrower editor it has nowhere to go but on top of the list, and covering
+/// the items being chosen from is worse than showing no details at all.
+const double kCompletionDetailsWidth = 420.0;
+
 /// Keys the platform IME must receive while it owns a composition (marked
 /// text) in the editor: candidate navigation, paging and dismissal.
 ///
@@ -4657,6 +4665,24 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                 valueListenable:
                                     _controller.selectedSuggestionNotifier,
                                 builder: (context, selected, child) {
+                                  // The documentation pane needs a side of the
+                                  // list to sit on, so it is only worth
+                                  // opening when one side has room for its
+                                  // full width. In a narrow editor there is no
+                                  // such side, and the pane can only be stacked
+                                  // over the list it describes -- hiding the
+                                  // very items being chosen from.
+                                  final detailsFitRight =
+                                      adjustedLeft +
+                                          suggestionWidth +
+                                          kCompletionDetailsWidth +
+                                          10 <=
+                                      overlayBounds.right;
+                                  final detailsFitLeft =
+                                      adjustedLeft -
+                                          kCompletionDetailsWidth -
+                                          10 >=
+                                      overlayBounds.left;
                                   return Stack(
                                     children: [
                                       Positioned.fill(
@@ -5065,7 +5091,8 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                         ),
                                       ),
                                       if (_selectedSuggestionMd != null &&
-                                          _lspSignatureNotifier.value == null)
+                                          _lspSignatureNotifier.value == null &&
+                                          (detailsFitRight || detailsFitLeft))
                                         Builder(
                                           builder: (_) {
                                             // The documentation sits beside the
@@ -5085,42 +5112,17 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                             // flipped above it had no room left
                                             // in the editor and collapsed.
                                             final documentationAbove =
-                                                viewportWidth >= 700 &&
                                                 shouldPositionAbove;
                                             final documentationTop =
                                                 documentationAbove
                                                 ? offset.dy - 10
                                                 : offset.dy + fontSize + 10;
-                                            final documentationGapBelow =
-                                                viewportWidth < 700
-                                                ? (offset.dy <
-                                                              (viewportWidth /
-                                                                  2) &&
-                                                          400 < popupHeight)
-                                                      ? ((fontSize + 6.5) *
-                                                                (_suggestionNotifier
-                                                                        .value
-                                                                        ?.length ??
-                                                                    0))
-                                                            .clamp(0, 400)
-                                                      : -100
-                                                : 0;
                                             final documentationLeft =
-                                                viewportWidth < 700
-                                                ? adjustedLeft
-                                                : ((adjustedLeft +
-                                                              suggestionWidth +
-                                                              420) >
-                                                          overlayBounds.right
-                                                      ? max(
-                                                          overlayBounds.left +
-                                                              10,
-                                                          adjustedLeft -
-                                                              420 -
-                                                              10,
-                                                        )
-                                                      : adjustedLeft +
-                                                            suggestionWidth);
+                                                detailsFitRight
+                                                ? adjustedLeft + suggestionWidth
+                                                : adjustedLeft -
+                                                      kCompletionDetailsWidth -
+                                                      10;
                                             return Positioned.fill(
                                               child: CustomSingleChildLayout(
                                                 delegate: _AnchoredPopupLayoutDelegate(
@@ -5128,13 +5130,10 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                   left: documentationLeft,
                                                   positionAbove:
                                                       documentationAbove,
-                                                  gapBelow:
-                                                      documentationGapBelow
-                                                          .toDouble(),
+                                                  gapBelow: 0,
                                                   gapAbove: 10,
-                                                  maxWidth: viewportWidth < 700
-                                                      ? viewportWidth * 0.63
-                                                      : 420,
+                                                  maxWidth:
+                                                      kCompletionDetailsWidth,
                                                   minWidth: 70,
                                                   // Same rule as the list
                                                   // beside it: the room is
@@ -5149,7 +5148,6 @@ class _CodeForgeState extends State<CodeForge> with TickerProviderStateMixin {
                                                                 10
                                                           : popupHeight -
                                                                 documentationTop -
-                                                                documentationGapBelow -
                                                                 popupBottomGap,
                                                     ),
                                                   ),
