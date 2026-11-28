@@ -807,6 +807,10 @@ sealed class LspConfig {
   ///
   /// Absence means the server never implemented it — the spec's own signal —
   /// and sending the request would only produce `MethodNotFound`.
+  ///
+  /// The answer only means "not advertised" once the handshake completed;
+  /// before that the advertisement is unknown, which is why every method
+  /// below calls [_ensureHandshakeAllows] before consulting this.
   bool _serverSupports(String capability) =>
       _serverCapabilities.containsKey(capability);
 
@@ -819,6 +823,7 @@ sealed class LspConfig {
     required Map<String, dynamic> range,
     bool force = false,
   }) async {
+    _ensureHandshakeAllows('textDocument/colorPresentation');
     if (!force && !capabilities.documentColor) return {'result': []};
     if (!_serverSupports('colorPresentation')) return {'result': []};
 
@@ -853,6 +858,7 @@ sealed class LspConfig {
     String filePath, {
     bool force = false,
   }) async {
+    _ensureHandshakeAllows('textDocument/documentColor');
     if (!force && !capabilities.documentColor) return {'result': []};
     if (!_serverSupports('documentColorProvider')) return {'result': []};
     final response = await sendRequest(
